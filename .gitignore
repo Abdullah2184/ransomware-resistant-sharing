@@ -1,0 +1,41 @@
+
+# Rust
+/target/
+**/target/
+
+# Node.js
+node_modules/
+**/node_modules/
+
+# Hardhat
+contracts/artifacts/
+contracts/cache/
+contracts/coverage/
+
+# Environment and secrets
+.env
+.env.*
+!.env.example
+secrets/
+**/secrets/
+*.pem
+*.p12
+*.pfx
+*.keystore
+
+# Local blockchain and storage data
+infra/**/data/
+infra/**/volumes/
+infra/**/keys/
+infra/**/passwords/
+
+# Logs and temporary files
+*.log
+*.tmp
+*.swp
+
+# IDE / operating system
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
