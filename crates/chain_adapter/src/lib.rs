@@ -1,0 +1,1 @@
+//! chain-adapter library.

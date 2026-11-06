@@ -1,0 +1,51 @@
+name: rrfs-dev
+
+services:
+  postgres:
+    image: postgres:18.6-bookworm
+    restart: unless-stopped
+
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-rrfs_dev}
+      POSTGRES_USER: ${POSTGRES_USER:-rrfs_app}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in the root .env file}
+
+    ports:
+      - "127.0.0.1:5432:5432"
+
+    volumes:
+      - postgres_data:/var/lib/postgresql
+
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - pg_isready -U "$${POSTGRES_USER}" -d "$${POSTGRES_DB}"
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  kubo:
+    image: ipfs/kubo:v0.43.1
+    restart: unless-stopped
+
+    environment:
+      IPFS_PROFILE: server
+
+    ports:
+      - "127.0.0.1:5001:5001"
+      - "127.0.0.1:8080:8080"
+
+    volumes:
+      - ipfs_data:/data/ipfs
+
+    healthcheck:
+      test: ["CMD", "ipfs", "id"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 20s
+
+volumes:
+  postgres_data:
+  ipfs_data:
