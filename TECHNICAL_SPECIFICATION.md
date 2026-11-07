@@ -69,21 +69,19 @@ These decisions are fixed for the first implementation unless changed through an
 1. **Client-first encryption:** plaintext is encrypted locally by the client before upload. The gateway and IPFS adapter receive ciphertext only.
 2. **Version-specific key:** generate a fresh random 256-bit data-encryption key (DEK, also called the version epoch key) for every new file version. Do not reuse the prior version's key for routine edits.
 3. **Key envelopes off-chain:** the DEK is wrapped separately for each authorized reader and the envelope set is stored as an immutable IPFS object, not as raw keys or wrapped-key entries in contract storage. The chain stores the CID/reference and authorization state. A per-version envelope-set pointer can be updated by appending a `KEY_ENVELOPE_UPDATE` record; earlier envelope sets remain immutable.
-4. **Content and envelope objects are separate:** encrypted content is one IPFS object/package; recipient-wrapped keys are a separate IPFS object. This lets a share operation add an envelope without re-encrypting the file bytes. Both CIDs are referenced by the ledger. This mechanism is abstracted away from the end-user. 
-5. **Upload ordering:** the encrypted content object and envelope object must be uploaded and pinned to the configured replication threshold before the version transaction is submitted. If chain submission fails, leave the blob unreferenced and let the retention/cleanup process deal with it later.
+4. **Content and envelope objects are separate:** encrypted content is one IPFS object/package; recipient-wrapped keys are a separate IPFS object. This lets a share operation add an envelope without re-encrypting the file bytes. Both CIDs are referenced by the ledger. This mechanism is abstracted away from the end-user.
+5. **Upload ordering:** the encrypted content object and envelope object must be uploaded and pinned to the configured replication threshold before the version transaction is submitted to the chain. If chain submission fails, leave the blob unreferenced and let the retention/cleanup process deal with it later.
 6. **Besu + QBFT:** use a permissioned Hyperledger Besu network with QBFT consensus. No proof-of-work and no public-chain deployment in the prototype.
 7. **Solidity contracts:** `FileRegistry` owns file/folder metadata, version records, current-head pointer and access-lookup records. `AccessGovernance` owns registered member keys, member status, Read/Write ACL state, policy/approval information and key-envelope references/updates. They are separate contracts with narrow interfaces.
-8. **Off-chain services are not the authority for authorization:** the gateway may pre-check requests, but state-changing operations must be independently authorized by the contracts. An indexer/database is a query projection, not an authorization source of truth.
-9. **Identity proof:** registration binds an approved member identity to versioned signing and encryption public keys. Login uses a one-time signed challenge; a claimed member ID alone is not proof. EIP-712 operation signatures use domain separation, and contracts/gateway enforce nonce and expiry to prevent replay.
+8. **Off-chain services are not the authority for authorization:** the gateway may pre-check requests, but state-changing operations must be independently authorized by the contracts. An indexer/database is a query projection, not an authorization source of truth. Additionally, the gateway runs on an independent system, not at the client-endpoint, so no invalid data or functionality references should be made.
+9. **Identity proof:** registration binds an approved member identity to versioned signing and encryption public keys. Login uses a one-time signed challenge; a claimed member ID alone is not proof. EIP-712 operation signatures use domain separation, and contracts/gateway enforce nonce and expiry to prevent replay. 
 10. **Separate key pairs:** use a signing key and an encryption/unwrap key as different key pairs. Do not reuse one private key for both purposes.
 11. **Governance:** sensitive ACL, member, key and consortium operations use policy-defined approval thresholds. Consortium-wide changes require timelock. Emergency suspension may use a specifically configured emergency route, but remains auditable and must not allow an unauthenticated caller to lock out another identity. The specific access thresholds (such as multi-sig or specific IDs) for each file or governance-level changes (adding an organization, or user or removing one) should be configurable on a case-by-case basis.
 12. **No `trustedVersion` flag in the MVP:** every accepted append is recorded as a version. An anomaly scanner can warn or hold a submission locally, but the ledger does not pretend that a signature proves content is benign. Recovery selects a version reviewed/identified as clean.
 13. **Restore/revert is append-only:** restoring V1 when V2 is current creates V3 containing the recovered V1 plaintext re-encrypted under a fresh DEK. V3's parent is V2. Do not move the head backward or delete V2.
-14. **Names/folders:** file display name and logical folder relationship may be visible to consortium participants on-chain for file browsing. Sensitive descriptions and other private metadata should be encrypted/off-chain. On-chain visibility is not confidentiality.
+14. **Names/folders:** file display name and logical folder relationship may be visible to consortium participants on-chain for file browsing. 
 15. **CLI first, GUI later:** build a CLI over the shared application core. Do not put business rules in CLI command handlers.
 16. **Rate limiting:** enforce request throttling and failed-attempt telemetry at the gateway; enforce signatures, nonce/replay checks, ACL checks and state-transition invariants in contracts.
-17. **Orphan cleanup:** unused IPFS objects may remain after failed transactions. A scheduled mark-and-sweep/retention job is optional for MVP; never delete a CID referenced by a finalized ledger record.
-18. **No mandatory entropy feature in MVP:** define a scanner/telemetry interface, but entropy-baseline analysis is optional and disabled by default. If implemented later, it is a heuristic, not proof of malware.
 
 ## Important terminology
 
@@ -101,7 +99,7 @@ These decisions are fixed for the first implementation unless changed through an
 # 3. Technology stack
 
 | Area | Selected technology | Implementation rule |
-|---|---|---|
+| ---  |        ---          |        ---          |
 | Workspace and core off-chain code | Rust stable, Cargo workspace | Pin toolchain and dependency versions in repository; keep domain logic independent from network/UI adapters. |
 | Async runtime / HTTP API | Tokio + Axum | Use typed request/response models, timeouts, cancellation and bounded streaming. |
 | Serialization | Serde + JSON for API and versioned JSON objects | Version every external schema; reject unknown required versions and malformed fields. Use deterministic canonical bytes when a byte-level hash/signature requires them. |
@@ -116,7 +114,6 @@ These decisions are fixed for the first implementation unless changed through an
 | Tests | Rust unit/integration tests; Hardhat Solidity + TypeScript tests; end-to-end tests | Include negative authorization tests, crypto vectors, concurrency tests, failure injection and storage-replication checks. |
 | User interface | CLI first (Rust `clap` or equivalent) | Commands delegate to application services. A later GUI calls the same application/API contracts. |
 
-**Do not rely on latest-version assumptions.** The coding agent must select mutually compatible stable package versions, lock them, document the chosen versions, and run the complete test suite. Technology references are listed in Section 18.
 
 # 4. System architecture and trust boundaries
 
@@ -157,9 +154,9 @@ Trust notes:
 ## 4.1 Layer responsibilities
 
 | Layer/module | Responsibility | Must not do |
-|---|---|---|
-| CLI / GUI | Gather input, display results, call application use cases | No direct contract ABI logic; no security policy in UI code. |
-| Domain | File, version, member, ACL, policy and typed errors | No network, database, filesystem or HSM calls. |
+|     ---      |      ---       |     ---     |
+| CLI / GUI    | Gather input, display results, call application use cases | No direct contract ABI logic; no security policy in UI code. |
+| Domain       | File, version, member, ACL, policy and typed errors | No network, database, filesystem or HSM calls. |
 | Application services | Orchestrate use cases and transaction order | No duplicated crypto primitives or direct SQL in use cases. |
 | Crypto | Encrypt/decrypt bytes; wrap/unwrap DEK; build and verify manifests/signatures; hash helpers | No chain authorization decisions; no logging of secrets. |
 | Key custody | Invoke HSM/token operations; key IDs and public-key lookup; sign/unwrap interface | Never persist private keys from production HSMs to a file. |
@@ -358,10 +355,6 @@ The contracts shall interact through defined Solidity interfaces.
 | Governance policies and approvals                | No governance authority                                            | Authoritative or delegated to reviewed governance modules |
 | Successful access lookups                        | Records the file/version disclosed                                 | Checks requester identity and Read permission             |
 
-`FileRegistry.sol` shall consult `AccessGovernance.sol` for membership and authorization decisions, such as whether a recovered signer belongs to an active member and whether that member has Write permission for the specified file.
-
-`FileRegistry.sol` shall independently enforce file-specific invariants, including version numbering, parent-manifest consistency, current-head validation and file status.
-
 Cross-contract operations shall execute within the same EVM transaction whenever atomic consistency is required.
 
 For initial version creation:
@@ -449,11 +442,7 @@ Each newly created file version shall use a fresh cryptographically random DEK. 
 
 Recipient-specific wrapped DEKs shall be stored in an envelope-set object in IPFS. The corresponding version's initial envelope-set CID shall be captured in its immutable version context, while `AccessGovernance.sol` maintains the authoritative current envelope-set CID and revision.
 
-Each envelope-set update shall create a new immutable object rather than modifying an existing IPFS object.
-
 Sharing an existing version shall add a recipient-specific wrapped DEK to a new envelope set for that version, subject to the applicable authorization policy. Access to historical versions shall be granted explicitly rather than automatically inferred from permission to access the current version.
-
-Removal from the Read ACL shall prevent future authorized retrievals through the application and shall exclude the removed member from subsequently generated envelope sets. It shall not retroactively invalidate DEKs or plaintext already obtained.
 
 A restored version shall be created as a new version with a fresh DEK. The restored content shall be re-encrypted and appended against the current head. Historical version records shall remain unchanged.
 
@@ -533,8 +522,6 @@ Sensitive file names, confidential descriptions and plaintext metadata shall not
 
 Failed authentication and authorization attempts shall generally be recorded in off-chain gateway security logs. Selected security alerts and suspension actions may be recorded on-chain. Individual IPFS chunk retries shall not generate separate blockchain transactions.
 
-An `ACCESS_LOOKUP` record proves that the registered signing key authenticated and received the corresponding references through the controlled access path. It does not prove that a human opened or decrypted the file.
-
 IPFS CIDs are content identifiers, not access credentials. Anyone who obtains a CID may attempt to retrieve the corresponding ciphertext if the storage network is reachable. The prototype shall restrict application-facing IPFS RPC access to authorized gateway and storage services and route normal client retrieval through the gateway. The system shall nevertheless document that a leaked CID and previously obtained encryption key may permit access to copied ciphertext outside the controlled retrieval path.
 
 ## 7.5 Governance, Multisignature and Timelock Requirements
@@ -586,6 +573,9 @@ The prototype shall use a zero-gas-price configuration to eliminate monetary tra
 
 All Besu nodes shall use consistent genesis configuration, chain ID, QBFT parameters, EVM fork configuration and gas policy. Network-level configuration shall be recorded and version-controlled independently of application configuration.
 
+Besu nodes are independent of user end-points and the gateway. No invalid data access or interdependent
+function calls should be made. Communication is only through the pre-defined protocols and interfaces.
+
 The system shall use separate node roles where appropriate:
 
 - Validator nodes: Participate in QBFT consensus and block finalization.
@@ -623,7 +613,7 @@ The gateway shall:
 - Perform preliminary identity and permission checks.
 - Apply rate limits and resource limits.
 - Construct the ABI-encoded contract call.
-- Estimate or assign an appropriate transaction gas limit.
+- Assign an appropriate transaction gas limit.
 - Manage the relayer's Ethereum account nonce.
 - Sign the Ethereum transaction using the relayer key.
 - Submit the transaction to a configured Besu RPC endpoint.
@@ -689,8 +679,6 @@ The gateway shall estimate gas or assign operation-specific gas limits for suppo
 Large encrypted files and file chunks shall remain in IPFS. Only the content identifiers and necessary metadata shall be recorded on-chain.
 
 Gas consumption shall be measured for major contract operations, including file creation, version append, access lookup, ACL modification, envelope-pointer update and governance execution. Excessive storage writes, expensive enumeration and oversized event payloads shall be avoided.
-
-Zero gas price shall not be treated as unlimited transaction capacity. Gateway rate limiting, request quotas, transaction-size constraints and block gas limits shall remain active.
 
 ## 7.10 QBFT Consensus and Validator Responsibilities
 
@@ -845,7 +833,7 @@ Contract addresses, chain identifiers, validator configuration, gas policies and
 
 # 8. Gateway and HTTP API
 
-The gateway is a replicable off-chain Rust service. It authenticates requests, checks current state, applies rate limits, streams ciphertext to storage, relays typed signed transactions and provides a stable API to CLI/GUI. It is not a blockchain validator. It should be as stateless as possible; PostgreSQL/Redis-like shared counters may be used for distributed throttling if needed, but no new mandatory Redis dependency is introduced unless warranted. In the overall system, the distributed gateway can live on a server specific to a particular organization. So based on user meta-data, the requests from an endpoint is sent to that organization's server.
+The gateway is a replicable off-chain Rust service. It authenticates requests, checks current state, applies rate limits, streams ciphertext to storage, relays typed signed transactions and provides a stable API to CLI/GUI. It is not a blockchain validator. It should be as stateless as possible; PostgreSQL/Redis-like shared counters may be used for distributed throttling if needed, but no new mandatory Redis dependency is introduced unless warranted. In the overall system, the distributed gateway can live on a server specific to a particular organization. So based on user meta-data, the requests from an endpoint is sent to that organization's server. The gateway accepts requests from multiple endpoints and should be able to seamlessly and safely provide services for all of them. Mechanisms to prevent data races, invalid data accesses and duplicated login challenges should be implemented. It should also be hardened from potential DDoS attacks.
 
 The gateway should apply independent budgets for:
 - Unauthenticated traffic: challenges, malformed requests and failed signature checks, primarily limited by source IP or network.
@@ -883,6 +871,9 @@ The gateway MUST not reveal whether a private File ID, CID or envelope exists be
 
 # 9. Core application workflows
 
+Note: The code for each workflow should be modular to allow for workflow-specific design modifications
+if later required. 
+
 ## 9.1 Register member / rotate keys
 
 1. An approved administrator establishes the organization/member identity out-of-band.
@@ -892,7 +883,7 @@ The gateway MUST not reveal whether a private File ID, CID or envelope exists be
 
 ## 9.2 Upload a new file
 
-1. CLI obtains file path, display name, parent folder and desired initial Read/Write ACL. Validate path, ensure input is a regular file (unless explicit symlink policy allows otherwise), enforce configured size limits and scan if an optional scanner is enabled.
+1. CLI obtains file path, display name, parent folder and desired initial Read/Write ACL. Validate path, ensure input is a regular file (unless explicit symlink policy allows otherwise), enforce configured size limits. Also run wildcard checks for any malware-related code or wording in the text.
 2. Resolve approved member public keys from authoritative identity state. Reject missing, suspended or revoked identities.
 3. Create stable File ID if new. For an update, obtain current head and latest state at a consistent finalised block.
 4. Generate new DEK, epoch ID and nonce prefix using CSPRNG. Encrypt any sensitive metadata and the file in chunks using AES-256-GCM.
@@ -948,11 +939,12 @@ An edit is a new snapshot. Load current head, ensure Write permission, encrypt t
 Only successfully authorized lookups are required on-chain for the MVP. Failed login/signature attempts are recorded off-chain with redaction and rate limits; aggregate/selected alert records may be appended to chain. Audit queries distinguish `authorization granted/reference returned` from `download completed` or `plaintext opened`; do not overclaim what the audit log proves.
 
 ## 9.9 What should happen automatically
-
+ The points mentioned here may tak place in differeent systems (user end-point, gateway, etc).
+ Adjacency does not necessitate it is the same system. Refer to the sections on the detailed architecture for specific location and system-wise breakdown. 
 # A. When a user uploads or modifies a file
   Triggered by request
   1. Validate the request and enforce file-size limits.
-  2. Scan the plaintext if scanning is enabled.
+  2. Scan the plaintext if scanning is enabled 
   3. Encrypt the file and construct its manifest.
   4. Upload the encrypted content to IPFS.
   5. Request pinning through IPFS Cluster.
@@ -1045,8 +1037,6 @@ Consequently:
 - Smart contracts can validate submitted metadata, signatures, permissions and state-transition conditions, but cannot establish the truth of external operational claims without an additional trusted attestation mechanism.
 
 The gateway MUST verify that the required IPFS pinning conditions are satisfied before submitting a file-version registration transaction.
-
-If stronger assurance against a compromised gateway is required, an extension MAY introduce independently signed pinning attestations from trusted storage nodes. The smart contract can verify these attestations against registered public keys and enforce a required threshold. Such attestations provide evidence of reported pinning status, not a guarantee of permanent content availability.
 
 ### 10.4.3 IPFS Access Control and CID Confidentiality
 
@@ -1347,10 +1337,11 @@ The MVP is not complete until these criteria pass:
 10. The client, gateway, contract and storage modules have automated tests and can be run using documented local setup commands.
 11. No plaintext/DEK/private key leaks appear in logs/test fixtures/repository. Production mode refuses the test-only key provider.
 12. Every module has a short README or rustdoc documenting purpose, interface and test command.
+13. Set-up functionality should be built so all the nodes of the application can be run simultaneously and the various workflows can be tested.
 
 # 16. Implementation phases for the coding agent
 
-Implement one phase at a time. For each phase: add tests first where practical, implement minimal behavior, run relevant tests, update README and keep the main branch buildable.
+Implement one phase at a time. For each phase: add tests first where practical, implement minimal behavior, run relevant tests, update README. All features are implemented in the agent/development branch and merging is only done after explicit approval by the human reviewer. Use the relevant folders for the different applications and interfaces and only communicate via defined protocols. 
 
 ## Phase 0 — repository and decision scaffolding
 - Create workspace/project layout, lint/format rules, pinned toolchains/dependencies, configuration example and CI tests.
