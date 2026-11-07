@@ -6,6 +6,12 @@ import {AccessGovernance} from "./AccessGovernance.sol";
 import {RrdsEip712} from "./libraries/RrdsEip712.sol";
 
 contract AccessGovernanceTest is Test {
+    event MemberKeyRegistered(
+        bytes32 indexed memberId,
+        uint32 indexed keyVersion,
+        bool encryptionKey,
+        bytes32 publicKey
+    );
     address private constant TIMELOCK = address(0x100);
     address private constant EMERGENCY_SAFE = address(0x200);
     address private constant ORGANIZATION_SAFE = address(0x300);
@@ -128,6 +134,47 @@ contract AccessGovernanceTest is Test {
         );
         assertEq(governance.signingAddressMembers(newSigningAddress), MEMBER_ID);
         assertEq(governance.signingAddressMembers(oldSigner), bytes32(0));
+    }
+
+    function test_RegistrationEmitsBothVersionedPublicKeysForIndexer() public {
+        bytes32 memberId = bytes32(uint256(99));
+        address signingAddress = vm.addr(0x5151);
+        bytes32 encryptionPublicKey = bytes32(uint256(0x6161));
+        bytes32 nonce = bytes32(uint256(0x7171));
+        uint256 deadline = block.timestamp + 1 days;
+        bytes memory proof = _keyProofSignature(
+            memberId,
+            ORGANIZATION_ID,
+            signingAddress,
+            3,
+            4,
+            encryptionPublicKey,
+            nonce,
+            deadline,
+            0x5151
+        );
+
+        vm.expectEmit(true, true, false, true, address(governance));
+        emit MemberKeyRegistered(
+            memberId,
+            3,
+            false,
+            bytes32(uint256(uint160(signingAddress)))
+        );
+        vm.expectEmit(true, true, false, true, address(governance));
+        emit MemberKeyRegistered(memberId, 4, true, encryptionPublicKey);
+        vm.prank(ORGANIZATION_SAFE);
+        governance.registerMember(
+            ORGANIZATION_ID,
+            memberId,
+            signingAddress,
+            3,
+            4,
+            encryptionPublicKey,
+            nonce,
+            deadline,
+            proof
+        );
     }
 
     function test_SigningAddressCannotIdentifyMultipleMembers() public {

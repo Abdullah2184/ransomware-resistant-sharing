@@ -3,3 +3,17 @@ name = "gateway"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+
+[dependencies]
+axum = { version = "=0.8.9", features = ["json"] }
+chain-adapter = { path = "../../crates/chain_adapter" }
+crypto = { path = "../../crates/crypto" }
+domain = { path = "../../crates/domain" }
+getrandom.workspace = true
+k256.workspace = true
+metadata-store = { path = "../../crates/metadata_store" }
+serde.workspace = true
+serde_json.workspace = true
+sha3.workspace = true
+sqlx.workspace = true
+tokio.workspace = true

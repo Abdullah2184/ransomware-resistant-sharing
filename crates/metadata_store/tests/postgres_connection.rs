@@ -1,7 +1,7 @@
 use metadata_store::PostgresStore;
 
 #[tokio::test]
-async fn migrates_indexer_schema_and_reuses_versioned_migrations() {
+async fn migrates_metadata_schema_and_reuses_versioned_migrations() {
     let database_url = match std::env::var("DATABASE_URL") {
         Ok(url) => url,
         Err(_) => {
@@ -29,7 +29,11 @@ async fn migrates_indexer_schema_and_reuses_versioned_migrations() {
          AND to_regclass('indexed_contract_events') IS NOT NULL \
          AND to_regclass('files_projection') IS NOT NULL \
          AND to_regclass('organizations_projection') IS NOT NULL \
-         AND to_regclass('indexer_projection_chain') IS NOT NULL",
+         AND to_regclass('indexer_projection_chain') IS NOT NULL \
+         AND to_regclass('gateway_login_challenges') IS NOT NULL \
+         AND to_regclass('gateway_sessions') IS NOT NULL \
+         AND to_regclass('gateway_rate_buckets') IS NOT NULL \
+         AND to_regclass('gateway_audit_events') IS NOT NULL",
     )
     .fetch_one(store.pool())
     .await

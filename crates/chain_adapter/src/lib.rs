@@ -90,6 +90,25 @@ pub struct FileHeadState {
     pub manifest_hash: String,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MemberIdentityState {
+    pub signing_address: EvmAddress,
+    pub encryption_key_version: u32,
+    pub active: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FileVersionState {
+    pub content_cid: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EnvelopeSetState {
+    pub cid: String,
+    pub epoch_id: [u8; 32],
+    pub revision: u32,
+}
+
 /// JSON-RPC client that never falls back from the node's `finalized` tag to a
 /// guessed confirmation count.
 pub struct BesuClient {
@@ -249,6 +268,306 @@ impl BesuClient {
         }))
     }
 
+    pub async fn file_head_at(
+        &self,
+        file_registry: &EvmAddress,
+        file_id: &[u8; 32],
+        block_number: u64,
+    ) -> Result<Option<FileHeadState>, ChainError> {
+        let selector = Keccak256::digest(b"getFile(bytes32)");
+        let mut call_data = Vec::with_capacity(36);
+        call_data.extend_from_slice(&selector[..4]);
+        call_data.extend_from_slice(file_id);
+        let result: String = self
+            .rpc(
+                "eth_call",
+                json!([{
+                    "to": format_address(file_registry),
+                    "data": format!("0x{}", encode_hex(&call_data)),
+                }, quantity(block_number)]),
+            )
+            .await?;
+        let bytes = decode_hex(&result)?;
+        let tuple_offset =
+            usize::try_from(read_word_u64(&bytes, 0)?).map_err(|_| ChainError::InvalidResponse)?;
+        if tuple_offset < 32 || tuple_offset % 32 != 0 {
+            return Err(ChainError::InvalidResponse);
+        }
+        let status = read_word_u64(&bytes, tuple_word_offset(tuple_offset, 5)?)?;
+        if status > 2 {
+            return Err(ChainError::InvalidResponse);
+        }
+        if status == 0 {
+            return Ok(None);
+        }
+        let version_number = read_word_u64(&bytes, tuple_word_offset(tuple_offset, 6)?)?;
+        let manifest_start = tuple_word_offset(tuple_offset, 7)?;
+        let manifest_end = manifest_start
+            .checked_add(32)
+            .ok_or(ChainError::InvalidResponse)?;
+        let manifest_hash = bytes
+            .get(manifest_start..manifest_end)
+            .ok_or(ChainError::InvalidResponse)?;
+        Ok(Some(FileHeadState {
+            status,
+            version_number,
+            manifest_hash: format!("0x{}", encode_hex(manifest_hash)),
+        }))
+    }
+
+    /// Returns the active member's signing address from finalized contract state.
+    ///
+    /// Inactive or unregistered identities return `None`; malformed contract
+    /// responses fail closed.
+    pub async fn active_member_signer(
+        &self,
+        access_governance: &EvmAddress,
+        member_id: &[u8; 32],
+    ) -> Result<Option<EvmAddress>, ChainError> {
+        let selector = Keccak256::digest(b"memberIdentity(bytes32)");
+        let mut call_data = Vec::with_capacity(36);
+        call_data.extend_from_slice(&selector[..4]);
+        call_data.extend_from_slice(member_id);
+        let result: String = self
+            .rpc(
+                "eth_call",
+                json!([{
+                    "to": format_address(access_governance),
+                    "data": format!("0x{}", encode_hex(&call_data)),
+                }, "finalized"]),
+            )
+            .await?;
+        let words = decode_hex(&result)?;
+        if words.len() != 6 * 32 {
+            return Err(ChainError::InvalidResponse);
+        }
+
+        let status = parse_abi_u64(&words[5 * 32..6 * 32])?;
+        if status != 1 {
+            return Ok(None);
+        }
+        let address_word = &words[32..64];
+        if address_word[..12].iter().any(|byte| *byte != 0) {
+            return Err(ChainError::InvalidResponse);
+        }
+        let mut address = [0; 20];
+        address.copy_from_slice(&address_word[12..]);
+        if address == [0; 20] {
+            return Err(ChainError::InvalidResponse);
+        }
+        Ok(Some(EvmAddress::from_bytes(address)))
+    }
+
+    pub async fn member_identity(
+        &self,
+        access_governance: &EvmAddress,
+        member_id: &[u8; 32],
+        block_number: u64,
+    ) -> Result<Option<MemberIdentityState>, ChainError> {
+        let selector = Keccak256::digest(b"memberIdentity(bytes32)");
+        let mut call_data = Vec::with_capacity(36);
+        call_data.extend_from_slice(&selector[..4]);
+        call_data.extend_from_slice(member_id);
+        let encoded: String = self
+            .rpc(
+                "eth_call",
+                json!([{
+                    "to": format_address(access_governance),
+                    "data": format!("0x{}", encode_hex(&call_data)),
+                }, quantity(block_number)]),
+            )
+            .await?;
+        let result = decode_hex(&encoded)?;
+        if result.len() != 6 * 32 {
+            return Err(ChainError::InvalidResponse);
+        }
+        let organization = &result[..32];
+        let mut signer = [0; 20];
+        let signer_word = &result[32..64];
+        if signer_word[..12].iter().any(|byte| *byte != 0) {
+            return Err(ChainError::InvalidResponse);
+        }
+        signer.copy_from_slice(&signer_word[12..]);
+        let signing_key_version = parse_abi_u32(&result[64..96])?;
+        let encryption_key_version = parse_abi_u32(&result[96..128])?;
+        let encryption_key = &result[128..160];
+        let status = parse_abi_u64(&result[160..192])?;
+        if status > 3 {
+            return Err(ChainError::InvalidResponse);
+        }
+        if status == 0 {
+            if organization.iter().any(|byte| *byte != 0)
+                || signer != [0; 20]
+                || signing_key_version != 0
+                || encryption_key_version != 0
+                || encryption_key.iter().any(|byte| *byte != 0)
+            {
+                return Err(ChainError::InvalidResponse);
+            }
+            return Ok(None);
+        }
+        if organization.iter().all(|byte| *byte == 0)
+            || signer == [0; 20]
+            || signing_key_version == 0
+            || encryption_key_version == 0
+            || encryption_key.iter().all(|byte| *byte == 0)
+        {
+            return Err(ChainError::InvalidResponse);
+        }
+        Ok(Some(MemberIdentityState {
+            signing_address: EvmAddress::from_bytes(signer),
+            encryption_key_version,
+            active: status == 1,
+        }))
+    }
+
+    pub async fn has_read_access(
+        &self,
+        access_governance: &EvmAddress,
+        member_id: &[u8; 32],
+        file_id: &[u8; 32],
+        block_number: u64,
+    ) -> Result<bool, ChainError> {
+        let selector = Keccak256::digest(b"hasReadAccess(bytes32,bytes32)");
+        let mut call_data = Vec::with_capacity(68);
+        call_data.extend_from_slice(&selector[..4]);
+        call_data.extend_from_slice(member_id);
+        call_data.extend_from_slice(file_id);
+        let result: String = self
+            .rpc(
+                "eth_call",
+                json!([{
+                    "to": format_address(access_governance),
+                    "data": format!("0x{}", encode_hex(&call_data)),
+                }, quantity(block_number)]),
+            )
+            .await?;
+        let result = decode_hex(&result)?;
+        if result.len() != 32 || result[..31].iter().any(|byte| *byte != 0) || result[31] > 1 {
+            return Err(ChainError::InvalidResponse);
+        }
+        Ok(result[31] == 1)
+    }
+
+    pub async fn file_version(
+        &self,
+        file_registry: &EvmAddress,
+        file_id: &[u8; 32],
+        version_number: u64,
+        block_number: u64,
+    ) -> Result<Option<FileVersionState>, ChainError> {
+        let selector = Keccak256::digest(b"getVersion(bytes32,uint64)");
+        let mut call_data = Vec::with_capacity(68);
+        call_data.extend_from_slice(&selector[..4]);
+        call_data.extend_from_slice(file_id);
+        call_data.extend_from_slice(&abi_word_u64(version_number));
+        let encoded = match self
+            .rpc::<String>(
+                "eth_call",
+                json!([{
+                    "to": format_address(file_registry),
+                    "data": format!("0x{}", encode_hex(&call_data)),
+                }, quantity(block_number)]),
+            )
+            .await
+        {
+            Ok(encoded) => decode_hex(&encoded)?,
+            Err(ChainError::RpcRejected(_)) => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let tuple_offset = usize::try_from(read_word_u64(&encoded, 0)?)
+            .map_err(|_| ChainError::InvalidResponse)?;
+        if tuple_offset < 32 || tuple_offset % 32 != 0 {
+            return Err(ChainError::InvalidResponse);
+        }
+        let tuple_end = tuple_offset.checked_add(9 * 32).ok_or(ChainError::InvalidResponse)?;
+        if encoded.get(tuple_offset..tuple_end).is_none() {
+            return Err(ChainError::InvalidResponse);
+        }
+        let returned_version = read_word_u64(&encoded, tuple_offset + 32)?;
+        if returned_version != version_number {
+            return Err(ChainError::InvalidResponse);
+        }
+        let content_offset = usize::try_from(read_word_u64(&encoded, tuple_offset + 3 * 32)?)
+            .map_err(|_| ChainError::InvalidResponse)?;
+        let content_cid = decode_abi_string(&encoded, tuple_offset, content_offset)?;
+        let cid = domain::ContentCid::parse(&content_cid)
+            .map_err(|_| ChainError::InvalidResponse)?;
+        Ok(Some(FileVersionState {
+            content_cid: cid.to_string(),
+        }))
+    }
+
+    pub async fn current_envelope_set(
+        &self,
+        access_governance: &EvmAddress,
+        file_id: &[u8; 32],
+        version_number: u64,
+        block_number: u64,
+    ) -> Result<Option<EnvelopeSetState>, ChainError> {
+        let selector = Keccak256::digest(b"currentEnvelopeSet(bytes32,uint64)");
+        let mut call_data = Vec::with_capacity(68);
+        call_data.extend_from_slice(&selector[..4]);
+        call_data.extend_from_slice(file_id);
+        call_data.extend_from_slice(&abi_word_u64(version_number));
+        let encoded = match self
+            .rpc::<String>(
+                "eth_call",
+                json!([{
+                    "to": format_address(access_governance),
+                    "data": format!("0x{}", encode_hex(&call_data)),
+                }, quantity(block_number)]),
+            )
+            .await
+        {
+            Ok(encoded) => decode_hex(&encoded)?,
+            Err(ChainError::RpcRejected(_)) => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let offset = usize::try_from(read_word_u64(&encoded, 0)?)
+            .map_err(|_| ChainError::InvalidResponse)?;
+        if offset < 96 || offset % 32 != 0 {
+            return Err(ChainError::InvalidResponse);
+        }
+        let epoch_start = encoded.get(32..64).ok_or(ChainError::InvalidResponse)?;
+        let mut epoch_id = [0; 32];
+        epoch_id.copy_from_slice(epoch_start);
+        let revision = parse_abi_u32(encoded.get(64..96).ok_or(ChainError::InvalidResponse)?)?;
+        if epoch_id == [0; 32] || revision == 0 {
+            return Err(ChainError::InvalidResponse);
+        }
+        let cid = decode_abi_string(&encoded, 0, offset)?;
+        let cid = domain::EnvelopeSetCid::parse(&cid)
+            .map_err(|_| ChainError::InvalidResponse)?;
+        Ok(Some(EnvelopeSetState {
+            cid: cid.to_string(),
+            epoch_id,
+            revision,
+        }))
+    }
+
+    async fn eth_call(
+        &self,
+        contract: &EvmAddress,
+        signature: &str,
+        bytes32_argument: &[u8; 32],
+    ) -> Result<Vec<u8>, ChainError> {
+        let selector = Keccak256::digest(signature.as_bytes());
+        let mut call_data = Vec::with_capacity(36);
+        call_data.extend_from_slice(&selector[..4]);
+        call_data.extend_from_slice(bytes32_argument);
+        let result: String = self
+            .rpc(
+                "eth_call",
+                json!([{
+                    "to": format_address(contract),
+                    "data": format!("0x{}", encode_hex(&call_data)),
+                }, "finalized"]),
+            )
+            .await?;
+        decode_hex(&result)
+    }
+
     async fn rpc<T: DeserializeOwned>(&self, method: &str, params: Value) -> Result<T, ChainError> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let response = self
@@ -299,6 +618,61 @@ struct RpcResponse<T> {
 #[derive(Deserialize)]
 struct RpcErrorObject {
     code: i64,
+}
+
+fn parse_abi_u64(word: &[u8]) -> Result<u64, ChainError> {
+    if word.len() != 32 || word[..24].iter().any(|byte| *byte != 0) {
+        return Err(ChainError::InvalidResponse);
+    }
+    let mut value = [0; 8];
+    value.copy_from_slice(&word[24..]);
+    Ok(u64::from_be_bytes(value))
+}
+
+fn parse_abi_u32(word: &[u8]) -> Result<u32, ChainError> {
+    if word.len() != 32 || word[..28].iter().any(|byte| *byte != 0) {
+        return Err(ChainError::InvalidResponse);
+    }
+    let mut value = [0; 4];
+    value.copy_from_slice(&word[28..]);
+    Ok(u32::from_be_bytes(value))
+}
+
+fn abi_word_u64(value: u64) -> [u8; 32] {
+    let mut word = [0; 32];
+    word[24..].copy_from_slice(&value.to_be_bytes());
+    word
+}
+
+fn decode_abi_string(encoded: &[u8], tuple_start: usize, offset: usize) -> Result<String, ChainError> {
+    if offset % 32 != 0 {
+        return Err(ChainError::InvalidResponse);
+    }
+    let start = tuple_start
+        .checked_add(offset)
+        .ok_or(ChainError::InvalidResponse)?;
+    let length_end = start.checked_add(32).ok_or(ChainError::InvalidResponse)?;
+    let length = usize::try_from(read_word_u64(encoded, start)?)
+        .map_err(|_| ChainError::InvalidResponse)?;
+    if length == 0 || length > 256 {
+        return Err(ChainError::InvalidResponse);
+    }
+    let end = length_end
+        .checked_add(length)
+        .ok_or(ChainError::InvalidResponse)?;
+    let bytes = encoded
+        .get(length_end..end)
+        .ok_or(ChainError::InvalidResponse)?;
+    let padding_end = length_end
+        .checked_add(length.div_ceil(32) * 32)
+        .ok_or(ChainError::InvalidResponse)?;
+    let padding = encoded
+        .get(end..padding_end)
+        .ok_or(ChainError::InvalidResponse)?;
+    if padding.iter().any(|byte| *byte != 0) {
+        return Err(ChainError::InvalidResponse);
+    }
+    String::from_utf8(bytes.to_vec()).map_err(|_| ChainError::InvalidResponse)
 }
 
 fn format_address(address: &EvmAddress) -> String {
@@ -459,6 +833,50 @@ mod tests {
                 version_number: 3,
                 manifest_hash: format!("0x{}", "ab".repeat(32)),
             })
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn queries_active_member_signer_at_finalized_state() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = vec![0; 4096];
+            let read = stream.read(&mut request).await.unwrap();
+            let request_text = String::from_utf8_lossy(&request[..read]);
+            assert!(request_text.contains("\"eth_call\""));
+            assert!(request_text.contains("\"finalized\""));
+
+            let mut output = String::new();
+            output.push_str(&"00".repeat(32));
+            output.push_str(&format!("{}{}", "00".repeat(12), "11".repeat(20)));
+            output.push_str(&format!("{:064x}", 1));
+            output.push_str(&format!("{:064x}", 1));
+            output.push_str(&"22".repeat(32));
+            output.push_str(&format!("{:064x}", 1));
+            let body = json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": format!("0x{output}")
+            })
+            .to_string();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+        });
+
+        let client = BesuClient::new(&format!("http://{address}")).unwrap();
+        assert_eq!(
+            client
+                .active_member_signer(&EvmAddress::from_bytes([0x33; 20]), &[0x44; 32])
+                .await
+                .unwrap(),
+            Some(EvmAddress::from_bytes([0x11; 20]))
         );
         server.await.unwrap();
     }

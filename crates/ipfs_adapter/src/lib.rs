@@ -123,8 +123,11 @@ impl IpfsClusterStore {
     pub fn new(config: IpfsConfig) -> Result<Self, StorageError> {
         if config.kubo_api_urls.is_empty()
             || config.max_upload_bytes == 0
+            || config.request_timeout.is_zero()
             || config.replication_timeout.is_zero()
             || config.replication_poll_interval.is_zero()
+            || config.cluster_credentials.username.is_empty()
+            || config.cluster_credentials.password.is_empty()
         {
             return Err(StorageError::InvalidPackage);
         }
@@ -602,12 +605,15 @@ fn raw_chunk_cid(bytes: &[u8]) -> Result<String, StorageError> {
 }
 
 fn verify_block_cid(expected: &cid::Cid, block: &[u8]) -> bool {
-    if expected.hash().code() != 0x12 {
+    if expected.version() != cid::Version::V1
+        || expected.hash().code() != 0x12
+        || expected.hash().digest().len() != 32
+    {
         return false;
     }
     use sha2::{Digest, Sha256};
 
-    Sha256::digest(block).as_slice() == expected.hash().digest()
+    Sha256::digest(block)[..] == *expected.hash().digest()
 }
 
 #[derive(Deserialize)]
@@ -661,6 +667,30 @@ mod tests {
                 cluster_api_url: "http://localhost:9094".to_owned(),
                 cluster_credentials: ClusterCredentials::new("user", "password"),
                 request_timeout: Duration::from_secs(1),
+                replication_timeout: Duration::from_secs(1),
+                replication_poll_interval: Duration::from_millis(50),
+                max_upload_bytes: 1024,
+            })
+            .is_err()
+        );
+        assert!(
+            IpfsClusterStore::new(IpfsConfig {
+                kubo_api_urls: vec!["http://localhost:5001".to_owned()],
+                cluster_api_url: "http://localhost:9094".to_owned(),
+                cluster_credentials: ClusterCredentials::new("", "password"),
+                request_timeout: Duration::from_secs(1),
+                replication_timeout: Duration::from_secs(1),
+                replication_poll_interval: Duration::from_millis(50),
+                max_upload_bytes: 1024,
+            })
+            .is_err()
+        );
+        assert!(
+            IpfsClusterStore::new(IpfsConfig {
+                kubo_api_urls: vec!["http://localhost:5001".to_owned()],
+                cluster_api_url: "http://localhost:9094".to_owned(),
+                cluster_credentials: ClusterCredentials::new("user", "password"),
+                request_timeout: Duration::ZERO,
                 replication_timeout: Duration::from_secs(1),
                 replication_poll_interval: Duration::from_millis(50),
                 max_upload_bytes: 1024,

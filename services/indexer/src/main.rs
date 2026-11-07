@@ -94,6 +94,13 @@ impl fmt::Display for IndexerError {
 
 impl Error for IndexerError {}
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StartupMode {
+    Normal,
+    RebuildProjections,
+    ReindexFromChain,
+}
+
 struct Indexer {
     config: Config,
     client: BesuClient,
@@ -179,7 +186,12 @@ impl Indexer {
         }
 
         let rows = sqlx::query(
-            "SELECT file_id FROM files_projection WHERE file_status IS NOT NULL ORDER BY file_id",
+            "SELECT DISTINCT event_data->>'file_id' AS file_id FROM indexed_contract_events \
+             WHERE chain_id = $1 AND event_name = 'FileCreated' ORDER BY file_id",
+        )
+        .bind(
+            i64::try_from(self.config.expected_chain_id)
+                .map_err(|_| IndexerError::InvalidConfiguration)?,
         )
         .fetch_all(self.database.pool())
         .await
@@ -246,11 +258,12 @@ async fn main() {
 }
 
 async fn run() -> Result<(), IndexerError> {
-    let rebuild = match env::args().skip(1).collect::<Vec<_>>().as_slice() {
-        [] => false,
-        [argument] if argument == "--rebuild-projections" => true,
+    let mode = match env::args().skip(1).collect::<Vec<_>>().as_slice() {
+        [] => StartupMode::Normal,
+        [argument] if argument == "--rebuild-projections" => StartupMode::RebuildProjections,
+        [argument] if argument == "--reindex-from-chain" => StartupMode::ReindexFromChain,
         [argument] if argument == "--help" || argument == "-h" => {
-            println!("Usage: indexer [--rebuild-projections]");
+            println!("Usage: indexer [--rebuild-projections | --reindex-from-chain]");
             return Ok(());
         }
         _ => return Err(IndexerError::InvalidConfiguration),
@@ -282,9 +295,18 @@ async fn run() -> Result<(), IndexerError> {
         return Err(IndexerError::ChainIdMismatch);
     }
     ensure_projection_chain(indexer.database.pool(), chain_id).await?;
-    if rebuild {
-        rebuild_projections(indexer.database.pool(), chain_id).await?;
-        eprintln!("rebuilt indexer projections from persisted finalized events");
+    match mode {
+        StartupMode::Normal => {}
+        StartupMode::RebuildProjections => {
+            rebuild_projections(indexer.database.pool(), chain_id).await?;
+            eprintln!("rebuilt indexer projections from persisted finalized events");
+        }
+        StartupMode::ReindexFromChain => {
+            reset_indexed_chain(indexer.database.pool(), chain_id).await?;
+            eprintln!(
+                "cleared derived index state; replaying finalized events from INDEXER_START_BLOCK"
+            );
+        }
     }
     let mut interval = time::interval(POLL_INTERVAL);
     loop {
@@ -313,10 +335,15 @@ async fn reconcile_head(
     let finalized_block = i64::try_from(finalized_block).map_err(|_| IndexerError::InvalidRange)?;
     let file_id = format!("0x{}", encode_hex(file_id));
     sqlx::query(
-        "UPDATE files_projection SET current_version = $2, current_head_manifest_hash = $3, \
-         file_status = $4, updated_block_number = $5 WHERE file_id = $1 AND \
-         (current_version IS DISTINCT FROM $2 OR current_head_manifest_hash IS DISTINCT FROM $3 \
-          OR file_status IS DISTINCT FROM $4)",
+        "INSERT INTO files_projection \
+         (file_id, current_version, current_head_manifest_hash, file_status, updated_block_number) \
+         VALUES ($1,$2,$3,$4,$5) ON CONFLICT (file_id) DO UPDATE SET \
+         current_version = EXCLUDED.current_version, \
+         current_head_manifest_hash = EXCLUDED.current_head_manifest_hash, \
+         file_status = EXCLUDED.file_status, updated_block_number = EXCLUDED.updated_block_number \
+         WHERE files_projection.current_version IS DISTINCT FROM EXCLUDED.current_version \
+         OR files_projection.current_head_manifest_hash IS DISTINCT FROM EXCLUDED.current_head_manifest_hash \
+         OR files_projection.file_status IS DISTINCT FROM EXCLUDED.file_status",
     )
     .bind(file_id)
     .bind(i64::try_from(state.version_number).map_err(|_| IndexerError::InvalidRange)?)
@@ -455,23 +482,7 @@ async fn rebuild_projections_in_transaction(
     const PAGE_SIZE: i64 = 1_000;
 
     let chain_id = i64::try_from(chain_id).map_err(|_| IndexerError::InvalidConfiguration)?;
-    for table in [
-        "organizations_projection",
-        "members_projection",
-        "member_keys_projection",
-        "files_projection",
-        "folders_projection",
-        "versions_projection",
-        "access_projection",
-        "envelope_sets_projection",
-    ] {
-        let statement = format!("DELETE FROM {table}");
-        sqlx::query(AssertSqlSafe(statement))
-            .execute(&mut **transaction)
-            .await
-            .map_err(|_| IndexerError::Database)?;
-    }
-
+    clear_projection_tables(transaction).await?;
     let (mut last_block, mut last_transaction, mut last_log) = (-1_i64, -1_i64, -1_i64);
     loop {
         let rows = sqlx::query(
@@ -522,6 +533,56 @@ async fn rebuild_projections_in_transaction(
             (last_block, last_transaction, last_log) = (block_number, transaction_index, log_index);
         }
     }
+    Ok(())
+}
+
+async fn clear_projection_tables(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+) -> Result<(), IndexerError> {
+    for table in [
+        "organizations_projection",
+        "members_projection",
+        "member_keys_projection",
+        "files_projection",
+        "folders_projection",
+        "versions_projection",
+        "access_projection",
+        "envelope_sets_projection",
+    ] {
+        let statement = format!("DELETE FROM {table}");
+        sqlx::query(AssertSqlSafe(statement))
+            .execute(&mut **transaction)
+            .await
+            .map_err(|_| IndexerError::Database)?;
+    }
+    Ok(())
+}
+
+async fn reset_indexed_chain(pool: &PgPool, chain_id: u64) -> Result<(), IndexerError> {
+    let mut transaction = pool.begin().await.map_err(|_| IndexerError::Database)?;
+    reset_indexed_chain_in_transaction(&mut transaction, chain_id).await?;
+    transaction
+        .commit()
+        .await
+        .map_err(|_| IndexerError::Database)
+}
+
+async fn reset_indexed_chain_in_transaction(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    chain_id: u64,
+) -> Result<(), IndexerError> {
+    let chain_id = i64::try_from(chain_id).map_err(|_| IndexerError::InvalidConfiguration)?;
+    clear_projection_tables(transaction).await?;
+    sqlx::query("DELETE FROM indexed_contract_events WHERE chain_id = $1")
+        .bind(chain_id)
+        .execute(&mut **transaction)
+        .await
+        .map_err(|_| IndexerError::Database)?;
+    sqlx::query("DELETE FROM indexer_checkpoints WHERE chain_id = $1")
+        .bind(chain_id)
+        .execute(&mut **transaction)
+        .await
+        .map_err(|_| IndexerError::Database)?;
     Ok(())
 }
 
@@ -1116,7 +1177,7 @@ mod tests {
     #[tokio::test]
     async fn event_replay_is_idempotent_and_projection_rebuild_is_atomic() {
         let _guard = TEST_LOCK.lock().await;
-        let Some((_, mut transaction)) = integration_transaction().await else {
+        let Some((pool, mut transaction)) = integration_transaction().await else {
             return;
         };
         let file_id = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -1153,7 +1214,7 @@ mod tests {
             &parent_hash[2..],
             &epoch_id[2..],
             &member_id[2..],
-            format!("{}{}", "00".repeat(12), "88".repeat(20)),
+            format_args!("{}{}", "00".repeat(12), "88".repeat(20)),
             word(content_offset),
             word(envelope_offset),
         );
@@ -1227,6 +1288,18 @@ mod tests {
         assert_eq!(projected_head.0, 1);
         assert_eq!(projected_head.1.trim(), manifest_hash);
         assert_eq!(projected_head.2, "quarterly-report");
+        let checkpoint_in_transaction: (i64, String) = sqlx::query_as(
+            "SELECT block_number, block_hash FROM indexer_checkpoints WHERE chain_id = $1",
+        )
+        .bind(TEST_CHAIN_ID as i64)
+        .fetch_one(&mut *transaction)
+        .await
+        .expect("read batch checkpoint");
+        assert_eq!(checkpoint_in_transaction.0, 10);
+        assert_eq!(
+            checkpoint_in_transaction.1.trim(),
+            format!("0x{}", "22".repeat(32))
+        );
 
         sqlx::query("UPDATE files_projection SET display_name = 'corrupt' WHERE file_id = $1")
             .bind(file_id)
@@ -1259,13 +1332,28 @@ mod tests {
             "0x8888888888888888888888888888888888888888"
         );
         assert_eq!(event_count_in_transaction(&mut transaction).await, 4);
+        reset_indexed_chain_in_transaction(&mut transaction, TEST_CHAIN_ID)
+            .await
+            .expect("reset derived index state for a chain replay");
+        assert_eq!(event_count_in_transaction(&mut transaction).await, 0);
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM files_projection WHERE file_id = $1"
+            )
+            .bind(file_id)
+            .fetch_one(&mut *transaction)
+            .await
+            .unwrap(),
+            0
+        );
+        assert_eq!(read_checkpoint(&pool, TEST_CHAIN_ID).await.unwrap(), None);
         transaction.rollback().await.expect("rollback test data");
     }
 
     #[tokio::test]
     async fn failed_event_decode_rolls_back_events_and_checkpoint() {
         let _guard = TEST_LOCK.lock().await;
-        let Some((pool, mut transaction)) = integration_transaction().await else {
+        let Some((pool, transaction)) = integration_transaction().await else {
             return;
         };
         let organization = log(
@@ -1287,15 +1375,9 @@ mod tests {
         );
         let hashes = BTreeMap::from([(4, format!("0x{}", "22".repeat(32)))]);
         assert!(
-            apply_range_in_transaction(
-                &mut transaction,
-                TEST_CHAIN_ID,
-                4,
-                &hashes,
-                &[organization, malformed]
-            )
-            .await
-            .is_err()
+            apply_range(&pool, TEST_CHAIN_ID, 4, &hashes, &[organization, malformed])
+                .await
+                .is_err()
         );
         transaction
             .rollback()

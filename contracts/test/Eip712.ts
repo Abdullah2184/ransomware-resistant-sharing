@@ -76,6 +76,24 @@ const memberKeyProofTypes = {
   ],
 } as const;
 
+const gatewayDomain = {
+  name: "RRDS Gateway",
+  version: "1",
+  chainId: 1337,
+  verifyingContract: "0x3333333333333333333333333333333333333333",
+} as const;
+
+const loginChallengeTypes = {
+  LoginChallenge: [
+    { name: "memberId", type: "bytes32" },
+    { name: "nonce", type: "bytes32" },
+    { name: "issuedAt", type: "uint64" },
+    { name: "expiresAt", type: "uint64" },
+    { name: "audience", type: "string" },
+    { name: "protocolVersion", type: "uint32" },
+  ],
+} as const;
+
 describe("approved EIP-712 operation schemas", function () {
   it("matches the Rust version-append digest vector", function () {
     const digest = hashTypedData({
@@ -161,5 +179,23 @@ describe("approved EIP-712 operation schemas", function () {
     });
 
     assert.equal(digest, expected.memberKeyProof);
+  });
+
+  it("matches the Rust gateway login-challenge digest vector", function () {
+    const digest = hashTypedData({
+      domain: gatewayDomain,
+      types: loginChallengeTypes,
+      primaryType: "LoginChallenge",
+      message: {
+        memberId: `0x${"11".repeat(32)}`,
+        nonce: `0x${"22".repeat(32)}`,
+        issuedAt: 1_800_000_000n,
+        expiresAt: 1_800_000_120n,
+        audience: "rrds-local",
+        protocolVersion: 1,
+      },
+    });
+
+    assert.equal(digest, expected.loginChallenge);
   });
 });

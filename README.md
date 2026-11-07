@@ -33,8 +33,9 @@ cryptographic protocols, functional requirements and implementation plan.
 ## Development setup
 
 The verified local toolchain is pinned to Rust `1.99.1`, Node.js `26.13.0`,
-pnpm `12.18.0`, Hardhat `3.21.2`, Solidity `0.8.34`, SQLx `0.9.0`, Tokio
-`1.54.1`, PostgreSQL `18.6`, Kubo `0.43.1`, and IPFS Cluster `1.1.6`.
+pnpm `12.18.0`, Hardhat `3.21.2`, Solidity `0.8.34`, Axum `0.8.9`, SQLx
+`0.9.0`, Tokio `1.54.1`, PostgreSQL `18.6`, Kubo `0.43.1`, and IPFS Cluster
+`1.1.6`.
 Rust and JavaScript dependency selections are locked in `Cargo.lock` and
 `contracts/pnpm-lock.yaml`.
 The first Rust feature increment pins `aes-gcm` `0.11.1`, `cid` `0.11.3`,
@@ -108,8 +109,8 @@ require an active Read-ACL actor. File metadata changes follow the configured
 file metadata policy Safe instead of granting the timelock an implicit bypass.
 File creation atomically initializes the signed creator's Read and Write
 grants, file policy, first version and initial envelope pointer, as approved
-and documented in the governance ADR and §7.1.1. The Hardhat suite passes all
-35 tests (29 Solidity, 6 TypeScript). The optimized
+and documented in the governance ADR and §7.1.1. The current Hardhat suite
+passes 37 tests (30 Solidity, 7 TypeScript). The optimized
 `AccessGovernance` runtime is 15,820 bytes, below the 24,576-byte EIP-170
 limit; local Besu deployment and actual Safe integration remain unverified.
 
@@ -120,28 +121,57 @@ file creation remains disabled until the Safe schedules and executes that role
 grant after the delay. Solidity tests exercise the delay and activation path.
 They do not establish an actual Safe deployment or Besu QBFT compatibility.
 
-Phase 3 now has an asynchronous encrypted-content `BlobStore` port, an initial
-Kubo/Cluster adapter, a Besu JSON-RPC client that requires finalized state, an
-additive PostgreSQL projection migration, and an event decoder/indexer with
-transactional event insertion, checkpointing, and file-head reconciliation.
+Phase 3 implements an asynchronous encrypted-content `BlobStore` port, the
+Kubo/Cluster adapter, a Besu JSON-RPC client that requires finalized state, and
+a PostgreSQL projection/indexer pipeline with transactional event insertion,
+checkpoints, event replay, identity/ACL/file/version/envelope projections, and
+file-head reconciliation against finalized contract state.
 The approved UnixFS package profile is recorded in
 [`docs/adr/content-package-unixfs-profile.md`](docs/adr/content-package-unixfs-profile.md).
-The adapter checks manifest and chunk CIDs returned by Kubo and waits for the
-requested number of distinct Cluster peers before reporting a successful
-write. Its live two-peer integration test is ignored by default; local
-replication remains unverified because Cluster peer 2 reports `PIN_ERROR`.
-See [infra/ipfs-cluster/README.md](infra/ipfs-cluster/README.md); Kubo/Cluster
-configuration is intentionally left for manual follow-up.
+The storage adapter verifies imported manifest/chunk CIDs, hashes the retrieved
+root block against its CID, supports bounded retries over configured Kubo
+endpoints, and waits for authenticated status from the required number of
+distinct Cluster peers before returning write success. The live two-peer
+integration test is ignored by default: local replication remains unverified
+because Cluster peer 2 reported `PIN_ERROR`. See
+[infra/ipfs-cluster/README.md](infra/ipfs-cluster/README.md); further Kubo/
+Cluster configuration work is deferred for manual follow-up.
 
-Phase 3 is **in progress, not complete**. The indexer does not yet implement a
-full projection rebuild or reorg recovery, member-key projection initialization
-is incomplete because current registration events omit key versions, and the
-reconciliation currently checks file heads only. The PostgreSQL audit service,
-gateway, full governance proposal workflows, production key custody, and
-cross-component acceptance tests remain outstanding. The PostgreSQL
-connection test and domain/crypto/decoder/adapter unit tests are useful
-component checks, not evidence that the system meets all security or
-functional acceptance criteria in `TECHNICAL_SPECIFICATION.md`.
+The indexer stores raw decoded finalized events and checkpoints atomically,
+rejects chain/checkpoint mismatches, and prevents database projections from
+authorizing access. Key-version events are included in the contract and
+decoded to rebuild member signing/encryption key history. Operator recovery
+modes are available: `indexer --rebuild-projections` reconstructs projections
+from persisted finalized events; `indexer --reindex-from-chain` clears only
+derived index data for the configured chain and replays from
+`INDEXER_START_BLOCK`. The latter requires the Besu node to retain that event
+history. Required indexer values are listed in `.env.example`.
+
+The first Phase 4 gateway increment adds one-time, audience-bound EIP-712
+login challenges, signature verification against the active member signing
+key at finalized Besu state, short-lived sessions, PostgreSQL-backed
+single-use challenge/session state, shared source-address token buckets, and
+an append-only hash-chained authentication audit stream. Session tokens are
+returned once and stored only as hashes; session inspection audits before
+returning the authenticated member ID. Challenge consumption, session
+creation, and successful-login audit append are one database transaction.
+The listener verifies its configured chain ID against Besu at startup,
+defaults to loopback, and refuses non-loopback binds until TLS termination is
+configured. Rust and `viem` share a passing EIP-712 challenge digest fixture.
+See [services/gateway/README.md](services/gateway/README.md),
+[docs/api.md](docs/api.md), and the
+[gateway authentication ADR](docs/adr/gateway-authentication-and-audit.md).
+
+Protected file/content routes, authoritative per-file ACL checks,
+audit-before-CID/ciphertext release, PostgreSQL role separation, audit-query
+controls, session revocation, full governance proposal workflows, production
+key custody, and end-to-end acceptance tests remain outstanding. Auth route
+errors are rate-limited and audited, but malformed HTTP requests rejected
+before routing are not. The PostgreSQL audit service currently covers only
+gateway authentication.
+Phase 3 functionality has component and PostgreSQL integration coverage, but
+live two-peer replication and the full storage/indexer application workflow
+are **not verified**. Do not treat this as overall MVP acceptance.
 
 Rust verification for this increment:
 
@@ -151,8 +181,14 @@ cargo test --workspace --locked
 cargo clippy --workspace --all-targets --locked -- -D warnings
 ```
 
-All commands passed: 51 Rust tests passed and the live two-peer IPFS
-integration test was ignored because the Cluster replication issue remains.
-The PostgreSQL integration test applied the additive indexer migration and
-confirmed that rerunning it is a no-op; it did not reset or delete database
-data.
+The full Rust workspace passed with 67 tests and one ignored live-Cluster test;
+strict Clippy with warnings denied, formatting, and `git diff --check` also
+passed. Gateway tests cover typed-data signature recovery and domain binding,
+request JSON shape, challenge replay rejection, session token hashing,
+transactional audit-chain integrity, and shared rate-limit buckets. The
+focused run also verified the new PostgreSQL migration and finalized-state
+member lookup. The live two-peer IPFS test remains ignored pending a verified
+Cluster quorum. The Hardhat suite passed 37 tests (30 Solidity, 7 TypeScript),
+including a shared Rust/`viem` login-challenge digest vector. PostgreSQL
+integration tests applied additive migrations; rollback-only feature tests do
+not reset or delete persistent database data.
