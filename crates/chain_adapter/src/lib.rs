@@ -224,16 +224,23 @@ impl BesuClient {
         let bytes = decode_hex(&result)?;
         let tuple_offset =
             usize::try_from(read_word_u64(&bytes, 0)?).map_err(|_| ChainError::InvalidResponse)?;
-        if tuple_offset % 32 != 0 {
+        if tuple_offset < 32 || tuple_offset % 32 != 0 {
             return Err(ChainError::InvalidResponse);
         }
-        let status = read_word_u64(&bytes, tuple_offset + 5 * 32)?;
+        let status = read_word_u64(&bytes, tuple_word_offset(tuple_offset, 5)?)?;
+        if status > 2 {
+            return Err(ChainError::InvalidResponse);
+        }
         if status == 0 {
             return Ok(None);
         }
-        let version_number = read_word_u64(&bytes, tuple_offset + 6 * 32)?;
+        let version_number = read_word_u64(&bytes, tuple_word_offset(tuple_offset, 6)?)?;
+        let manifest_start = tuple_word_offset(tuple_offset, 7)?;
+        let manifest_end = manifest_start
+            .checked_add(32)
+            .ok_or(ChainError::InvalidResponse)?;
         let manifest_hash = bytes
-            .get(tuple_offset + 7 * 32..tuple_offset + 8 * 32)
+            .get(manifest_start..manifest_end)
             .ok_or(ChainError::InvalidResponse)?;
         Ok(Some(FileHeadState {
             status,
@@ -329,6 +336,13 @@ fn read_word_u64(data: &[u8], offset: usize) -> Result<u64, ChainError> {
     let mut value = [0; 8];
     value.copy_from_slice(&word[24..]);
     Ok(u64::from_be_bytes(value))
+}
+
+fn tuple_word_offset(base: usize, index: usize) -> Result<usize, ChainError> {
+    index
+        .checked_mul(32)
+        .and_then(|offset| base.checked_add(offset))
+        .ok_or(ChainError::InvalidResponse)
 }
 
 pub fn decode_hex(value: &str) -> Result<Vec<u8>, ChainError> {
@@ -446,6 +460,86 @@ mod tests {
                 manifest_hash: format!("0x{}", "ab".repeat(32)),
             })
         );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn filters_logs_to_configured_contracts_and_rejects_mismatched_results() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            for response_address in ["11", "22"] {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                let mut buffer = [0; 1024];
+                let body_start;
+                loop {
+                    let read = stream.read(&mut buffer).await.unwrap();
+                    request.extend_from_slice(&buffer[..read]);
+                    if let Some(position) =
+                        request.windows(4).position(|bytes| bytes == b"\r\n\r\n")
+                    {
+                        body_start = position + 4;
+                        break;
+                    }
+                }
+                let headers = String::from_utf8_lossy(&request[..body_start]);
+                let content_length = headers
+                    .lines()
+                    .find_map(|line| {
+                        line.to_ascii_lowercase()
+                            .strip_prefix("content-length: ")
+                            .and_then(|value| value.trim().parse::<usize>().ok())
+                    })
+                    .unwrap();
+                while request.len() < body_start + content_length {
+                    let read = stream.read(&mut buffer).await.unwrap();
+                    request.extend_from_slice(&buffer[..read]);
+                }
+                let body: Value = serde_json::from_slice(&request[body_start..]).unwrap();
+                assert_eq!(body["method"], "eth_getLogs");
+                assert_eq!(body["params"][0]["fromBlock"], "0x5");
+                assert_eq!(
+                    body["params"][0]["address"][0],
+                    format!("0x{}", "11".repeat(20))
+                );
+                let log = json!({
+                    "address": format!("0x{}", response_address.repeat(20)),
+                    "topics": [format!("0x{}", "aa".repeat(32))],
+                    "data": "0x",
+                    "blockNumber": "0x5",
+                    "blockHash": format!("0x{}", "bb".repeat(32)),
+                    "transactionHash": format!("0x{}", "cc".repeat(32)),
+                    "transactionIndex": "0x0",
+                    "logIndex": "0x0",
+                    "removed": false
+                });
+                let response_body = json!({
+                    "jsonrpc": "2.0",
+                    "id": body["id"],
+                    "result": [log]
+                })
+                .to_string();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    response_body.len(),
+                    response_body
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+
+        let client = BesuClient::new(&format!("http://{address}")).unwrap();
+        let configured_address = EvmAddress::from_bytes([0x11; 20]);
+        let accepted = client
+            .logs(5, 5, &[configured_address])
+            .await
+            .expect("matching contract log");
+        assert_eq!(accepted.len(), 1);
+        assert_eq!(accepted[0].block_number().unwrap(), 5);
+
+        let rejected = client.logs(5, 5, &[configured_address]).await;
+        assert_eq!(rejected, Err(ChainError::InvalidResponse));
         server.await.unwrap();
     }
 }

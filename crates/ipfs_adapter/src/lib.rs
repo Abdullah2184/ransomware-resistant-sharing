@@ -22,6 +22,7 @@ use tokio_util::io::{ReaderStream, StreamReader};
 
 const ADD_RESPONSE_LIMIT_BYTES: usize = 4 * 1024 * 1024;
 const PIN_STATUS_LIMIT_BYTES: usize = 1024 * 1024;
+const ROOT_BLOCK_LIMIT_BYTES: usize = 4 * 1024 * 1024;
 const MAX_REPLICA_COUNT: usize = 64;
 
 #[derive(Clone)]
@@ -335,7 +336,39 @@ impl IpfsClusterStore {
         if total_bytes == 0 {
             return Err(StorageError::IntegrityCheckFailed);
         }
-        Ok(())
+        self.verify_root_block(&cid_text).await
+    }
+
+    async fn verify_root_block(&self, cid_text: &str) -> Result<(), StorageError> {
+        let expected = cid::Cid::try_from(cid_text).map_err(|_| StorageError::InvalidCid)?;
+        let mut invalid_block = false;
+        for base in &self.kubo_api_urls {
+            let url = base
+                .join("api/v0/block/get")
+                .map_err(|_| StorageError::InvalidPackage)?;
+            let response = self
+                .client
+                .post(url)
+                .query(&[("arg", cid_text)])
+                .send()
+                .await;
+            let Ok(response) = response else {
+                continue;
+            };
+            if !response.status().is_success() {
+                continue;
+            }
+            let block = bounded_response_body(response, ROOT_BLOCK_LIMIT_BYTES).await?;
+            if verify_block_cid(&expected, &block) {
+                return Ok(());
+            }
+            invalid_block = true;
+        }
+        if invalid_block {
+            Err(StorageError::IntegrityCheckFailed)
+        } else {
+            Err(StorageError::TransportUnavailable)
+        }
     }
 }
 
@@ -390,6 +423,7 @@ impl BlobStore for IpfsClusterStore {
             let replication = self
                 .pin_and_wait(StorageCid::Content(cid.clone()), min_replicas)
                 .await?;
+            self.verify_root_block(&cid.to_string()).await?;
             Ok(StoredContent {
                 cid,
                 bytes_written,
@@ -419,6 +453,7 @@ impl BlobStore for IpfsClusterStore {
             let replication = self
                 .pin_and_wait(StorageCid::EnvelopeSet(cid.clone()), min_replicas)
                 .await?;
+            self.verify_root_block(&cid.to_string()).await?;
             Ok(StoredEnvelopeSet {
                 cid,
                 bytes_written: byte_length,
@@ -566,6 +601,15 @@ fn raw_chunk_cid(bytes: &[u8]) -> Result<String, StorageError> {
     Ok(cid::Cid::new_v1(0x55, multihash).to_string())
 }
 
+fn verify_block_cid(expected: &cid::Cid, block: &[u8]) -> bool {
+    if expected.hash().code() != 0x12 {
+        return false;
+    }
+    use sha2::{Digest, Sha256};
+
+    Sha256::digest(block).as_slice() == expected.hash().digest()
+}
+
 #[derive(Deserialize)]
 struct AddResponseLine {
     #[serde(rename = "Name")]
@@ -695,6 +739,74 @@ mod tests {
         healthy_server.await.unwrap();
     }
 
+    #[tokio::test]
+    async fn pin_wait_requires_distinct_authenticated_cluster_peers() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let cid = ContentCid::parse(&raw_chunk_cid(b"pinned payload").unwrap()).unwrap();
+        let cid_text = cid.to_string();
+        let server_cid = cid_text.clone();
+        let server = tokio::spawn(async move {
+            for request_index in 0..2 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = [0; 4096];
+                let read = socket.read(&mut request).await.unwrap();
+                let request = String::from_utf8_lossy(&request[..read]);
+                assert!(
+                    request
+                        .to_ascii_lowercase()
+                        .contains("authorization: basic")
+                );
+                assert!(request.contains("dXNlcjpwYXNzd29yZA=="));
+                if request_index == 0 {
+                    assert!(request.starts_with("POST /pins/"));
+                    assert!(request.contains("replication-min=2"));
+                    socket
+                        .write_all(
+                            b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        )
+                        .await
+                        .unwrap();
+                } else {
+                    assert!(request.starts_with("GET /pins/"));
+                    let body = serde_json::json!({
+                        "cid": server_cid,
+                        "peer_map": {
+                            "peer-one": { "status": "pinned" },
+                            "peer-two": { "status": "pinned" },
+                            "peer-three": { "status": "pin_error" }
+                        }
+                    })
+                    .to_string();
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    socket.write_all(response.as_bytes()).await.unwrap();
+                }
+            }
+        });
+        let store = IpfsClusterStore::new(IpfsConfig {
+            kubo_api_urls: vec!["http://127.0.0.1:5001".to_owned()],
+            cluster_api_url: format!("http://{address}"),
+            cluster_credentials: ClusterCredentials::new("user", "password"),
+            request_timeout: Duration::from_secs(2),
+            replication_timeout: Duration::from_secs(1),
+            replication_poll_interval: Duration::from_millis(10),
+            max_upload_bytes: 1024,
+        })
+        .unwrap();
+
+        let receipt = store
+            .pin_and_wait(StorageCid::Content(cid), 2)
+            .await
+            .unwrap();
+        assert_eq!(receipt.required_replicas, 2);
+        assert_eq!(receipt.pinned_peers, vec!["peer-one", "peer-two"]);
+        server.await.unwrap();
+    }
+
     #[test]
     fn rejects_content_add_responses_with_manifest_or_chunk_cid_mismatches() {
         let ciphertext = [0xa5; 17];
@@ -756,10 +868,23 @@ mod tests {
     #[test]
     fn computes_raw_sha256_cid_for_a_ciphertext_chunk() {
         let payload = [0xabu8; 17];
+        let cid = raw_chunk_cid(&payload).unwrap();
         assert_eq!(
-            raw_chunk_cid(&payload).unwrap(),
+            cid,
             "bafkreiewgvgk44czrxzm3u42r3ypxj76o6uebclaabcq7wsnlgaotpvcx4"
         );
+        let cid = cid::Cid::try_from(cid.as_str()).unwrap();
+        assert!(verify_block_cid(&cid, &payload));
+        assert!(!verify_block_cid(&cid, b"different block"));
+    }
+
+    #[test]
+    fn refuses_unsupported_hash_functions_when_verifying_block_cids() {
+        let cid = cid::Cid::new_v1(
+            0x55,
+            cid::multihash::Multihash::<64>::wrap(0x13, &[7; 32]).unwrap(),
+        );
+        assert!(!verify_block_cid(&cid, b"block"));
     }
 
     #[test]

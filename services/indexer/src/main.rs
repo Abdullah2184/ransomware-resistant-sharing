@@ -6,7 +6,7 @@ use chain_adapter::{BesuClient, ChainError, ChainLog, FileHeadState, FinalizedBl
 use domain::EvmAddress;
 use metadata_store::PostgresStore;
 use serde_json::Value;
-use sqlx::{PgPool, Row};
+use sqlx::{AssertSqlSafe, PgPool, Row};
 use tokio::{signal, sync::Mutex, time};
 
 const POLL_INTERVAL: Duration = Duration::from_secs(5);
@@ -54,7 +54,7 @@ impl Config {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Debug)]
 enum IndexerError {
     InvalidConfiguration,
     UnsupportedFinalityPolicy,
@@ -64,6 +64,7 @@ enum IndexerError {
     Chain(ChainError),
     Decode(decoder::DecodeError),
     Database,
+    DatabaseCause(String),
 }
 
 impl fmt::Display for IndexerError {
@@ -81,6 +82,12 @@ impl fmt::Display for IndexerError {
             Self::Chain(error) => error.fmt(formatter),
             Self::Decode(error) => error.fmt(formatter),
             Self::Database => formatter.write_str("indexer database operation failed"),
+            Self::DatabaseCause(context) => {
+                write!(
+                    formatter,
+                    "indexer database operation failed while {context}"
+                )
+            }
         }
     }
 }
@@ -433,10 +440,21 @@ async fn ensure_projection_chain(pool: &PgPool, chain_id: u64) -> Result<(), Ind
 }
 
 async fn rebuild_projections(pool: &PgPool, chain_id: u64) -> Result<(), IndexerError> {
+    let mut transaction = pool.begin().await.map_err(|_| IndexerError::Database)?;
+    rebuild_projections_in_transaction(&mut transaction, chain_id).await?;
+    transaction
+        .commit()
+        .await
+        .map_err(|_| IndexerError::Database)
+}
+
+async fn rebuild_projections_in_transaction(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    chain_id: u64,
+) -> Result<(), IndexerError> {
     const PAGE_SIZE: i64 = 1_000;
 
     let chain_id = i64::try_from(chain_id).map_err(|_| IndexerError::InvalidConfiguration)?;
-    let mut transaction = pool.begin().await.map_err(|_| IndexerError::Database)?;
     for table in [
         "organizations_projection",
         "members_projection",
@@ -448,8 +466,8 @@ async fn rebuild_projections(pool: &PgPool, chain_id: u64) -> Result<(), Indexer
         "envelope_sets_projection",
     ] {
         let statement = format!("DELETE FROM {table}");
-        sqlx::query(&statement)
-            .execute(&mut *transaction)
+        sqlx::query(AssertSqlSafe(statement))
+            .execute(&mut **transaction)
             .await
             .map_err(|_| IndexerError::Database)?;
     }
@@ -467,7 +485,7 @@ async fn rebuild_projections(pool: &PgPool, chain_id: u64) -> Result<(), Indexer
         .bind(last_transaction)
         .bind(last_log)
         .bind(PAGE_SIZE)
-        .fetch_all(&mut *transaction)
+        .fetch_all(&mut **transaction)
         .await
         .map_err(|_| IndexerError::Database)?;
         if rows.is_empty() {
@@ -494,7 +512,7 @@ async fn rebuild_projections(pool: &PgPool, chain_id: u64) -> Result<(), Indexer
                 .try_get("transaction_hash")
                 .map_err(|_| IndexerError::Database)?;
             project_event(
-                &mut transaction,
+                transaction,
                 &event_name,
                 &fields,
                 &transaction_hash,
@@ -504,10 +522,7 @@ async fn rebuild_projections(pool: &PgPool, chain_id: u64) -> Result<(), Indexer
             (last_block, last_transaction, last_log) = (block_number, transaction_index, log_index);
         }
     }
-    transaction
-        .commit()
-        .await
-        .map_err(|_| IndexerError::Database)
+    Ok(())
 }
 
 async fn apply_range(
@@ -517,10 +532,31 @@ async fn apply_range(
     canonical_hashes: &BTreeMap<u64, String>,
     logs: &[ChainLog],
 ) -> Result<(), IndexerError> {
+    let mut transaction = pool.begin().await.map_err(|_| IndexerError::Database)?;
+    apply_range_in_transaction(
+        &mut transaction,
+        chain_id,
+        checkpoint_number,
+        canonical_hashes,
+        logs,
+    )
+    .await?;
+    transaction
+        .commit()
+        .await
+        .map_err(|_| IndexerError::Database)
+}
+
+async fn apply_range_in_transaction(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    chain_id: u64,
+    checkpoint_number: u64,
+    canonical_hashes: &BTreeMap<u64, String>,
+    logs: &[ChainLog],
+) -> Result<(), IndexerError> {
     let chain_id = i64::try_from(chain_id).map_err(|_| IndexerError::InvalidConfiguration)?;
     let checkpoint_number =
         i64::try_from(checkpoint_number).map_err(|_| IndexerError::InvalidRange)?;
-    let mut transaction = pool.begin().await.map_err(|_| IndexerError::Database)?;
 
     for log in logs {
         let decoded = decoder::decode(log).map_err(IndexerError::Decode)?;
@@ -562,13 +598,13 @@ async fn apply_range(
         .bind(&decoded.fields)
         .bind(&topics)
         .bind(log.data.to_ascii_lowercase())
-        .execute(&mut *transaction)
+        .execute(&mut **transaction)
         .await
         .map_err(|_| IndexerError::Database)?;
 
         if inserted.rows_affected() == 1 {
             project_event(
-                &mut transaction,
+                transaction,
                 &decoded.name,
                 &decoded.fields,
                 &transaction_hash,
@@ -590,17 +626,36 @@ async fn apply_range(
     .bind(chain_id)
     .bind(checkpoint_number)
     .bind(block_hash)
-    .execute(&mut *transaction)
+    .execute(&mut **transaction)
     .await
     .map_err(|_| IndexerError::Database)?;
-    transaction
-        .commit()
-        .await
-        .map_err(|_| IndexerError::Database)?;
     Ok(())
 }
 
 async fn project_event(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    event_name: &str,
+    fields: &Value,
+    transaction_hash: &str,
+    block_number: i64,
+) -> Result<(), IndexerError> {
+    match project_event_inner(
+        transaction,
+        event_name,
+        fields,
+        transaction_hash,
+        block_number,
+    )
+    .await
+    {
+        Err(IndexerError::Database) => Err(IndexerError::DatabaseCause(format!(
+            "projection update failed for {event_name}"
+        ))),
+        result => result,
+    }
+}
+
+async fn project_event_inner(
     transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     event_name: &str,
     fields: &Value,
@@ -864,9 +919,6 @@ async fn project_event(
             .await
             .map_err(|_| IndexerError::Database)?;
         }
-        "MemberKeySuperseded" => {
-            // Key status transitions and newly registered keys have dedicated events.
-        }
         "ReadAccessGranted" | "ReadAccessRevoked" | "WriteAccessGranted" | "WriteAccessRevoked" => {
             let permission: i16 = if event_name.starts_with("Read") { 0 } else { 1 };
             let granted = event_name.ends_with("Granted");
@@ -962,19 +1014,14 @@ fn field_i32(fields: &Value, name: &str) -> Result<i32, IndexerError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use metadata_store::PostgresStore;
     use sha3::Digest;
-    use sqlx::{
-        Executor,
-        postgres::{PgConnectOptions, PgPoolOptions},
-    };
-    use std::{
-        str::FromStr,
-        sync::atomic::{AtomicU64, Ordering},
-    };
+    use sqlx::PgPool;
 
-    static NEXT_SCHEMA: AtomicU64 = AtomicU64::new(0);
+    static TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-    async fn isolated_pool() -> Option<(PgPool, PgPool, String)> {
+    async fn integration_transaction()
+    -> Option<(PgPool, sqlx::Transaction<'static, sqlx::Postgres>)> {
         let database_url = match env::var("DATABASE_URL") {
             Ok(value) => value,
             Err(_) => {
@@ -982,52 +1029,21 @@ mod tests {
                 return None;
             }
         };
-        let admin = PgPoolOptions::new()
-            .max_connections(1)
-            .connect(&database_url)
+        let store = PostgresStore::connect(&database_url)
             .await
-            .expect("connect to PostgreSQL for isolated indexer integration test");
-        let schema = format!(
-            "rrfs_indexer_test_{}_{}",
-            std::process::id(),
-            NEXT_SCHEMA.fetch_add(1, Ordering::Relaxed)
-        );
-        let create_schema = format!("CREATE SCHEMA {schema}");
-        admin
-            .execute(create_schema.as_str())
+            .expect("connect to PostgreSQL for indexer integration test");
+        store
+            .migrate()
             .await
-            .expect("create isolated indexer test schema");
-        let options = PgConnectOptions::from_str(&database_url)
-            .expect("parse PostgreSQL connection options")
-            .options([("search_path", schema.as_str())]);
-        let pool = PgPoolOptions::new()
-            .max_connections(3)
-            .connect_with(options)
+            .expect("apply indexer integration migrations");
+        let pool = store.pool().clone();
+        let mut transaction = pool.begin().await.expect("begin test transaction");
+        sqlx::query("SELECT pg_advisory_xact_lock($1)")
+            .bind(7_218_493_601_i64)
+            .execute(&mut *transaction)
             .await
-            .expect("connect to isolated indexer schema");
-        sqlx::raw_sql(include_str!(
-            "../../../crates/metadata_store/migrations/0001_indexer_projections.sql"
-        ))
-        .execute(&pool)
-        .await
-        .expect("create indexer projection tables");
-        sqlx::raw_sql(include_str!(
-            "../../../crates/metadata_store/migrations/0002_indexer_identity_projections.sql"
-        ))
-        .execute(&pool)
-        .await
-        .expect("create identity projection tables");
-        Some((admin, pool, schema))
-    }
-
-    async fn drop_isolated_pool(admin: PgPool, pool: PgPool, schema: &str) {
-        pool.close().await;
-        let drop_schema = format!("DROP SCHEMA {schema} CASCADE");
-        admin
-            .execute(drop_schema.as_str())
-            .await
-            .expect("drop isolated indexer test schema");
-        admin.close().await;
+            .expect("serialize rollback-only indexer tests");
+        Some((pool, transaction))
     }
 
     fn topic_word(value: &str) -> String {
@@ -1077,16 +1093,30 @@ mod tests {
         }
     }
 
+    const TEST_CHAIN_ID: u64 = 3_141_592_653;
+
     async fn event_count(pool: &PgPool) -> i64 {
-        sqlx::query_scalar("SELECT COUNT(*) FROM indexed_contract_events")
+        sqlx::query_scalar("SELECT COUNT(*) FROM indexed_contract_events WHERE chain_id = $1")
+            .bind(TEST_CHAIN_ID as i64)
             .fetch_one(pool)
             .await
             .expect("count indexed events")
     }
 
+    async fn event_count_in_transaction(
+        transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    ) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM indexed_contract_events WHERE chain_id = $1")
+            .bind(TEST_CHAIN_ID as i64)
+            .fetch_one(&mut **transaction)
+            .await
+            .expect("count test-chain events")
+    }
+
     #[tokio::test]
     async fn event_replay_is_idempotent_and_projection_rebuild_is_atomic() {
-        let Some((admin, pool, schema)) = isolated_pool().await else {
+        let _guard = TEST_LOCK.lock().await;
+        let Some((_, mut transaction)) = integration_transaction().await else {
             return;
         };
         let file_id = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -1167,19 +1197,31 @@ mod tests {
         ];
         let canonical_hashes = BTreeMap::from([(10, format!("0x{}", "22".repeat(32)))]);
 
-        apply_range(&pool, 1337, 10, &canonical_hashes, &logs)
-            .await
-            .expect("index finalized events");
-        apply_range(&pool, 1337, 10, &canonical_hashes, &logs)
-            .await
-            .expect("replay identical finalized events");
-        assert_eq!(event_count(&pool).await, 4);
+        apply_range_in_transaction(
+            &mut transaction,
+            TEST_CHAIN_ID,
+            10,
+            &canonical_hashes,
+            &logs,
+        )
+        .await
+        .expect("index finalized events");
+        apply_range_in_transaction(
+            &mut transaction,
+            TEST_CHAIN_ID,
+            10,
+            &canonical_hashes,
+            &logs,
+        )
+        .await
+        .expect("replay identical finalized events");
+        assert_eq!(event_count_in_transaction(&mut transaction).await, 4);
         let projected_head: (i64, String, String) = sqlx::query_as(
             "SELECT current_version, current_head_manifest_hash, display_name \
              FROM files_projection WHERE file_id = $1",
         )
         .bind(file_id)
-        .fetch_one(&pool)
+        .fetch_one(&mut *transaction)
         .await
         .expect("read file projection");
         assert_eq!(projected_head.0, 1);
@@ -1188,16 +1230,16 @@ mod tests {
 
         sqlx::query("UPDATE files_projection SET display_name = 'corrupt' WHERE file_id = $1")
             .bind(file_id)
-            .execute(&pool)
+            .execute(&mut *transaction)
             .await
             .expect("simulate projection drift");
-        rebuild_projections(&pool, 1337)
+        rebuild_projections_in_transaction(&mut transaction, TEST_CHAIN_ID)
             .await
             .expect("rebuild projections from persisted events");
         let rebuilt_name: String =
             sqlx::query_scalar("SELECT display_name FROM files_projection WHERE file_id = $1")
                 .bind(file_id)
-                .fetch_one(&pool)
+                .fetch_one(&mut *transaction)
                 .await
                 .expect("read rebuilt file projection");
         assert_eq!(rebuilt_name, "quarterly-report");
@@ -1207,7 +1249,7 @@ mod tests {
              FROM versions_projection WHERE file_id = $1 AND version_number = 1",
         )
         .bind(file_id)
-        .fetch_one(&pool)
+        .fetch_one(&mut *transaction)
         .await
         .expect("read version projection");
         assert_eq!(projected_version.0, content_cid);
@@ -1216,14 +1258,14 @@ mod tests {
             projected_version.2.trim(),
             "0x8888888888888888888888888888888888888888"
         );
-        assert_eq!(event_count(&pool).await, 4);
-
-        drop_isolated_pool(admin, pool, &schema).await;
+        assert_eq!(event_count_in_transaction(&mut transaction).await, 4);
+        transaction.rollback().await.expect("rollback test data");
     }
 
     #[tokio::test]
     async fn failed_event_decode_rolls_back_events_and_checkpoint() {
-        let Some((admin, pool, schema)) = isolated_pool().await else {
+        let _guard = TEST_LOCK.lock().await;
+        let Some((pool, mut transaction)) = integration_transaction().await else {
             return;
         };
         let organization = log(
@@ -1245,20 +1287,29 @@ mod tests {
         );
         let hashes = BTreeMap::from([(4, format!("0x{}", "22".repeat(32)))]);
         assert!(
-            apply_range(&pool, 1337, 4, &hashes, &[organization, malformed])
-                .await
-                .is_err()
+            apply_range_in_transaction(
+                &mut transaction,
+                TEST_CHAIN_ID,
+                4,
+                &hashes,
+                &[organization, malformed]
+            )
+            .await
+            .is_err()
         );
+        transaction
+            .rollback()
+            .await
+            .expect("rollback failed event batch");
         assert_eq!(event_count(&pool).await, 0);
-        let checkpoint = read_checkpoint(&pool, 1337).await.unwrap();
+        let checkpoint = read_checkpoint(&pool, TEST_CHAIN_ID).await.unwrap();
         assert_eq!(checkpoint, None);
-
-        drop_isolated_pool(admin, pool, &schema).await;
     }
 
     #[tokio::test]
     async fn identity_and_key_projections_follow_registration_and_supersession_events() {
-        let Some((admin, pool, schema)) = isolated_pool().await else {
+        let _guard = TEST_LOCK.lock().await;
+        let Some((_, mut transaction)) = integration_transaction().await else {
             return;
         };
         let organization_id = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -1339,7 +1390,7 @@ mod tests {
             (20, format!("0x{}", "22".repeat(32))),
             (21, format!("0x{}", "22".repeat(32))),
         ]);
-        apply_range(&pool, 1337, 21, &hashes, &logs)
+        apply_range_in_transaction(&mut transaction, TEST_CHAIN_ID, 21, &hashes, &logs)
             .await
             .expect("index identity and key events");
 
@@ -1348,7 +1399,7 @@ mod tests {
              encryption_public_key FROM members_projection WHERE member_id = $1",
         )
         .bind(member_id)
-        .fetch_one(&pool)
+        .fetch_one(&mut *transaction)
         .await
         .expect("read member projection");
         assert_eq!(
@@ -1364,7 +1415,7 @@ mod tests {
              WHERE member_id = $1 ORDER BY key_kind, key_version",
         )
         .bind(member_id)
-        .fetch_all(&pool)
+        .fetch_all(&mut *transaction)
         .await
         .expect("read member key status history");
         assert_eq!(
@@ -1377,6 +1428,9 @@ mod tests {
             ]
         );
 
-        drop_isolated_pool(admin, pool, &schema).await;
+        transaction
+            .rollback()
+            .await
+            .expect("rollback identity test data");
     }
 }

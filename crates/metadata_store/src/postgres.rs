@@ -35,7 +35,7 @@ impl PostgresStore {
         Ok(())
     }
 
-    /// Applies additive, versioned schema migrations.
+    /// Applies the additive, versioned metadata and indexer schema migrations.
     pub async fn migrate(&self) -> Result<(), sqlx::migrate::MigrateError> {
         MIGRATOR.run(&self.pool).await
     }
