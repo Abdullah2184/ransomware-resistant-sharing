@@ -3,3 +3,9 @@ name = "ports"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+
+[dependencies]
+crypto = { path = "../crypto" }
+domain = { path = "../domain" }
+tokio.workspace = true
+zeroize.workspace = true

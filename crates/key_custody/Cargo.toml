@@ -3,3 +3,15 @@ name = "key-custody"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+
+[dependencies]
+crypto = { path = "../crypto" }
+domain = { path = "../domain" }
+getrandom.workspace = true
+k256.workspace = true
+ports = { path = "../ports" }
+sha3.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true

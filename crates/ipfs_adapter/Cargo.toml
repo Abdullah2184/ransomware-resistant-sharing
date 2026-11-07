@@ -3,3 +3,16 @@ name = "ipfs-adapter"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+
+[dependencies]
+crypto = { path = "../crypto" }
+cid.workspace = true
+domain = { path = "../domain" }
+futures-util = { version = "=0.3.32" }
+ports = { path = "../ports" }
+reqwest.workspace = true
+serde = { workspace = true }
+serde_json.workspace = true
+sha2 = "=0.10.9"
+tokio.workspace = true
+tokio-util.workspace = true

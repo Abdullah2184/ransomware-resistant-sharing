@@ -2,8 +2,10 @@ name: rrfs-dev
 
 services:
   postgres:
-    image: postgres:18.6-bookworm
+    image: postgres:18.6-bookworm@sha256:f1ea2a1a4fb7b68d4836be1fdcb8a6466a89b072158bf9d97663600538c294c5
     restart: unless-stopped
+    networks:
+      - rrfs-private
 
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-rrfs_dev}
@@ -26,18 +28,25 @@ services:
       start_period: 10s
 
   kubo:
-    image: ipfs/kubo:v0.43.1
+    image: ipfs/kubo:v0.43.1@sha256:b293923d66e490e70ced64df42ea7a6cf7eac2740e3fb29101df18070fa7be48
     restart: unless-stopped
+    networks:
+      - rrfs-private
 
     environment:
       IPFS_PROFILE: server
-
-    ports:
-      - "127.0.0.1:5001:5001"
-      - "127.0.0.1:8080:8080"
+      LIBP2P_TCP_MUX: "false"
 
     volumes:
       - ipfs_data:/data/ipfs
+      - ./ipfs-cluster/start-kubo.sh:/opt/rrfs/start-kubo.sh:ro
+
+    entrypoint: ["/bin/sh", "/opt/rrfs/start-kubo.sh"]
+    command: ["daemon", "--migrate=true", "--agent-version-suffix=docker"]
+
+    secrets:
+      - source: ipfs_swarm_key
+        target: swarm-key
 
     healthcheck:
       test: ["CMD", "ipfs", "id"]
@@ -46,6 +55,135 @@ services:
       retries: 5
       start_period: 20s
 
+  kubo2:
+    image: ipfs/kubo:v0.43.1@sha256:b293923d66e490e70ced64df42ea7a6cf7eac2740e3fb29101df18070fa7be48
+    restart: unless-stopped
+    depends_on:
+      kubo:
+        condition: service_healthy
+    networks:
+      - rrfs-private
+
+    environment:
+      IPFS_PROFILE: server
+      LIBP2P_TCP_MUX: "false"
+      KUBO_BOOTSTRAP_FROM: kubo
+
+    volumes:
+      - ipfs_data_2:/data/ipfs
+      - ./ipfs-cluster/start-kubo.sh:/opt/rrfs/start-kubo.sh:ro
+
+    entrypoint: ["/bin/sh", "/opt/rrfs/start-kubo.sh"]
+    command: ["daemon", "--migrate=true", "--agent-version-suffix=docker"]
+
+    secrets:
+      - source: ipfs_swarm_key
+        target: swarm-key
+
+    healthcheck:
+      test: ["CMD", "ipfs", "id"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 20s
+
+  cluster1:
+    image: ipfs/ipfs-cluster:v1.1.6@sha256:a83266c524f1c0bc81d14fe3c8b46c5b83a7b2d8432fb8a50300f27d3c863dcd
+    restart: unless-stopped
+    depends_on:
+      kubo:
+        condition: service_healthy
+    networks:
+      - rrfs-private
+
+    environment:
+      CLUSTER_CONSENSUS: crdt
+      CLUSTER_PEERNAME: rrfs-cluster-1
+      CLUSTER_IPFSHTTP_NODEMULTIADDRESS: /dns4/kubo/tcp/5001
+      CLUSTER_RESTAPI_HTTPLISTENMULTIADDRESS: /ip4/0.0.0.0/tcp/9094
+      CLUSTER_MONITORPINGINTERVAL: 2s
+
+    entrypoint: ["/bin/sh", "/opt/rrfs/start-cluster-peer.sh"]
+    command: ["daemon"]
+
+    ports:
+      - "127.0.0.1:9094:9094"
+
+    volumes:
+      - cluster1_data:/data/ipfs-cluster
+      - ./ipfs-cluster/start-cluster-peer.sh:/opt/rrfs/start-cluster-peer.sh:ro
+
+    secrets:
+      - source: cluster_secret
+        target: cluster-secret
+      - source: cluster_api_password
+        target: cluster-api-password
+
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - password=$$(cat /run/secrets/cluster-api-password); ipfs-cluster-ctl --host /ip4/127.0.0.1/tcp/9094 --basic-auth "rrfs-admin:$$password" --force-http id >/dev/null
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+
+  cluster2:
+    image: ipfs/ipfs-cluster:v1.1.6@sha256:a83266c524f1c0bc81d14fe3c8b46c5b83a7b2d8432fb8a50300f27d3c863dcd
+    restart: unless-stopped
+    depends_on:
+      kubo2:
+        condition: service_healthy
+      cluster1:
+        condition: service_healthy
+    networks:
+      - rrfs-private
+
+    environment:
+      CLUSTER_CONSENSUS: crdt
+      CLUSTER_PEERNAME: rrfs-cluster-2
+      CLUSTER_IPFSHTTP_NODEMULTIADDRESS: /dns4/kubo2/tcp/5001
+      CLUSTER_RESTAPI_HTTPLISTENMULTIADDRESS: /ip4/0.0.0.0/tcp/9094
+      CLUSTER_MONITORPINGINTERVAL: 2s
+      CLUSTER_BOOTSTRAP_FROM: cluster1
+
+    entrypoint: ["/bin/sh", "/opt/rrfs/start-cluster-peer.sh"]
+    command: ["daemon"]
+
+    volumes:
+      - cluster2_data:/data/ipfs-cluster
+      - ./ipfs-cluster/start-cluster-peer.sh:/opt/rrfs/start-cluster-peer.sh:ro
+
+    secrets:
+      - source: cluster_secret
+        target: cluster-secret
+      - source: cluster_api_password
+        target: cluster-api-password
+
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - password=$$(cat /run/secrets/cluster-api-password); ipfs-cluster-ctl --host /ip4/127.0.0.1/tcp/9094 --basic-auth "rrfs-admin:$$password" --force-http id >/dev/null
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+
 volumes:
   postgres_data:
   ipfs_data:
+  ipfs_data_2:
+  cluster1_data:
+  cluster2_data:
+
+networks:
+  rrfs-private:
+    internal: true
+
+secrets:
+  ipfs_swarm_key:
+    file: ./ipfs-cluster/secrets/swarm-key
+  cluster_secret:
+    file: ./ipfs-cluster/secrets/cluster-secret
+  cluster_api_password:
+    file: ./ipfs-cluster/secrets/cluster-api-password

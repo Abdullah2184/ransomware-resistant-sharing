@@ -2,13 +2,20 @@
   "name": "contracts",
   "version": "1.0.0",
   "type": "module",
+  "packageManager": "pnpm@12.18.0",
+  "engines": {
+    "node": "26.13.0"
+  },
   "devDependencies": {
-    "@nomicfoundation/hardhat-ignition": "^3.1.9",
-    "@nomicfoundation/hardhat-toolbox-viem": "^5.0.7",
-    "@types/node": "^22.20.5",
+    "@nomicfoundation/hardhat-ignition": "3.1.9",
+    "@nomicfoundation/hardhat-toolbox-viem": "5.0.7",
+    "@types/node": "22.20.5",
     "forge-std": "github:foundry-rs/forge-std#v1.17.0",
-    "hardhat": "^3.21.2",
-    "typescript": "~6.0.3",
-    "viem": "^2.57.16"
+    "hardhat": "3.21.2",
+    "typescript": "6.0.3",
+    "viem": "2.57.16"
+  },
+  "dependencies": {
+    "@openzeppelin/contracts": "5.6.1"
   }
 }

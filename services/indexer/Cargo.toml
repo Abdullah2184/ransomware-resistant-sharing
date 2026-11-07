@@ -3,3 +3,12 @@ name = "indexer"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+
+[dependencies]
+chain-adapter = { path = "../../crates/chain_adapter" }
+domain = { path = "../../crates/domain" }
+metadata-store = { path = "../../crates/metadata_store" }
+serde_json.workspace = true
+sha3.workspace = true
+sqlx.workspace = true
+tokio.workspace = true

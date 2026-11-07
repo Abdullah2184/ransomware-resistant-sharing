@@ -72,7 +72,7 @@ These decisions are fixed for the first implementation unless changed through an
 4. **Content and envelope objects are separate:** encrypted content is one IPFS object/package; recipient-wrapped keys are a separate IPFS object. This lets a share operation add an envelope without re-encrypting the file bytes. Both CIDs are referenced by the ledger. This mechanism is abstracted away from the end-user.
 5. **Upload ordering:** the encrypted content object and envelope object must be uploaded and pinned to the configured replication threshold before the version transaction is submitted to the chain. If chain submission fails, leave the blob unreferenced and let the retention/cleanup process deal with it later.
 6. **Besu + QBFT:** use a permissioned Hyperledger Besu network with QBFT consensus. No proof-of-work and no public-chain deployment in the prototype.
-7. **Solidity contracts:** `FileRegistry` owns file/folder metadata, version records, current-head pointer and access-lookup records. `AccessGovernance` owns registered member keys, member status, Read/Write ACL state, policy/approval information and key-envelope references/updates. They are separate contracts with narrow interfaces.
+7. **Solidity contracts:** `FileRegistry` owns file/folder metadata and version records, including the current-head pointer. `AccessGovernance` owns registered member keys, member status, Read/Write ACL state, policy/approval information and key-envelope references/updates. They are separate contracts with narrow interfaces. Routine access attempts are audited off-chain in PostgreSQL; they do not create blockchain transactions.
 8. **Off-chain services are not the authority for authorization:** the gateway may pre-check requests, but state-changing operations must be independently authorized by the contracts. An indexer/database is a query projection, not an authorization source of truth. Additionally, the gateway runs on an independent system, not at the client-endpoint, so no invalid data or functionality references should be made.
 9. **Identity proof:** registration binds an approved member identity to versioned signing and encryption public keys. Login uses a one-time signed challenge; a claimed member ID alone is not proof. EIP-712 operation signatures use domain separation, and contracts/gateway enforce nonce and expiry to prevent replay. 
 10. **Separate key pairs:** use a signing key and an encryption/unwrap key as different key pairs. Do not reuse one private key for both purposes.
@@ -162,7 +162,7 @@ Trust notes:
 | Key custody | Invoke HSM/token operations; key IDs and public-key lookup; sign/unwrap interface | Never persist private keys from production HSMs to a file. |
 | Gateway | Challenge login, validate requests, rate-limit, stream ciphertext, relay authorized chain operations | Never assume session token alone authorizes a sensitive operation; never return CID/key-envelope reference before ACL check and successful lookup logging. |
 | IPFS adapter | Add/get content packages and envelope sets; pin/verify replica counts; CID validation | Never accept plaintext input from application services; never mark upload durable just because `add` returned a CID. |
-| `FileRegistry` | Stable file identity, folder/name metadata, version history, current head, logged access lookup | No delete/update of historical version records; no IPFS/network calls. |
+| `FileRegistry` | Stable file identity, folder/name metadata, version history and current head | No delete/update of historical version records; no IPFS/network calls. |
 | `AccessGovernance` | Identity/key versions, member status, Read/Write ACL, proposals/approvals, envelope-set pointer updates and governance events | No raw DEKs or wrapped-key bytes in contract storage. |
 | Indexer | Consume finalized events, rebuild searchable read model and history | Never be the final authorization authority; tolerate restart/replay. |
 | Recovery tooling | Select candidate historical version, verify/decrypt and restore as a new version | Never overwrite or delete ledger history. |
@@ -330,7 +330,6 @@ This contract shall manage:
 - Append-only per-file version records.
 - A single mutable current-head pointer for each file.
 - Version numbering, parent-manifest consistency and optimistic concurrency validation.
-- Successful access-lookup audit records.
 - Visible file renaming, moving and supported metadata changes as logged state transitions.
 - Restore/revert operations, implemented as new version creation rather than modification of historical records.
 
@@ -353,7 +352,8 @@ The contracts shall interact through defined Solidity interfaces.
 | Read and Write ACLs                              | Checks through interface                                           | Authoritative                                             |
 | Current envelope-set pointer per version         | Stores the initial envelope reference in immutable version context | Authoritative current pointer and revision                |
 | Governance policies and approvals                | No governance authority                                            | Authoritative or delegated to reviewed governance modules |
-| Successful access lookups                        | Records the file/version disclosed                                 | Checks requester identity and Read permission             |
+| Read authorization                               | No read-side state mutation                                        | Authoritative Read ACL and member-status query            |
+| Access-attempt audit                             | Not stored                                                          | Not stored; gateway writes the protected PostgreSQL audit record |
 
 Cross-contract operations shall execute within the same EVM transaction whenever atomic consistency is required.
 
@@ -361,10 +361,10 @@ For initial version creation:
 
 1. The client uploads and pins the encrypted content package and initial envelope-set object to IPFS.
 2. The client submits the signed version-creation operation through the gateway.
-3. `FileRegistry.sol` validates the application signature, member status, Write ACL, application nonce, deadline and expected file state.
+3. `FileRegistry.sol` validates the application signature, active member identity and organization association, application nonce, deadline and expected initial file state.
 4. `FileRegistry.sol` creates the immutable version record and advances the current head.
-5. It calls a restricted initialization function in `AccessGovernance.sol` to register the initial envelope-set CID and revision for that file version.
-6. Both operations either complete successfully or revert atomically.
+5. It calls a restricted initialization function in `AccessGovernance.sol` to register the file policy, grant the signed creator initial Read and Write access, and register the initial envelope-set CID and revision for that file version.
+6. Both contracts' state changes either complete successfully or revert atomically. The signed creator's initial ACL grants are part of file creation; subsequent version appends require an existing Write ACL.
 
 Only `FileRegistry.sol` shall be authorized to initialize envelope pointers as part of version creation. Subsequent envelope-set changes shall use the relevant authorized governance or access-management functions in `AccessGovernance.sol`.
 
@@ -493,34 +493,23 @@ Gateway-side signature verification shall be an early rejection mechanism only. 
 
 If direct user-signed Ethereum transactions are introduced in a future implementation, they shall use the same application authorization rules.
 
-## 7.4 Access-Lookup Record and Retrieval Authorization
+## 7.4 Access Authorization and Retrieval Audit
 
-An ordinary EVM read using `eth_call` shall not be treated as a persistent access record. Successful access lookups requiring an immutable audit trail shall therefore be submitted as state-changing transactions.
+Routine access is a read operation, not a blockchain state transition. The gateway shall query authoritative Besu contract state with `eth_call` at a sufficiently recent finalized block to verify member status, Read ACL membership, version existence and the current envelope-set reference. It shall not submit an access-lookup transaction, consume an on-chain application nonce, or wait for QBFT finality for an ordinary read. When an access lookup uses an EIP-712 operation nonce, the gateway shall consume it atomically in the protected PostgreSQL replay store before releasing protected references or ciphertext; it is not an on-chain nonce.
 
-The workflow shall be:
+Every access attempt shall be recorded in the protected PostgreSQL audit store, including successful and failed authentication, authorization, version lookup, content retrieval and envelope retrieval attempts. Each record shall contain, as applicable:
 
-1. The client submits a signed access-lookup request through the gateway.
-2. The gateway verifies the request signature and applies authentication and rate-limiting policies.
-3. The gateway submits an access-lookup transaction to the relevant contract.
-4. The contract verifies the requester identity, active status and Read ACL membership.
-5. The contract records a successful access lookup and emits an `ACCESS_LOOKUP` event.
-6. The transaction is finalized according to the configured QBFT finality policy.
-7. The gateway releases the authorized version's content CID and current envelope-set reference to the client.
-8. The client retrieves the encrypted objects from IPFS, verifies their content identifiers and decrypts the file using its key-custody provider.
+- Actor identity and signing-key version, or the unauthenticated source identifier when no verified actor exists.
+- Resource type and stable resource identifier (file/version/CID); do not record plaintext names or secret material.
+- Action and outcome, with a bounded reason code for failures.
+- UTC event timestamp, request/operation identifier and correlation/trace identifier.
+- Relevant organization, gateway instance and authoritative chain ID/block reference used for the authorization decision.
 
-The access event shall include, at minimum:
+The audit append shall be committed before the gateway returns protected content references or ciphertext. If the required audit append fails, the gateway shall fail closed and not release protected data. Failed attempts shall be recorded without revealing whether a private file, version, CID or envelope exists to the requester.
 
-- Requesting `memberId`.
-- Requesting signing address.
-- `fileId`.
-- Version number or manifest hash.
-- Envelope-set revision.
-- Envelope-set CID hash or equivalent reference.
-- Operation or trace identifier, where appropriate.
+Audit records shall be append-only to application roles and integrity-protected by a per-stream cryptographic hash chain. Database privileges shall separate audit insertion from read access and prohibit ordinary gateway roles from updating or deleting audit rows. Access to audit queries shall be restricted and audited. Selected security alerts may be emitted on-chain or periodically anchored by digest under the configured security/governance policy; this does not put every access attempt on-chain.
 
-Sensitive file names, confidential descriptions and plaintext metadata shall not be included in audit events unless explicitly approved by the consortium's metadata-visibility policy.
-
-Failed authentication and authorization attempts shall generally be recorded in off-chain gateway security logs. Selected security alerts and suspension actions may be recorded on-chain. Individual IPFS chunk retries shall not generate separate blockchain transactions.
+IPFS CIDs are content identifiers, not access credentials. Anyone who obtains a CID may attempt to retrieve the corresponding ciphertext if the storage network is reachable. The prototype shall restrict application-facing IPFS RPC access to authorized gateway and storage services and route normal client retrieval through the gateway. The system shall nevertheless document that a leaked CID and previously obtained encryption key may permit access to copied ciphertext outside the controlled retrieval path.
 
 IPFS CIDs are content identifiers, not access credentials. Anyone who obtains a CID may attempt to retrieve the corresponding ciphertext if the storage network is reachable. The prototype shall restrict application-facing IPFS RPC access to authorized gateway and storage services and route normal client retrieval through the gateway. The system shall nevertheless document that a leaked CID and previously obtained encryption key may permit access to copied ciphertext outside the controlled retrieval path.
 
@@ -649,11 +638,11 @@ Two independent nonce mechanisms shall be implemented.
 
 Ethereum transaction nonce: The sequential nonce associated with the relayer's Ethereum account. It establishes transaction ordering and prevents reuse of previously processed sender transactions.
 
-Application operation nonce: The nonce associated with the member's application authorization. It prevents previously signed application requests from being submitted again as new operations.
+Application operation nonce: The nonce associated with a member's application authorization. For state-changing operations, the appropriate smart contract validates and consumes the nonce atomically. For routine read-only access lookups, the gateway validates and consumes the signed nonce atomically in the protected PostgreSQL replay store, consistent with §7.4; it does not submit a blockchain transaction.
 
-Application operation nonces shall be validated and consumed by the appropriate smart contract. They shall be bound to the signed typed-data message.
+Operation nonces shall be bound to their signed typed-data messages. Nonce scope and storage shall distinguish state-changing contract operations from read-only access lookups.
 
-The application nonce mechanism shall support concurrent operations without allowing the same authorization message to execute more than once. The selected nonce policy, including sequencing and concurrent-submission behavior, shall be documented and tested.
+The nonce mechanisms shall support concurrent operations without allowing the same authorization message to execute more than once. The selected nonce policy, including sequencing and concurrent-submission behavior, shall be documented and tested.
 
 All sensitive application operations shall include an expiry deadline. Expired operations shall be rejected by the contracts, even if the gateway accepted the request earlier.
 
@@ -678,7 +667,7 @@ The gateway shall estimate gas or assign operation-specific gas limits for suppo
 
 Large encrypted files and file chunks shall remain in IPFS. Only the content identifiers and necessary metadata shall be recorded on-chain.
 
-Gas consumption shall be measured for major contract operations, including file creation, version append, access lookup, ACL modification, envelope-pointer update and governance execution. Excessive storage writes, expensive enumeration and oversized event payloads shall be avoided.
+Gas consumption shall be measured for major contract operations, including file creation, version append, ACL modification, envelope-pointer update and governance execution. Routine access checks are read-only and shall not require gas-consuming transactions. Excessive storage writes, expensive enumeration and oversized event payloads shall be avoided.
 
 ## 7.10 QBFT Consensus and Validator Responsibilities
 
@@ -736,7 +725,6 @@ The event model shall include, at minimum:
 | File management     | `FileCreated`, `FileVersionAppended`, `FileRenamed`, `FileMoved`, `FileRestored` |
 | Access governance   | `AccessGranted`, `AccessRevoked`, `EnvelopeSetUpdated`                           |
 | Identity management | `MemberRegistered`, `MemberSuspended`, `MemberRevoked`, `SigningKeyUpdated`      |
-| Access auditing     | `AccessLookup`                                                                   |
 | Governance          | `ProposalCreated`, `ProposalApproved`, `ProposalExecuted`, `ProposalCancelled`   |
 | Security            | `EmergencySuspension`, `SecurityAlertRecorded`                                   |
 
@@ -861,7 +849,7 @@ All endpoints use TLS in non-local deployments, JSON for control metadata and st
 | History | `GET /v1/files/{fileId}/versions` | Return event-derived immutable chain and current head. |
 | Share / revoke | `POST /v1/files/{fileId}/acl/proposals` and governed execution | Create/approve scoped governance proposal; rotate future version key by always-new-per-version rule; update envelope sets for selected old versions if history is granted. |
 | Restore/revert | Application command using history + upload-version flow | Decrypt selected old content and append newly encrypted version parented to the current head. |
-| Audit | `GET /v1/audit?...` | Return finalized chain events; failed-attempt detail comes from protected off-chain audit store, where available. |
+| Audit | `GET /v1/audit?...` | Return access-controlled PostgreSQL audit records and relevant finalized chain events; enforce audit-query authorization and record the query itself. |
 
 ## 8.2 Rate limiting and circuit breaker
 
@@ -883,23 +871,23 @@ if later required.
 
 ## 9.2 Upload a new file
 
-1. CLI obtains file path, display name, parent folder and desired initial Read/Write ACL. Validate path, ensure input is a regular file (unless explicit symlink policy allows otherwise), enforce configured size limits. Also run wildcard checks for any malware-related code or wording in the text.
+1. CLI obtains file path, display name, parent folder and desired ACL. File creation atomically grants the signed creator initial Read and Write access with the first version; additional recipients are added through the governed sharing workflow in §9.5. Validate path, ensure input is a regular file (unless explicit symlink policy allows otherwise), and enforce configured size limits. Also run wildcard checks for any malware-related code or wording in the text.
 2. Resolve approved member public keys from authoritative identity state. Reject missing, suspended or revoked identities.
 3. Create stable File ID if new. For an update, obtain current head and latest state at a consistent finalised block.
 4. Generate new DEK, epoch ID and nonce prefix using CSPRNG. Encrypt any sensitive metadata and the file in chunks using AES-256-GCM.
 5. Create one HPKE envelope for each reader permitted to decrypt that version. No plaintext DEK appears in the bundle.
 6. Upload encrypted content package and envelope set to IPFS Cluster. Verify resulting CIDs and await configured independent pin quorum (`MIN_PIN_REPLICAS`, default 2 for local prototype; production target should be higher and spread across organizations). Verify retrieve/re-hash for the root package when configured.
 7. Build a version manifest containing File ID, version number, parent manifest hash, epoch ID, content CID, envelope-set CID, file size, algorithm/format IDs and any permitted metadata. Compute its digest and ask key custody to sign the EIP-712 typed append request.
-8. Gateway re-checks member/session and applies rate limits, then relays the typed signed request. `FileRegistry`/`AccessGovernance` verify signature, active status, Write ACL, nonce, deadline and expected current head; append version and advance current head atomically.
+8. Gateway re-checks member/session and applies rate limits, then relays the typed signed request. For initial creation, the contracts verify the active signed creator and atomically initialize the creator's Read/Write ACL with the file policy and first version. For later appends, the contracts require an existing Write ACL. Both paths validate nonce, deadline and expected file state; each append advances the current head atomically.
 9. Wait for the configured confirmation/finality condition. Return a receipt and refresh the indexer view. Only then report the version committed.
 10. If upload/pinning succeeds but the chain transaction fails, report a failed commit and retain the CID as an orphan candidate. Never claim it is a registered version. Cleanup must not delete a CID that later becomes referenced by a finalized record.
 
 ## 9.3 Download / view
 
-1. Client requests a specific version or current head and signs the lookup request.
-2. Gateway validates session, fresh operation signature, deadline, nonce, active membership and Read ACL against authoritative state.
-3. Gateway submits an on-chain access-lookup transaction and waits for the configured commit/finality condition.
-4. Gateway returns the content CID and current envelope-set CID for that version; download encrypted package and envelope set through the controlled IPFS adapter.
+1. Client requests a specific version or current head and supplies the required request authentication.
+2. Gateway validates the session and any required signed request, then checks active membership and Read ACL against authoritative Besu state at a known finalized block using `eth_call`.
+3. Gateway appends the successful authorization/access-attempt record to the protected PostgreSQL audit store. It does not submit an access-lookup transaction.
+4. Only after the authorization and audit append succeed, the gateway returns the content CID and current envelope-set CID for that version; download encrypted package and envelope set through the controlled IPFS adapter.
 5. Verify CID/DAG integrity and version-manifest digest before attempting decryption.
 6. Find the envelope matching member ID and encryption key version; use key custody to unwrap DEK; verify the DEK/epoch context; decrypt all chunks and verify every GCM tag.
 7. Write output to a temporary file with restrictive permissions, fsync/close where supported, then atomically rename into target destination after full integrity validation. Do not expose partially decrypted output as a successful file.
@@ -936,7 +924,7 @@ An edit is a new snapshot. Load current head, ensure Write permission, encrypt t
 
 ## 9.8 Successful lookup and audit
 
-Only successfully authorized lookups are required on-chain for the MVP. Failed login/signature attempts are recorded off-chain with redaction and rate limits; aggregate/selected alert records may be appended to chain. Audit queries distinguish `authorization granted/reference returned` from `download completed` or `plaintext opened`; do not overclaim what the audit log proves.
+Successful and failed access attempts are recorded in the protected PostgreSQL audit store for the MVP. Security-significant events may additionally be represented by an on-chain alert or a periodically anchored audit digest under the configured policy. Audit queries distinguish `authorization granted/reference returned`, `ciphertext retrieval completed` and `plaintext opened`; do not overclaim what the audit log proves. A gateway audit record cannot capture direct IPFS access that bypasses the gateway.
 
 ## 9.9 What should happen automatically
  The points mentioned here may tak place in differeent systems (user end-point, gateway, etc).
@@ -978,7 +966,7 @@ Define typed domain models and avoid raw strings for IDs where possible:
 - `FileMetadata`: File ID, display name, parent folder ID, owner organization, creator ID, created/updated event references and file status.
 - `VersionRecord`: file ID, version number, parent manifest hash, manifest hash, content CID, initial/current envelope-set CID reference, epoch ID, author ID/address and on-chain timestamp/transaction details.
 - `AccessPolicy`: readers and writers (non-enumerable membership map in contract; list is reconstructed from events/indexer), policy scope and required approval threshold.
-- `AuditEvent`: event type, actor/key version, target file/member, version/epoch/operation reference, block/transaction identifiers and safe metadata.
+- `AuditEvent`: event type, actor/key version or unauthenticated source, target resource/file/member, action, outcome/reason code, version/epoch/operation reference, UTC timestamp, correlation identifier, authoritative chain/block reference where applicable, and safe metadata. PostgreSQL access-attempt records are distinct from finalized contract events.
 
 ## 10.2 Event names
 
@@ -989,7 +977,6 @@ Use stable, versioned Solidity events with indexed IDs where sensible. At minimu
 - `VersionAppended`, `CurrentHeadAdvanced` (may be one event if atomic and clear);
 - `ReadAccessGranted`, `ReadAccessRevoked`, `WriteAccessGranted`, `WriteAccessRevoked`, `AccessPolicyChanged`;
 - `EnvelopeSetUpdated` / `KeyEnvelopeUpdate`;
-- `AccessLookupRecorded`;
 - `GovernanceProposalCreated`, `GovernanceProposalApproved`, `GovernanceProposalExecuted`, `GovernanceProposalCancelled`;
 - `IdentitySuspended`, `IdentityReinstated`, `SecurityAlertRecorded`, `RecoveryVersionAppended` where needed.
 
@@ -1089,7 +1076,7 @@ Examples include:
 - Access grants and revocations.
 - Member registration, suspension and removal.
 - Governance-policy changes.
-- On-chain audit-event recording.
+- Selected security-alert or audit-anchor transactions when required by the configured policy.
 
 Transactions are executed by Besu nodes and processed through the configured QBFT consensus protocol. The gateway MUST distinguish between transaction submission, execution success, block inclusion and finality before reporting an operation as successfully committed.
 
@@ -1111,25 +1098,13 @@ A successful read-only query does not represent a consensus-backed transaction. 
 
 ### 10.4.6 On-Chain and Off-Chain Audit Strategy
 
-The system SHOULD use a hybrid audit strategy to avoid requiring a blockchain transaction for every routine file operation.
+Routine access authorization and retrieval MUST use read-only contract queries and MUST NOT require a blockchain write transaction. Every successful and failed access attempt handled by the gateway MUST be recorded in PostgreSQL with the actor (or unauthenticated source), resource, action, UTC timestamp, outcome, reason code where applicable, chain/block reference and correlation identifiers.
 
-**On-chain audit records SHOULD include:**
-- File creation and registration.
-- File-version creation and modification.
-- Access-control and governance changes.
-- Membership and suspension changes.
-- Other security-relevant state transitions requiring a shared, tamper-evident record.
+The PostgreSQL audit store MUST protect integrity and availability through append-only audit tables, a per-stream cryptographic hash chain, restrictive database roles, and access-controlled/audited reads. Audit records MUST exclude plaintext, DEKs, private keys, session tokens and unnecessary confidential metadata. Failure to durably append an access result MUST prevent the gateway from releasing protected references or ciphertext.
 
-**Off-chain audit records SHOULD include:**
-- Routine download and retrieval activity.
-- Failed authentication and authorization attempts.
-- IPFS retrieval and pinning operations.
-- Operational errors, timeouts and retry activity.
-- Detailed gateway and service activity.
+On-chain records remain authoritative for shared state transitions: file/version creation, ACL/governance changes, membership/key-status changes and selected security alerts. A configured policy MAY anchor batches of off-chain audit records by submitting their digest, or submit a selected security alert; it MUST NOT turn every routine read into a blockchain transaction. Audit digest anchoring does not replace the protected PostgreSQL records.
 
-Recording every download on-chain would require a transaction and QBFT processing for every recorded event, introducing additional latency and transaction-processing overhead. Routine downloads SHOULD therefore use read-only authorization checks and off-chain audit logging unless the consortium explicitly requires immutable on-chain download records.
-
-The system MUST NOT claim that every file read is recorded on-chain unless the retrieval architecture actually enforces such recording. Direct IPFS retrieval that bypasses the gateway may not be represented in gateway audit logs.
+The system MUST NOT claim that gateway audit records capture direct IPFS retrievals that bypass the gateway, nor that an authorization record proves ciphertext was fully downloaded, decrypted or opened.
 
 ### 10.4.7 Performance and Security Requirements
 
@@ -1239,9 +1214,8 @@ trait KeyCustodyProvider {
 trait LedgerPort {
     async fn get_file_head(&self, file_id: FileId) -> Result<Option<HeadRecord>, LedgerError>;
     async fn get_member(&self, member_id: MemberId) -> Result<MemberIdentity, LedgerError>;
-    async fn check_read_access(&self, member: MemberId, file_id: FileId) -> Result<bool, LedgerError>;
+    async fn check_read_access(&self, member: MemberId, file_id: FileId, version: VersionNumber) -> Result<bool, LedgerError>;
     async fn append_version(&self, request: SignedAppendRequest) -> Result<TxReceipt, LedgerError>;
-    async fn record_access_lookup(&self, request: SignedLookupRequest) -> Result<TxReceipt, LedgerError>;
     async fn update_envelope_set(&self, request: SignedEnvelopeUpdate) -> Result<TxReceipt, LedgerError>;
 }
 ```
@@ -1256,7 +1230,7 @@ Define stable typed errors at the domain/application boundary: `Unauthenticated`
 
 Provide a typed configuration layer. The `.env.example` must contain placeholders only. At minimum configure:
 
-- `CHAIN_RPC_URL`, chain ID, deployed contract addresses and receipt/finality policy;
+- `BESU_RPC_URL`, chain ID, deployed contract addresses and receipt/finality policy;
 - `IPFS_API_URL`, IPFS Cluster endpoint(s), request timeout and private-network settings;
 - `DATABASE_URL` and migration mode;
 - key-custody provider type, provider endpoint/module, non-secret key IDs and expected capabilities;
@@ -1302,7 +1276,7 @@ The app must refuse to start in non-development mode when a development key prov
 - Invalid/replayed/expired signatures fail; wrong chain/contract domain fails.
 - Stale parent/head and wrong version number fail; valid append advances head once and leaves history intact.
 - Direct gateway identity cannot impersonate a requester just by being `msg.sender`.
-- Read lookup rejects absent/suspended member and records a finalized access event for authorized member.
+- Authoritative read authorization rejects absent/suspended members; routine checks do not mutate contract state or emit access events.
 - ACL grant/revoke, envelope pointer update and policy approval rules enforce required scopes and thresholds.
 - Emergency suspension does not allow arbitrary users to suspend a victim; reinstatement is governed and logged.
 - Historical `VersionAppended` records cannot be edited/deleted; revert creates a new version.
@@ -1329,7 +1303,7 @@ The MVP is not complete until these criteria pass:
 2. The chain stores the version metadata and pointers, not file bytes, plaintext metadata marked private, raw DEKs or wrapped key bytes.
 3. Authorized user can download, verify and decrypt. A user without a valid envelope cannot decrypt even if they obtain ciphertext.
 4. Upload/modify rejects unauthorized writers, replayed/expired signatures and stale parents.
-5. Read access lookups are logged on-chain only after successful authorization; failed attempts are off-chain and rate-limited.
+5. Successful and failed access attempts are durably recorded off-chain in the protected PostgreSQL audit store; audit failure prevents protected data release. Selected security alerts or digest anchors may be on-chain, but routine reads are not.
 6. A share operation adds a new envelope through a governed update without re-encrypting ciphertext. Historical sharing is explicit.
 7. Revoke blocks future versions by removing the user from the Read ACL and excluding them from new version envelope sets. The known inability to retroactively revoke already obtained keys is documented and tested.
 8. Restore appends a new version with the old current head as parent and a fresh DEK; no history is deleted or moved backwards.
@@ -1368,7 +1342,7 @@ Implement one phase at a time. For each phase: add tests first where practical, 
 ## Phase 4 — gateway and authentication
 - Implement one-time challenge login, short-lived sessions, typed operation signatures, rate limiting and structured audit logs.
 - Implement gateway storage and chain adapters; never accept plaintext from clients at these endpoints.
-- Confirm that access lookup transaction is finalized before releasing CIDs.
+- Confirm authoritative read authorization and durable PostgreSQL audit append before releasing CIDs; no read-side blockchain transaction is submitted.
 
 ## Phase 5 — CLI use cases
 - Implement register/identity display, file/folder listing, create/upload, download, modify, history, share, revoke and recovery/revert commands.

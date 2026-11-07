@@ -1,0 +1,116 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ransomware-resistant-sharing.invalid/schemas/encrypted-file-manifest-v1.json",
+  "title": "Ransomware-resistant encrypted content manifest v1",
+  "description": "Canonical compact JSON. The Rust validator additionally enforces chunkCount equality, sequential indexes, ciphertext lengths relative to chunkSizeBytes, canonical CIDv1 text, and canonical unpadded base64url encoding.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "fileId",
+    "versionNumber",
+    "parentManifestHash",
+    "epochId",
+    "cipher",
+    "nonceScheme",
+    "chunkSizeBytes",
+    "chunkCount",
+    "noncePrefix",
+    "chunks"
+  ],
+  "properties": {
+    "schema": {
+      "const": "rrds.encrypted-content.v1"
+    },
+    "fileId": {
+      "type": "string",
+      "pattern": "^0x[0-9a-f]{64}$"
+    },
+    "versionNumber": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "A non-zero unsigned 64-bit version number; values outside the Rust u64 range are rejected by the implementation."
+    },
+    "parentManifestHash": {
+      "type": "string",
+      "pattern": "^0x[0-9a-f]{64}$"
+    },
+    "epochId": {
+      "type": "string",
+      "pattern": "^0x[0-9a-f]{64}$"
+    },
+    "cipher": {
+      "const": "AES-256-GCM"
+    },
+    "nonceScheme": {
+      "const": "prefix64-index32-v1"
+    },
+    "chunkSizeBytes": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 4194304
+    },
+    "chunkCount": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 4294967295
+    },
+    "noncePrefix": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_-]{11}$",
+      "description": "Canonical unpadded base64url encoding of exactly eight bytes."
+    },
+    "privateMetadata": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "encoding",
+        "nonceIndex",
+        "ciphertext"
+      ],
+      "properties": {
+        "encoding": {
+          "const": "AES-256-GCM"
+        },
+        "nonceIndex": {
+          "const": 0
+        },
+        "ciphertext": {
+          "type": "string",
+          "minLength": 22,
+          "pattern": "^[A-Za-z0-9_-]+$",
+          "description": "Canonical unpadded base64url encoding of ciphertext with its 16-byte GCM tag."
+        }
+      }
+    },
+    "chunks": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "index",
+          "cid",
+          "ciphertextBytes"
+        ],
+        "properties": {
+          "index": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 4294967295
+          },
+          "cid": {
+            "type": "string",
+            "pattern": "^b[a-z2-7]+$",
+            "description": "Canonical lower-case base32 CIDv1."
+          },
+          "ciphertextBytes": {
+            "type": "integer",
+            "minimum": 17,
+            "maximum": 4194320
+          }
+        }
+      }
+    }
+  }
+}

@@ -1,9 +1,10 @@
 use std::time::Duration;
 
-use sqlx::{PgPool, postgres::PgPoolOptions};
+use sqlx::{PgPool, migrate::Migrator, postgres::PgPoolOptions};
 
 const MAX_CONNECTIONS: u32 = 5;
 const ACQUIRE_TIMEOUT: Duration = Duration::from_secs(5);
+static MIGRATOR: Migrator = sqlx::migrate!("./migrations");
 
 /// PostgreSQL-backed metadata store.
 ///
@@ -32,5 +33,16 @@ impl PostgresStore {
         sqlx::query("SELECT 1").execute(&self.pool).await?;
 
         Ok(())
+    }
+
+    /// Applies additive, versioned schema migrations.
+    pub async fn migrate(&self) -> Result<(), sqlx::migrate::MigrateError> {
+        MIGRATOR.run(&self.pool).await
+    }
+
+    /// Gives infrastructure services access to the shared pool for repository
+    /// operations without transferring ownership of the pool.
+    pub const fn pool(&self) -> &PgPool {
+        &self.pool
     }
 }

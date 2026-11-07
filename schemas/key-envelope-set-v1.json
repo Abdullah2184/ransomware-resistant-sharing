@@ -1,0 +1,77 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ransomware-resistant-sharing.invalid/schemas/key-envelope-set-v1.json",
+  "title": "Ransomware-resistant key envelope set v1",
+  "description": "Canonical compact JSON with one HPKE envelope per member, sorted by the raw memberId bytes. The Rust validator additionally rejects duplicate members, unsupported key/envelope sizes, and noncanonical unpadded base64url encodings.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "fileId",
+    "versionNumber",
+    "epochId",
+    "wrappingSuite",
+    "revision",
+    "envelopes"
+  ],
+  "properties": {
+    "schema": {
+      "const": "rrds.key-envelope-set.v1"
+    },
+    "fileId": {
+      "type": "string",
+      "pattern": "^0x[0-9a-f]{64}$"
+    },
+    "versionNumber": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "epochId": {
+      "type": "string",
+      "pattern": "^0x[0-9a-f]{64}$"
+    },
+    "wrappingSuite": {
+      "const": "HPKE-X25519-HKDF-SHA256-AES256GCM"
+    },
+    "revision": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 4294967295
+    },
+    "envelopes": {
+      "type": "array",
+      "maxItems": 1024,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "memberId",
+          "encryptionKeyVersion",
+          "encapsulatedKey",
+          "wrappedDek"
+        ],
+        "properties": {
+          "memberId": {
+            "type": "string",
+            "pattern": "^0x[0-9a-f]{64}$"
+          },
+          "encryptionKeyVersion": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 4294967295
+          },
+          "encapsulatedKey": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9_-]{43}$",
+            "description": "Canonical unpadded base64url encoding of the 32-byte X25519 encapsulated key."
+          },
+          "wrappedDek": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9_-]{64}$",
+            "description": "Canonical unpadded base64url encoding of the 32-byte DEK and 16-byte AES-GCM tag."
+          }
+        }
+      }
+    }
+  }
+}

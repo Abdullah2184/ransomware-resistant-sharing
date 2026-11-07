@@ -1,57 +1,65 @@
-# Sample Hardhat 3 Project (`node:test` and `viem`)
+# Hardhat contract workspace
 
-This project showcases a Hardhat 3 project using the native Node.js test runner (`node:test`) and the `viem` library for Ethereum interactions.
+Hardhat 3, Solidity, `node:test` and `viem` are used for contract development, compilation, testing and deployment. The only configured external network is the local permissioned Besu development network; public-chain deployment is not supported.
 
-To learn more about Hardhat 3, please visit the [Getting Started guide](https://hardhat.org/docs/getting-started#getting-started-with-hardhat-3). To share your feedback, join our [Hardhat 3](https://hardhat.org/hardhat3-telegram-group) Telegram group or [open an issue](https://github.com/NomicFoundation/hardhat/issues/new) in our GitHub issue tracker.
+The current `Counter` contract and its tests are retained as toolchain smoke tests; they are not ransomware-resistant-sharing functionality.
 
-## Project Overview
+## Run tests
 
-This example project includes:
-
-- A simple Hardhat configuration file.
-- Foundry-compatible Solidity unit tests.
-- TypeScript integration tests using [`node:test`](https://nodejs.org/api/test.html), the new Node.js native test runner, and [`viem`](https://viem.sh/).
-- Examples demonstrating how to connect to different types of networks, including locally simulating OP mainnet.
-
-## Usage
-
-### Running Tests
-
-To run all the tests in the project, execute the following command:
+From this directory:
 
 ```shell
-npx hardhat test
+pnpm exec hardhat test
 ```
 
-You can also selectively run the Solidity or `node:test` tests:
+Solidity and Node.js tests can also be selected individually:
 
 ```shell
-npx hardhat test solidity
-npx hardhat test nodejs
+pnpm exec hardhat test solidity
+pnpm exec hardhat test nodejs
 ```
 
-### Make a deployment to Sepolia
+The default and production Solidity build profiles enable the optimizer with
+200 runs so local tests and Besu deployments use deployable bytecode. The
+current optimized `AccessGovernance` runtime is 15,820 bytes, below the
+24,576-byte EIP-170 limit.
 
-This project includes an example Ignition module to deploy the contract. You can deploy this module to a locally simulated chain or to Sepolia.
+## Deploy to local Besu
 
-To run the deployment to a local chain:
+Start the local Besu QBFT development network and set its RPC endpoint and chain ID:
 
 ```shell
-npx hardhat ignition deploy ignition/modules/Counter.ts
+export BESU_RPC_URL=http://127.0.0.1:8545
+export BESU_CHAIN_ID=1337
 ```
 
-To run the deployment to Sepolia, you need an account with funds to send the transaction. The provided Hardhat configuration includes a Configuration Variable called `SEPOLIA_PRIVATE_KEY`, which you can use to set the private key of the account you want to use.
-
-You can set the `SEPOLIA_PRIVATE_KEY` variable using the `hardhat-keystore` plugin or by setting it as an environment variable.
-
-To set the `SEPOLIA_PRIVATE_KEY` config variable using `hardhat-keystore`:
+Store the local deployer key in Hardhat's keystore; do not put it in source control or command-line arguments:
 
 ```shell
-npx hardhat keystore set SEPOLIA_PRIVATE_KEY
+pnpm exec hardhat keystore set BESU_DEPLOYER_PRIVATE_KEY
 ```
 
-After setting the variable, you can run the deployment with the Sepolia network:
+Deploy the RRDS contracts to Besu with a private Ignition parameter file
+containing `consortiumSafeAddress` and `emergencySafeAddress`:
 
 ```shell
-npx hardhat ignition deploy --network sepolia ignition/modules/Counter.ts
+pnpm exec hardhat ignition deploy --network besuLocal \
+  ignition/modules/RrdsDeployment.ts \
+  --parameters ./ignition/parameters.local.json \
+  --build-profile production
 ```
+
+The deployment uses OpenZeppelin Contracts `5.6.1` with a 24-hour
+`TimelockController`. The consortium Safe is its proposer and canceller; the
+executor role is open, and no deployer/EOA receives an administrative bypass.
+The module intentionally does not grant `FILE_REGISTRY_ROLE`. After deployment,
+the consortium Safe must schedule that grant through the timelock, wait the
+full delay, and have an account execute it. File creation remains unavailable
+until that operation completes. Never put private keys in the parameter file.
+
+`BESU_CHAIN_ID` defaults to the local development chain ID `1337` in the
+Hardhat configuration. The actual Besu genesis configuration is authoritative;
+configure the same chain ID there. `Counter.ts` remains only a toolchain
+deployment smoke test. Deployment and role activation are covered by local
+Solidity tests; a running Besu QBFT deployment and actual Safe integration have
+not yet been verified.
