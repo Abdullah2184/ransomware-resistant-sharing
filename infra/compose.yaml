@@ -184,7 +184,6 @@ volumes:
 
 networks:
   rrfs-private:
-    internal: true
 
 secrets:
   ipfs_swarm_key:
