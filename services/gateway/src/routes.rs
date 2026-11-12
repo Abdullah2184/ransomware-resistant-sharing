@@ -2,9 +2,8 @@ use std::{net::SocketAddr, sync::Arc, time::SystemTime};
 
 use axum::{
     Json, Router,
-    extract::{
-        ConnectInfo, DefaultBodyLimit, Path, Request, State, rejection::JsonRejection,
-    },
+    body::Body,
+    extract::{ConnectInfo, DefaultBodyLimit, Path, Request, State, rejection::JsonRejection},
     http::{HeaderMap, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -12,8 +11,10 @@ use axum::{
 };
 use chain_adapter::BesuClient;
 use crypto::{AccessLookup, ChainId, Eip712Domain, UnixDeadline};
-use domain::{FileId, KeyVersion, OperationNonce, VersionNumber};
+use domain::{ContentCid, FileId, KeyVersion, OperationNonce, VersionNumber};
+use ports::BlobStore;
 use serde::{Deserialize, Serialize};
+use tokio_util::io::ReaderStream;
 
 use crate::{
     auth::{
@@ -28,6 +29,7 @@ use crate::{
 pub struct AppState {
     store: GatewayStore,
     chain: Arc<BesuClient>,
+    blob_store: Arc<dyn BlobStore>,
     config: Arc<GatewayConfig>,
 }
 
@@ -71,6 +73,20 @@ struct SessionIdentity {
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
+struct PublicIdentityResponse {
+    member_id: String,
+    organization_id: String,
+    signing_address: String,
+    signing_key_version: u32,
+    encryption_key_version: u32,
+    encryption_public_key: String,
+    status: &'static str,
+    finalized_block: u64,
+    finalized_block_hash: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 struct AccessLookupResponse {
     file_id: String,
     version_number: u64,
@@ -87,10 +103,16 @@ struct ErrorResponse {
 }
 
 impl AppState {
-    pub fn new(store: GatewayStore, chain: BesuClient, config: GatewayConfig) -> Self {
+    pub fn new(
+        store: GatewayStore,
+        chain: BesuClient,
+        blob_store: impl BlobStore + 'static,
+        config: GatewayConfig,
+    ) -> Self {
         Self {
             store,
             chain: Arc::new(chain),
+            blob_store: Arc::new(blob_store),
             config: Arc::new(config),
         }
     }
@@ -98,6 +120,7 @@ impl AppState {
 
 pub fn router(state: AppState) -> Router {
     let auth_routes = Router::new()
+        .route("/v1/identities/{member_id}", get(public_identity))
         .route("/v1/auth/challenge", post(create_challenge))
         .route(
             "/v1/auth/session",
@@ -106,6 +129,10 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/v1/files/{file_id}/versions/{version}/access",
             post(access_lookup),
+        )
+        .route(
+            "/v1/files/{file_id}/versions/{version}/content",
+            get(retrieve_version_content),
         )
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
@@ -120,6 +147,64 @@ pub fn router(state: AppState) -> Router {
 
 async fn health() -> &'static str {
     "ok"
+}
+
+async fn public_identity(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    Path(raw_member_id): Path<String>,
+) -> Response {
+    let source_id = source_identifier(&peer.ip().to_string());
+    let member_id = match parse_member_id(&raw_member_id) {
+        Ok(member_id) => member_id,
+        Err(_) => {
+            return failure(
+                &state,
+                "identity.lookup",
+                &source_id,
+                "invalid_request",
+                None,
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+            )
+            .await;
+        }
+    };
+    let finalized = match state.chain.finalized_block().await {
+        Ok(block) => block,
+        Err(_) => return error(StatusCode::SERVICE_UNAVAILABLE, "service_unavailable"),
+    };
+    let identity = match state
+        .chain
+        .member_identity(
+            &state.config.access_governance,
+            member_id.as_bytes(),
+            finalized.number,
+        )
+        .await
+    {
+        Ok(Some(identity)) => identity,
+        Ok(None) => return error(StatusCode::NOT_FOUND, "not_found"),
+        Err(_) => return error(StatusCode::SERVICE_UNAVAILABLE, "service_unavailable"),
+    };
+    let status = match identity.status {
+        1 => "active",
+        2 => "suspended",
+        3 => "revoked",
+        _ => return error(StatusCode::SERVICE_UNAVAILABLE, "service_unavailable"),
+    };
+    Json(PublicIdentityResponse {
+        member_id: member_id.to_string(),
+        organization_id: encode_hex(&identity.organization_id),
+        signing_address: identity.signing_address.to_string(),
+        signing_key_version: identity.signing_key_version,
+        encryption_key_version: identity.encryption_key_version,
+        encryption_public_key: encode_hex(&identity.encryption_public_key),
+        status,
+        finalized_block: finalized.number,
+        finalized_block_hash: finalized.hash,
+    })
+    .into_response()
 }
 
 async fn create_challenge(
@@ -584,8 +669,7 @@ async fn access_lookup(
     let deadline = match UnixDeadline::from_unix_seconds(request.deadline) {
         Ok(deadline)
             if request.deadline > now
-                && request.deadline.saturating_sub(now)
-                    <= state.config.challenge_ttl_seconds =>
+                && request.deadline.saturating_sub(now) <= state.config.challenge_ttl_seconds =>
         {
             deadline
         }
@@ -659,7 +743,7 @@ async fn access_lookup(
             .await;
         }
     };
-    let signer = match recover_signer(&digest, &request.signature) {
+    let signer = match recover_signer(digest.as_bytes(), &request.signature) {
         Ok(signer) => signer,
         Err(_) => {
             return failure(
@@ -717,7 +801,7 @@ async fn access_lookup(
             .await;
         }
     };
-    let Some(member) = member.filter(|member| member.active) else {
+    let Some(member) = member.filter(|member| member.active()) else {
         return signed_access_failure(
             &state,
             member_id,
@@ -731,7 +815,9 @@ async fn access_lookup(
         )
         .await;
     };
-    if signer != member.signing_address || key_version != KeyVersion::new(member.encryption_key_version).unwrap_or(key_version) {
+    if signer != member.signing_address
+        || key_version != KeyVersion::new(member.encryption_key_version).unwrap_or(key_version)
+    {
         return signed_access_failure(
             &state,
             member_id,
@@ -797,10 +883,8 @@ async fn access_lookup(
             .await;
         }
     };
-    let version_exists = head
-        .as_ref()
-        .is_some_and(|head| head.status == 1 && version_number <= head.version_number);
-    if !authorized || !version_exists {
+    let Some(head) = head.filter(|head| head.status == 1 && version_number <= head.version_number)
+    else {
         return signed_access_failure(
             &state,
             member_id,
@@ -813,6 +897,63 @@ async fn access_lookup(
             "unauthorized",
         )
         .await;
+    };
+    if !authorized {
+        return signed_access_failure(
+            &state,
+            member_id,
+            &source_id,
+            &file_id,
+            version_number,
+            &nonce,
+            request.deadline,
+            Some(finalized.number),
+            "unauthorized",
+        )
+        .await;
+    }
+    if version_number < head.version_number {
+        let historical_access = match state
+            .chain
+            .has_historical_read_access(
+                &state.config.access_governance,
+                member_id.as_bytes(),
+                file_id.as_bytes(),
+                version_number,
+                finalized.number,
+            )
+            .await
+        {
+            Ok(allowed) => allowed,
+            Err(_) => {
+                return signed_access_failure(
+                    &state,
+                    member_id,
+                    &source_id,
+                    &file_id,
+                    version_number,
+                    &nonce,
+                    request.deadline,
+                    Some(finalized.number),
+                    "chain_unavailable",
+                )
+                .await;
+            }
+        };
+        if !historical_access {
+            return signed_access_failure(
+                &state,
+                member_id,
+                &source_id,
+                &file_id,
+                version_number,
+                &nonce,
+                request.deadline,
+                Some(finalized.number),
+                "unauthorized",
+            )
+            .await;
+        }
     }
     let content = match state
         .chain
@@ -925,6 +1066,374 @@ async fn access_lookup(
     }
 }
 
+async fn retrieve_version_content(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Path((raw_file_id, version_number)): Path<(String, u64)>,
+) -> Response {
+    let source_id = source_identifier(&peer.ip().to_string());
+    let file_id = match parse_fixed_hex::<32>(&raw_file_id) {
+        Some(bytes) if bytes != [0; 32] && raw_file_id == raw_file_id.to_ascii_lowercase() => {
+            FileId::from_bytes(bytes)
+        }
+        _ => {
+            return failure(
+                &state,
+                "file.content_retrieval",
+                &source_id,
+                "invalid_request",
+                None,
+                StatusCode::UNAUTHORIZED,
+                "unauthorized",
+            )
+            .await;
+        }
+    };
+    if VersionNumber::new(version_number).is_err() {
+        return content_attempt_failure(
+            &state,
+            None,
+            &source_id,
+            &file_id,
+            version_number,
+            None,
+            "denied",
+            "invalid_request",
+            StatusCode::UNAUTHORIZED,
+        )
+        .await;
+    }
+
+    let token = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .and_then(parse_fixed_hex::<32>);
+    let Some(token) = token else {
+        return content_attempt_failure(
+            &state,
+            None,
+            &source_id,
+            &file_id,
+            version_number,
+            None,
+            "denied",
+            "unauthenticated",
+            StatusCode::UNAUTHORIZED,
+        )
+        .await;
+    };
+    let member_id = match state
+        .store
+        .active_session_member(&hash_session_token(&token))
+        .await
+    {
+        Ok(Some(member_id)) => match parse_member_id(&member_id) {
+            Ok(member_id) => member_id,
+            Err(_) => return error(StatusCode::SERVICE_UNAVAILABLE, "service_unavailable"),
+        },
+        Ok(None) => {
+            return content_attempt_failure(
+                &state,
+                None,
+                &source_id,
+                &file_id,
+                version_number,
+                None,
+                "denied",
+                "unauthenticated",
+                StatusCode::UNAUTHORIZED,
+            )
+            .await;
+        }
+        Err(_) => return error(StatusCode::SERVICE_UNAVAILABLE, "service_unavailable"),
+    };
+    let member_id_string = member_id.to_string();
+
+    let finalized = match state.chain.finalized_block().await {
+        Ok(block) => block,
+        Err(_) => {
+            return content_attempt_failure(
+                &state,
+                Some(&member_id_string),
+                &source_id,
+                &file_id,
+                version_number,
+                None,
+                "denied",
+                "chain_unavailable",
+                StatusCode::SERVICE_UNAVAILABLE,
+            )
+            .await;
+        }
+    };
+    let read_access = match state
+        .chain
+        .has_read_access(
+            &state.config.access_governance,
+            member_id.as_bytes(),
+            file_id.as_bytes(),
+            finalized.number,
+        )
+        .await
+    {
+        Ok(allowed) => allowed,
+        Err(_) => {
+            return content_attempt_failure(
+                &state,
+                Some(&member_id_string),
+                &source_id,
+                &file_id,
+                version_number,
+                Some(finalized.number),
+                "denied",
+                "chain_unavailable",
+                StatusCode::SERVICE_UNAVAILABLE,
+            )
+            .await;
+        }
+    };
+    let head = match state
+        .chain
+        .file_head_at(
+            &state.config.file_registry,
+            file_id.as_bytes(),
+            finalized.number,
+        )
+        .await
+    {
+        Ok(head) => head,
+        Err(_) => {
+            return content_attempt_failure(
+                &state,
+                Some(&member_id_string),
+                &source_id,
+                &file_id,
+                version_number,
+                Some(finalized.number),
+                "denied",
+                "chain_unavailable",
+                StatusCode::SERVICE_UNAVAILABLE,
+            )
+            .await;
+        }
+    };
+    let Some(head) = head.filter(|head| head.status == 1 && version_number <= head.version_number)
+    else {
+        return content_attempt_failure(
+            &state,
+            Some(&member_id_string),
+            &source_id,
+            &file_id,
+            version_number,
+            Some(finalized.number),
+            "denied",
+            "unauthorized",
+            StatusCode::UNAUTHORIZED,
+        )
+        .await;
+    };
+    if !read_access {
+        return content_attempt_failure(
+            &state,
+            Some(&member_id_string),
+            &source_id,
+            &file_id,
+            version_number,
+            Some(finalized.number),
+            "denied",
+            "unauthorized",
+            StatusCode::UNAUTHORIZED,
+        )
+        .await;
+    }
+    if version_number < head.version_number {
+        match state
+            .chain
+            .has_historical_read_access(
+                &state.config.access_governance,
+                member_id.as_bytes(),
+                file_id.as_bytes(),
+                version_number,
+                finalized.number,
+            )
+            .await
+        {
+            Ok(true) => {}
+            Ok(false) => {
+                return content_attempt_failure(
+                    &state,
+                    Some(&member_id_string),
+                    &source_id,
+                    &file_id,
+                    version_number,
+                    Some(finalized.number),
+                    "denied",
+                    "unauthorized",
+                    StatusCode::UNAUTHORIZED,
+                )
+                .await;
+            }
+            Err(_) => {
+                return content_attempt_failure(
+                    &state,
+                    Some(&member_id_string),
+                    &source_id,
+                    &file_id,
+                    version_number,
+                    Some(finalized.number),
+                    "denied",
+                    "chain_unavailable",
+                    StatusCode::SERVICE_UNAVAILABLE,
+                )
+                .await;
+            }
+        }
+    }
+    let content = match state
+        .chain
+        .file_version(
+            &state.config.file_registry,
+            file_id.as_bytes(),
+            version_number,
+            finalized.number,
+        )
+        .await
+    {
+        Ok(Some(content)) => content,
+        Ok(None) => {
+            return content_attempt_failure(
+                &state,
+                Some(&member_id_string),
+                &source_id,
+                &file_id,
+                version_number,
+                Some(finalized.number),
+                "denied",
+                "unauthorized",
+                StatusCode::UNAUTHORIZED,
+            )
+            .await;
+        }
+        Err(_) => {
+            return content_attempt_failure(
+                &state,
+                Some(&member_id_string),
+                &source_id,
+                &file_id,
+                version_number,
+                Some(finalized.number),
+                "denied",
+                "chain_unavailable",
+                StatusCode::SERVICE_UNAVAILABLE,
+            )
+            .await;
+        }
+    };
+    let content_cid = match ContentCid::parse(&content.content_cid) {
+        Ok(cid) => cid,
+        Err(_) => {
+            return content_attempt_failure(
+                &state,
+                Some(&member_id_string),
+                &source_id,
+                &file_id,
+                version_number,
+                Some(finalized.number),
+                "denied",
+                "invalid_chain_reference",
+                StatusCode::SERVICE_UNAVAILABLE,
+            )
+            .await;
+        }
+    };
+    let reader = match state.blob_store.get_content(&content_cid).await {
+        Ok(reader) => reader,
+        Err(_) => {
+            return content_attempt_failure(
+                &state,
+                Some(&member_id_string),
+                &source_id,
+                &file_id,
+                version_number,
+                Some(finalized.number),
+                "storage_failed",
+                "storage_unavailable",
+                StatusCode::SERVICE_UNAVAILABLE,
+            )
+            .await;
+        }
+    };
+    if state
+        .store
+        .record_content_attempt(
+            Some(&member_id_string),
+            &source_id,
+            &file_id.to_string(),
+            version_number,
+            state.config.chain_id,
+            Some(finalized.number),
+            "authorized",
+            None,
+        )
+        .await
+        .is_err()
+    {
+        return error(StatusCode::SERVICE_UNAVAILABLE, "service_unavailable");
+    }
+
+    let mut response = Response::new(Body::from_stream(ReaderStream::new(reader)));
+    response.headers_mut().insert(
+        axum::http::header::CONTENT_TYPE,
+        axum::http::HeaderValue::from_static("application/vnd.ipld.car"),
+    );
+    response.headers_mut().insert(
+        axum::http::header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("no-store"),
+    );
+    response
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn content_attempt_failure(
+    state: &AppState,
+    member_id: Option<&str>,
+    source_id: &str,
+    file_id: &FileId,
+    version: u64,
+    block_number: Option<u64>,
+    outcome: &'static str,
+    reason: &'static str,
+    status: StatusCode,
+) -> Response {
+    match state
+        .store
+        .record_content_attempt(
+            member_id,
+            source_id,
+            &file_id.to_string(),
+            version,
+            state.config.chain_id,
+            block_number,
+            outcome,
+            Some(reason),
+        )
+        .await
+    {
+        Ok(()) => error(
+            status,
+            if status == StatusCode::UNAUTHORIZED {
+                "unauthorized"
+            } else {
+                "service_unavailable"
+            },
+        ),
+        Err(_) => error(StatusCode::SERVICE_UNAVAILABLE, "service_unavailable"),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn signed_access_failure(
     state: &AppState,
     member_id: domain::MemberId,
@@ -964,8 +1473,12 @@ async fn enforce_rate_limit(
     next: Next,
 ) -> Response {
     let action = match (request.method().as_str(), request.uri().path()) {
+        ("GET", path) if path.starts_with("/v1/identities/") => "identity.lookup",
         ("POST", "/v1/auth/challenge") => "auth.challenge",
         ("POST", "/v1/auth/session") | ("GET", "/v1/auth/session") => "auth.session",
+        ("GET", path) if path.starts_with("/v1/files/") && path.ends_with("/content") => {
+            "file.content"
+        }
         _ => return next.run(request).await,
     };
     let source_id = source_identifier(&peer.ip().to_string());
@@ -1074,5 +1587,28 @@ mod tests {
         assert_eq!(value["issuedAt"], 10);
         assert_eq!(value["protocolVersion"], 1);
         assert!(value.get("member_id").is_none());
+    }
+
+    #[test]
+    fn public_identity_response_exposes_only_canonical_public_fields() {
+        let response = PublicIdentityResponse {
+            member_id: format!("0x{}", "11".repeat(32)),
+            organization_id: format!("0x{}", "22".repeat(32)),
+            signing_address: format!("0x{}", "33".repeat(20)),
+            signing_key_version: 2,
+            encryption_key_version: 4,
+            encryption_public_key: format!("0x{}", "44".repeat(32)),
+            status: "active",
+            finalized_block: 17,
+            finalized_block_hash: format!("0x{}", "55".repeat(32)),
+        };
+        let value = serde_json::to_value(response).unwrap();
+        assert_eq!(value["memberId"], format!("0x{}", "11".repeat(32)));
+        assert_eq!(value["status"], "active");
+        assert_eq!(value["signingKeyVersion"], 2);
+        assert_eq!(value["encryptionKeyVersion"], 4);
+        assert_eq!(value["finalizedBlock"], 17);
+        assert!(value.get("signing_address").is_none());
+        assert!(value.get("privateKey").is_none());
     }
 }

@@ -259,6 +259,7 @@ impl GatewayStore {
         Ok(completed)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn record_access_attempt(
         &self,
         member_id: &str,
@@ -320,6 +321,40 @@ impl GatewayStore {
         .await?;
         transaction.commit().await?;
         Ok(authorized && !replayed)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn record_content_attempt(
+        &self,
+        member_id: Option<&str>,
+        source_id: &str,
+        file_id: &str,
+        version: u64,
+        chain_id: u64,
+        block_number: Option<u64>,
+        outcome: &'static str,
+        reason_code: Option<&'static str>,
+    ) -> Result<(), sqlx::Error> {
+        let mut transaction = self.pool.begin().await?;
+        append_audit(
+            &mut transaction,
+            AuditRecord {
+                occurred_at_unix_ms: unix_millis()?,
+                action: "file.content_retrieval",
+                actor_member_id: member_id,
+                source_id,
+                outcome,
+                reason_code,
+                operation_id: None,
+                resource_type: Some("file-version"),
+                resource_id: Some(file_id),
+                resource_version: Some(version),
+                chain_id,
+                block_number,
+            },
+        )
+        .await?;
+        transaction.commit().await
     }
 
     pub async fn active_session_member(

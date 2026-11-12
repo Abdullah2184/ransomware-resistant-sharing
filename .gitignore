@@ -28,6 +28,8 @@ infra/**/data/
 infra/**/volumes/
 infra/**/keys/
 infra/**/passwords/
+/infra/besu-qbft/networkFiles/
+/infra/besu-qbft/generated/
 
 # Logs and temporary files
 *.log

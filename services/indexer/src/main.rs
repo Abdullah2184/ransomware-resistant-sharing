@@ -547,6 +547,7 @@ async fn clear_projection_tables(
         "folders_projection",
         "versions_projection",
         "access_projection",
+        "historical_read_access_projection",
         "envelope_sets_projection",
     ] {
         let statement = format!("DELETE FROM {table}");
@@ -1001,6 +1002,27 @@ async fn project_event_inner(
             .await
             .map_err(|_| IndexerError::Database)?;
         }
+        "HistoricalReadAccessGranted" | "HistoricalReadAccessRevoked" => {
+            let granted = event_name == "HistoricalReadAccessGranted";
+            sqlx::query(
+                "INSERT INTO historical_read_access_projection \
+                 (file_id, version_number, member_id, granted, actor, proposal_id, updated_block_number) \
+                 VALUES ($1,$2,$3,$4,$5,$6,$7) \
+                 ON CONFLICT (file_id, version_number, member_id) DO UPDATE SET \
+                 granted = EXCLUDED.granted, actor = EXCLUDED.actor, \
+                 proposal_id = EXCLUDED.proposal_id, updated_block_number = EXCLUDED.updated_block_number",
+            )
+            .bind(field_string(fields, "file_id")?)
+            .bind(field_i64(fields, "version_number")?)
+            .bind(field_string(fields, "member_id")?)
+            .bind(granted)
+            .bind(field_string(fields, "actor")?)
+            .bind(field_string(fields, "proposal_id")?)
+            .bind(block_number)
+            .execute(&mut **transaction)
+            .await
+            .map_err(|_| IndexerError::Database)?;
+        }
         "EnvelopeSetInitialized" => {
             sqlx::query(
                 "INSERT INTO envelope_sets_projection \
@@ -1250,11 +1272,27 @@ mod tests {
             10,
             3,
         );
+        let historical_read_granted = log(
+            "HistoricalReadAccessGranted(bytes32,uint64,bytes32,address,bytes32)",
+            &[
+                topic_word(&file_id[2..]),
+                topic_word(&word(1)),
+                topic_word(&member_id[2..]),
+            ],
+            &format!(
+                "{}{}",
+                format_args!("{}{}", "00".repeat(12), "55".repeat(20)),
+                "aa".repeat(32)
+            ),
+            10,
+            4,
+        );
         let logs = vec![
             file_created,
             version_appended,
             current_head,
             envelope_initialized,
+            historical_read_granted,
         ];
         let canonical_hashes = BTreeMap::from([(10, format!("0x{}", "22".repeat(32)))]);
 
@@ -1276,7 +1314,18 @@ mod tests {
         )
         .await
         .expect("replay identical finalized events");
-        assert_eq!(event_count_in_transaction(&mut transaction).await, 4);
+        assert_eq!(event_count_in_transaction(&mut transaction).await, 5);
+        let historical_grant: (bool, String) = sqlx::query_as(
+            "SELECT granted, actor FROM historical_read_access_projection \
+             WHERE file_id = $1 AND version_number = 1 AND member_id = $2",
+        )
+        .bind(file_id)
+        .bind(member_id)
+        .fetch_one(&mut *transaction)
+        .await
+        .expect("read historical access projection");
+        assert!(historical_grant.0);
+        assert_eq!(historical_grant.1.trim(), format!("0x{}", "55".repeat(20)));
         let projected_head: (i64, String, String) = sqlx::query_as(
             "SELECT current_version, current_head_manifest_hash, display_name \
              FROM files_projection WHERE file_id = $1",
@@ -1331,7 +1380,7 @@ mod tests {
             projected_version.2.trim(),
             "0x8888888888888888888888888888888888888888"
         );
-        assert_eq!(event_count_in_transaction(&mut transaction).await, 4);
+        assert_eq!(event_count_in_transaction(&mut transaction).await, 5);
         reset_indexed_chain_in_transaction(&mut transaction, TEST_CHAIN_ID)
             .await
             .expect("reset derived index state for a chain replay");

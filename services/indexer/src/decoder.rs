@@ -41,6 +41,8 @@ const EVENTS: &[&str] = &[
     "ReadAccessRevoked(bytes32,bytes32,address,bytes32)",
     "WriteAccessGranted(bytes32,bytes32,address,bytes32)",
     "WriteAccessRevoked(bytes32,bytes32,address,bytes32)",
+    "HistoricalReadAccessGranted(bytes32,uint64,bytes32,address,bytes32)",
+    "HistoricalReadAccessRevoked(bytes32,uint64,bytes32,address,bytes32)",
     "EnvelopeSetInitialized(bytes32,uint64,bytes32,string)",
     "EnvelopeSetUpdated(bytes32,uint64,bytes32,bytes32,bytes32,string,string,uint32,uint256)",
     "FileCreated(bytes32,bytes32,bytes32,string,bytes32)",
@@ -125,6 +127,14 @@ pub fn decode(log: &ChainLog) -> Result<DecodedEvent, DecodeError> {
             "member_id": indexed(&topics, 1)?,
             "actor": indexed_address(&topics, 2)?,
             "proposal_id": word_hex(&data, 0)?
+        }),
+        "HistoricalReadAccessGranted(bytes32,uint64,bytes32,address,bytes32)"
+        | "HistoricalReadAccessRevoked(bytes32,uint64,bytes32,address,bytes32)" => json!({
+            "file_id": indexed(&topics, 0)?,
+            "version_number": number_topic(&topics, 1)?,
+            "member_id": indexed(&topics, 2)?,
+            "actor": address_word(&data, 0)?,
+            "proposal_id": word_hex(&data, 1)?
         }),
         "EnvelopeSetInitialized(bytes32,uint64,bytes32,string)" => json!({
             "file_id": indexed(&topics, 0)?,
@@ -441,5 +451,38 @@ mod tests {
             "0x".into(),
         );
         assert_eq!(decode(&unknown).unwrap().name, "Unknown");
+    }
+
+    #[test]
+    fn decodes_version_scoped_historical_read_events() {
+        let signature = "HistoricalReadAccessGranted(bytes32,uint64,bytes32,address,bytes32)";
+        let data = format!(
+            "0x{}{}{}",
+            "00".repeat(12),
+            "33".repeat(20),
+            "44".repeat(32)
+        );
+        let decoded = decode(&log(
+            signature,
+            vec![
+                topic(&"11".repeat(32)),
+                topic(&word_hex_u64(7)),
+                topic(&"22".repeat(32)),
+            ],
+            data,
+        ))
+        .unwrap();
+        assert_eq!(decoded.name, "HistoricalReadAccessGranted");
+        assert_eq!(decoded.fields["file_id"], format!("0x{}", "11".repeat(32)));
+        assert_eq!(decoded.fields["version_number"], 7);
+        assert_eq!(
+            decoded.fields["member_id"],
+            format!("0x{}", "22".repeat(32))
+        );
+        assert_eq!(decoded.fields["actor"], format!("0x{}", "33".repeat(20)));
+        assert_eq!(
+            decoded.fields["proposal_id"],
+            format!("0x{}", "44".repeat(32))
+        );
     }
 }

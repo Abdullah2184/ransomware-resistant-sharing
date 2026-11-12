@@ -374,6 +374,90 @@ contract AccessGovernanceTest is Test {
         assertFalse(governance.hasReadAccess(OTHER_MEMBER_ID, bytes32(uint256(999))));
     }
 
+    function test_HistoricalReadRequiresFileReadAndAnExplicitVersionGrant() public {
+        string memory cid = "bafkreiaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaq";
+        vm.prank(FILE_REGISTRY);
+        governance.initializeEnvelopeSet(FILE_ID, 1, bytes32(uint256(6)), cid);
+
+        vm.expectRevert(AccessGovernance.InvalidPermission.selector);
+        vm.prank(ORGANIZATION_SAFE);
+        governance.setHistoricalReadAccess(
+            FILE_ID, 1, OTHER_MEMBER_ID, true, bytes32(uint256(77))
+        );
+
+        vm.prank(ORGANIZATION_SAFE);
+        governance.setFilePermission(
+            FILE_ID,
+            OTHER_MEMBER_ID,
+            AccessGovernance.Permission.Read,
+            true,
+            bytes32(0)
+        );
+
+        vm.expectEmit(true, true, true, true, address(governance));
+        emit AccessGovernance.HistoricalReadAccessGranted(
+            FILE_ID, 1, OTHER_MEMBER_ID, ORGANIZATION_SAFE, bytes32(uint256(77))
+        );
+        vm.prank(ORGANIZATION_SAFE);
+        governance.setHistoricalReadAccess(
+            FILE_ID, 1, OTHER_MEMBER_ID, true, bytes32(uint256(77))
+        );
+        assertTrue(governance.hasReadAccess(OTHER_MEMBER_ID, FILE_ID));
+        assertTrue(governance.hasHistoricalReadAccess(OTHER_MEMBER_ID, FILE_ID, 1));
+        assertFalse(governance.hasHistoricalReadAccess(OTHER_MEMBER_ID, FILE_ID, 2));
+
+        vm.prank(ORGANIZATION_SAFE);
+        governance.setFilePermission(
+            FILE_ID,
+            OTHER_MEMBER_ID,
+            AccessGovernance.Permission.Read,
+            false,
+            bytes32(0)
+        );
+        assertFalse(governance.hasHistoricalReadAccess(OTHER_MEMBER_ID, FILE_ID, 1));
+
+        vm.prank(ORGANIZATION_SAFE);
+        governance.setFilePermission(
+            FILE_ID,
+            OTHER_MEMBER_ID,
+            AccessGovernance.Permission.Read,
+            true,
+            bytes32(0)
+        );
+        assertFalse(governance.hasHistoricalReadAccess(OTHER_MEMBER_ID, FILE_ID, 1));
+
+        vm.prank(ORGANIZATION_SAFE);
+        governance.setHistoricalReadAccess(FILE_ID, 1, OTHER_MEMBER_ID, true, bytes32(0));
+        assertTrue(governance.hasHistoricalReadAccess(OTHER_MEMBER_ID, FILE_ID, 1));
+    }
+
+    function test_HistoricalReadGrantRequiresExistingVersionAndReadPolicySafe() public {
+        vm.expectRevert(AccessGovernance.InvalidEnvelopeReference.selector);
+        vm.prank(ORGANIZATION_SAFE);
+        governance.setHistoricalReadAccess(FILE_ID, 1, OTHER_MEMBER_ID, false, bytes32(0));
+
+        string memory cid = "bafkreiaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaq";
+        vm.prank(FILE_REGISTRY);
+        governance.initializeEnvelopeSet(FILE_ID, 1, bytes32(uint256(6)), cid);
+        vm.prank(ORGANIZATION_SAFE);
+        governance.setFilePermission(
+            FILE_ID,
+            OTHER_MEMBER_ID,
+            AccessGovernance.Permission.Read,
+            true,
+            bytes32(0)
+        );
+
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                AccessGovernance.UnauthorizedPolicyAuthority.selector,
+                address(this),
+                governance.READ_ACL_POLICY()
+            )
+        );
+        governance.setHistoricalReadAccess(FILE_ID, 1, OTHER_MEMBER_ID, true, bytes32(0));
+    }
+
     function test_FilePolicyCanUseADifferentSafeForWriteAcl() public {
         bytes32 writePolicy = governance.WRITE_ACL_POLICY();
         vm.prank(ORGANIZATION_SAFE);

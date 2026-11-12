@@ -21,7 +21,7 @@ pnpm exec hardhat test nodejs
 
 The default and production Solidity build profiles enable the optimizer with
 200 runs so local tests and Besu deployments use deployable bytecode. The
-current optimized `AccessGovernance` runtime is 15,820 bytes, below the
+current optimized `AccessGovernance` runtime is 17,229 bytes, below the
 24,576-byte EIP-170 limit.
 
 ## Deploy to local Besu

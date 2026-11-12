@@ -693,6 +693,8 @@ where \\(N\\) is the number of validators and \\(f\\) is the maximum number of f
 
 The initial four-validator deployment shall tolerate one faulty validator and require a three-validator quorum for finalization.
 
+For a QBFT network, the latest block returned by the trusted execution client is the latest block committed by the required QBFT quorum and is treated as finalized. The generic JSON-RPC `finalized` tag is a proof-of-stake finality tag and MUST NOT be assumed to work on QBFT networks. Implementations MUST query and record the QBFT committed head (and its hash), then use its explicit block number for related authoritative contract reads.
+
 If the required quorum cannot be achieved, block finalization may halt. Application operations shall remain pending or fail according to their transaction lifecycle status; they shall not be treated as committed without finality.
 
 Validator execution shall enforce contract rules through deterministic EVM execution. This includes execution of the EIP-712 signature-recovery logic and application authorization checks implemented in the contracts.

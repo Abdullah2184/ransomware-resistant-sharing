@@ -33,6 +33,9 @@ services:
     networks:
       - rrfs-private
 
+    ports:
+      - "127.0.0.1:15001:5001"
+
     environment:
       IPFS_PROFILE: server
       LIBP2P_TCP_MUX: "false"
@@ -63,6 +66,9 @@ services:
         condition: service_healthy
     networks:
       - rrfs-private
+
+    ports:
+      - "127.0.0.1:15002:5001"
 
     environment:
       IPFS_PROFILE: server

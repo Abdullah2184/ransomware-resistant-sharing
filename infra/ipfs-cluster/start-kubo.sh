@@ -16,6 +16,20 @@ gosu ipfs install -m 0400 /run/secrets/swarm-key /data/ipfs/swarm.key
 gosu ipfs ipfs config --json Bootstrap '[]'
 gosu ipfs ipfs config --json Swarm.DisableNatPortMap true
 gosu ipfs ipfs config --json Swarm.AddrFilters '[]'
+# This private swarm must not depend on public bootstrap or delegated-routing
+# services. Kubo 0.43.1's default "auto" mode falls back to WAN-only DHT when
+# AutoConf is disabled, so configure its LAN DHT explicitly.
+gosu ipfs ipfs config --json DNS.Resolvers '{}'
+gosu ipfs ipfs config --json Routing.DelegatedRouters '[]'
+gosu ipfs ipfs config --json Ipns.DelegatedPublishers '[]'
+gosu ipfs ipfs config --json Routing.Type '"custom"'
+gosu ipfs ipfs config Routing.Routers.LanDHT --json \
+    '{"Type":"dht","Parameters":{"Mode":"server","PublicIPNetwork":false,"AcceleratedDHTClient":false}}'
+gosu ipfs ipfs config Routing.Methods --json \
+    '{"find-peers":{"RouterName":"LanDHT"},"find-providers":{"RouterName":"LanDHT"},"get-ipns":{"RouterName":"LanDHT"},"provide":{"RouterName":"LanDHT"},"put-ipns":{"RouterName":"LanDHT"}}'
+# Kubo 0.43.1's sweep provider is a no-op for custom routing with a DHT
+# router; use the legacy provider so configured LAN DHT methods are honored.
+gosu ipfs ipfs config --bool Provide.DHT.SweepEnabled false
 gosu ipfs ipfs config --bool AutoConf.Enabled false
 gosu ipfs ipfs config --bool AutoTLS.Enabled false
 

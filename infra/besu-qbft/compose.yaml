@@ -1,0 +1,109 @@
+name: rrfs-besu-dev
+
+x-besu-image: &besu-image ${BESU_IMAGE:-hyperledger/besu:26.11.0@sha256:3d6ac0368d449c13c4ba075acac90d6b96afa5b3113295385d88c4d5122c8808}
+x-validator-options: &validator-options
+  - --genesis-file=/config/genesis.json
+  - --data-path=/data
+  - --min-gas-price=0
+  - --p2p-host=0.0.0.0
+  - --p2p-port=30303
+  - --bootnodes=/config/bootnodes.txt
+  - --Xdns-enabled=true
+  - --Xdns-update-enabled=true
+  - --host-allowlist=*
+  - --logging=INFO
+
+services:
+  validator1:
+    image: *besu-image
+    restart: unless-stopped
+    environment:
+      BESU_NODE_PRIVATE_KEY_FILE: /node-key/key
+    command: *validator-options
+    volumes:
+      - validator1_data:/data
+      - ./generated/genesis.json:/config/genesis.json:ro
+      - ./generated/bootnodes.txt:/config/bootnodes.txt:ro
+      - ./generated/validators/validator1:/node-key:ro
+    networks: [besu-private]
+
+  validator2:
+    image: *besu-image
+    restart: unless-stopped
+    environment:
+      BESU_NODE_PRIVATE_KEY_FILE: /node-key/key
+    command: *validator-options
+    volumes:
+      - validator2_data:/data
+      - ./generated/genesis.json:/config/genesis.json:ro
+      - ./generated/bootnodes.txt:/config/bootnodes.txt:ro
+      - ./generated/validators/validator2:/node-key:ro
+    networks: [besu-private]
+
+  validator3:
+    image: *besu-image
+    restart: unless-stopped
+    environment:
+      BESU_NODE_PRIVATE_KEY_FILE: /node-key/key
+    command: *validator-options
+    volumes:
+      - validator3_data:/data
+      - ./generated/genesis.json:/config/genesis.json:ro
+      - ./generated/bootnodes.txt:/config/bootnodes.txt:ro
+      - ./generated/validators/validator3:/node-key:ro
+    networks: [besu-private]
+
+  validator4:
+    image: *besu-image
+    restart: unless-stopped
+    environment:
+      BESU_NODE_PRIVATE_KEY_FILE: /node-key/key
+    command: *validator-options
+    volumes:
+      - validator4_data:/data
+      - ./generated/genesis.json:/config/genesis.json:ro
+      - ./generated/bootnodes.txt:/config/bootnodes.txt:ro
+      - ./generated/validators/validator4:/node-key:ro
+    networks: [besu-private]
+
+  rpcnode:
+    image: *besu-image
+    restart: unless-stopped
+    depends_on:
+      - validator1
+    command:
+      - --genesis-file=/config/genesis.json
+      - --data-path=/data
+      - --min-gas-price=0
+      - --p2p-host=0.0.0.0
+      - --p2p-port=30303
+      - --bootnodes=/config/bootnodes.txt
+      - --Xdns-enabled=true
+      - --Xdns-update-enabled=true
+      - --rpc-http-enabled=true
+      - --rpc-http-host=0.0.0.0
+      - --rpc-http-port=8545
+      - --rpc-http-api=ETH,NET,WEB3,QBFT
+      - --rpc-http-max-active-connections=64
+      - --host-allowlist=localhost,127.0.0.1,rpcnode
+      - --logging=INFO
+    ports:
+      - "127.0.0.1:8545:8545"
+    volumes:
+      - rpcnode_data:/data
+      - ./generated/genesis.json:/config/genesis.json:ro
+      - ./generated/bootnodes.txt:/config/bootnodes.txt:ro
+    networks: [besu-private]
+
+volumes:
+  validator1_data:
+  validator2_data:
+  validator3_data:
+  validator4_data:
+  rpcnode_data:
+
+networks:
+  besu-private:
+    # Keep P2P ports unpublished and bind the RPC HTTP port to host loopback.
+    # Docker's internal networks have no host-interface connection, which
+    # prevents the RPC service's required localhost port publication.

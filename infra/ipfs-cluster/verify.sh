@@ -2,7 +2,7 @@
 set -eu
 
 compose() {
-    docker compose -f infra/compose.yaml "$@"
+    docker compose --env-file .env -f infra/compose.yaml "$@"
 }
 
 peer_output=$(compose exec -T cluster1 sh -ec '

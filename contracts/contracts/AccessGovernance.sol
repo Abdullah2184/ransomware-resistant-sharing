@@ -150,6 +150,20 @@ contract AccessGovernance is AccessControl {
         address indexed actor,
         bytes32 proposalId
     );
+    event HistoricalReadAccessGranted(
+        bytes32 indexed fileId,
+        uint64 indexed versionNumber,
+        bytes32 indexed memberId,
+        address actor,
+        bytes32 proposalId
+    );
+    event HistoricalReadAccessRevoked(
+        bytes32 indexed fileId,
+        uint64 indexed versionNumber,
+        bytes32 indexed memberId,
+        address actor,
+        bytes32 proposalId
+    );
     event EnvelopeSetInitialized(
         bytes32 indexed fileId,
         uint64 indexed versionNumber,
@@ -177,6 +191,9 @@ contract AccessGovernance is AccessControl {
     mapping(bytes32 fileId => bytes32 organizationId) public fileOrganizations;
     mapping(bytes32 fileId => mapping(bytes32 policy => address authority)) public filePolicyAuthorities;
     mapping(bytes32 fileId => mapping(bytes32 memberId => uint8 permissions)) private filePermissions;
+    mapping(bytes32 fileId => mapping(uint64 versionNumber => mapping(bytes32 memberId => uint64 grantEpoch)))
+        private historicalReadPermissions;
+    mapping(bytes32 fileId => mapping(bytes32 memberId => uint64 epoch)) private readPermissionEpochs;
     mapping(bytes32 fileId => mapping(uint64 versionNumber => EnvelopePointer pointer)) private envelopePointers;
     mapping(bytes32 memberId => mapping(bytes32 operationNonce => bool consumed)) public consumedOperationNonces;
     mapping(bytes32 memberId => mapping(bytes32 operationNonce => bool consumed)) public consumedKeyProofNonces;
@@ -441,6 +458,9 @@ contract AccessGovernance is AccessControl {
             filePermissions[fileId][memberId] |= bit;
         } else {
             filePermissions[fileId][memberId] &= ~bit;
+            if (permission == Permission.Read) {
+                readPermissionEpochs[fileId][memberId] += 1;
+            }
         }
 
         if (permission == Permission.Read) {
@@ -454,6 +474,49 @@ contract AccessGovernance is AccessControl {
 
     function hasReadAccess(bytes32 memberId, bytes32 fileId) external view returns (bool) {
         return _hasReadAccess(memberId, fileId);
+    }
+
+    function setHistoricalReadAccess(
+        bytes32 fileId,
+        uint64 versionNumber,
+        bytes32 memberId,
+        bool granted,
+        bytes32 proposalId
+    ) external {
+        bytes32 organizationId = fileOrganizations[fileId];
+        if (organizationId == bytes32(0)) revert UnknownFile();
+        if (versionNumber == 0 || !envelopePointers[fileId][versionNumber].initialized) {
+            revert InvalidEnvelopeReference();
+        }
+        if (members[memberId].status == MemberStatus.Unregistered) revert UnknownMember();
+        _requireFilePolicyAuthority(fileId, organizationId, READ_ACL_POLICY);
+
+        uint64 grantEpoch = readPermissionEpochs[fileId][memberId] + 1;
+        bool wasGranted = historicalReadPermissions[fileId][versionNumber][memberId] == grantEpoch;
+        if (wasGranted == granted) return;
+        if (granted) {
+            if (members[memberId].status != MemberStatus.Active) revert MemberNotActive();
+            if ((filePermissions[fileId][memberId] & 1) == 0) revert InvalidPermission();
+            historicalReadPermissions[fileId][versionNumber][memberId] = grantEpoch;
+            emit HistoricalReadAccessGranted(
+                fileId, versionNumber, memberId, msg.sender, proposalId
+            );
+        } else {
+            delete historicalReadPermissions[fileId][versionNumber][memberId];
+            emit HistoricalReadAccessRevoked(
+                fileId, versionNumber, memberId, msg.sender, proposalId
+            );
+        }
+    }
+
+    function hasHistoricalReadAccess(
+        bytes32 memberId,
+        bytes32 fileId,
+        uint64 versionNumber
+    ) external view returns (bool) {
+        return _hasReadAccess(memberId, fileId)
+            && historicalReadPermissions[fileId][versionNumber][memberId]
+                == readPermissionEpochs[fileId][memberId] + 1;
     }
 
     function hasWriteAccess(bytes32 memberId, bytes32 fileId) external view returns (bool) {

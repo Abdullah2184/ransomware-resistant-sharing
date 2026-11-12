@@ -7,6 +7,7 @@ use std::{error::Error, net::TcpListener};
 
 use chain_adapter::BesuClient;
 use config::GatewayConfig;
+use ipfs_adapter::{IpfsClusterStore, IpfsConfig};
 use metadata_store::PostgresStore;
 use routes::{AppState, router};
 use store::GatewayStore;
@@ -15,6 +16,7 @@ use store::GatewayStore;
 async fn main() -> Result<(), Box<dyn Error>> {
     let config = GatewayConfig::from_env().map_err(std::io::Error::other)?;
     let chain = BesuClient::new(&config.besu_rpc_url)?;
+    let blob_store = IpfsClusterStore::new(IpfsConfig::from_env()?)?;
     let connected_chain_id = chain.chain_id().await?;
     if connected_chain_id != config.chain_id {
         return Err(std::io::Error::other("configured chain ID does not match Besu").into());
@@ -32,6 +34,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         router(AppState::new(
             GatewayStore::new(metadata.pool().clone()),
             chain,
+            blob_store,
             config,
         ))
         .into_make_service_with_connect_info::<std::net::SocketAddr>(),

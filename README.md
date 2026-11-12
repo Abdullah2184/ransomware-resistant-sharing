@@ -50,13 +50,15 @@ Initialize local IPFS Cluster secrets once, then start the services:
 
 ```shell
 sh infra/ipfs-cluster/init-secrets.sh
-docker compose -f infra/compose.yaml up -d
+docker compose --env-file .env -f infra/compose.yaml up -d
 ```
 
 The script generates private-network and Cluster credentials into an ignored
-local secrets directory and never prints their values. Both Kubo APIs and
-gateways remain private to the Compose network. Only the authenticated
-Cluster management API is published on loopback at `127.0.0.1:9094`.
+local secrets directory and never prints their values. Kubo APIs are published
+only on host loopback ports `127.0.0.1:15001` and `127.0.0.1:15002` for the
+host-run gateway; the Kubo gateways and swarm ports remain unpublished. Only
+the authenticated Cluster management API is published at `127.0.0.1:9094`.
+See [the local Kubo API ADR](docs/adr/host-loopback-kubo-api-for-development.md).
 
 The two local peers are a development replication test only. They share one
 host, Docker daemon, and failure domain; this does not demonstrate
@@ -110,8 +112,8 @@ file metadata policy Safe instead of granting the timelock an implicit bypass.
 File creation atomically initializes the signed creator's Read and Write
 grants, file policy, first version and initial envelope pointer, as approved
 and documented in the governance ADR and §7.1.1. The current Hardhat suite
-passes 37 tests (30 Solidity, 7 TypeScript). The optimized
-`AccessGovernance` runtime is 15,820 bytes, below the 24,576-byte EIP-170
+passes 39 tests (32 Solidity, 7 TypeScript). The optimized
+`AccessGovernance` runtime is 17,229 bytes, below the 24,576-byte EIP-170
 limit; local Besu deployment and actual Safe integration remain unverified.
 
 The deployment increment now includes an OpenZeppelin `TimelockController`
@@ -122,7 +124,8 @@ grant after the delay. Solidity tests exercise the delay and activation path.
 They do not establish an actual Safe deployment or Besu QBFT compatibility.
 
 Phase 3 implements an asynchronous encrypted-content `BlobStore` port, the
-Kubo/Cluster adapter, a Besu JSON-RPC client that requires finalized state, and
+Kubo/Cluster adapter, a Besu JSON-RPC client that reads the QBFT committed
+head, and
 a PostgreSQL projection/indexer pipeline with transactional event insertion,
 checkpoints, event replay, identity/ACL/file/version/envelope projections, and
 file-head reconciliation against finalized contract state.
@@ -137,7 +140,7 @@ because Cluster peer 2 reported `PIN_ERROR`. See
 [infra/ipfs-cluster/README.md](infra/ipfs-cluster/README.md); further Kubo/
 Cluster configuration work is deferred for manual follow-up.
 
-The indexer stores raw decoded finalized events and checkpoints atomically,
+The indexer stores raw decoded QBFT-finalized events and checkpoints atomically,
 rejects chain/checkpoint mismatches, and prevents database projections from
 authorizing access. Key-version events are included in the contract and
 decoded to rebuild member signing/encryption key history. Operator recovery
@@ -147,28 +150,65 @@ derived index data for the configured chain and replays from
 `INDEXER_START_BLOCK`. The latter requires the Besu node to retain that event
 history. Required indexer values are listed in `.env.example`.
 
-The first Phase 4 gateway increment adds one-time, audience-bound EIP-712
-login challenges, signature verification against the active member signing
-key at finalized Besu state, short-lived sessions, PostgreSQL-backed
-single-use challenge/session state, shared source-address token buckets, and
-an append-only hash-chained authentication audit stream. Session tokens are
-returned once and stored only as hashes; session inspection audits before
-returning the authenticated member ID. Challenge consumption, session
-creation, and successful-login audit append are one database transaction.
-The listener verifies its configured chain ID against Besu at startup,
+Phase 4 includes one-time, audience-bound EIP-712 login challenges, signature
+verification against the active member signing key at QBFT-committed Besu state,
+short-lived sessions, PostgreSQL-backed single-use challenge/session state,
+shared source-address token buckets, and an append-only hash-chained
+authentication audit stream. It also provides signed access lookup with
+finalized member, file Read ACL, head, version and envelope-pointer checks;
+successful and failed lookups are durably audited before any CID is returned.
+Historical versions require explicit version-scoped grants. Contract
+grant/revoke state, finalized chain queries, gateway enforcement and indexer
+projection are implemented; a Read-ACL epoch prevents old grants from
+resurfacing after revoke/regrant. Session tokens are returned once and stored
+only as hashes. The listener verifies its configured chain ID at startup,
 defaults to loopback, and refuses non-loopback binds until TLS termination is
-configured. Rust and `viem` share a passing EIP-712 challenge digest fixture.
-See [services/gateway/README.md](services/gateway/README.md),
-[docs/api.md](docs/api.md), and the
-[gateway authentication ADR](docs/adr/gateway-authentication-and-audit.md).
+configured. See [services/gateway/README.md](services/gateway/README.md),
+[docs/api.md](docs/api.md),
+[the authentication ADR](docs/adr/gateway-authentication-and-audit.md), and
+[the historical-access ADR](docs/adr/version-scoped-historical-read-access.md).
 
-Protected file/content routes, authoritative per-file ACL checks,
-audit-before-CID/ciphertext release, PostgreSQL role separation, audit-query
-controls, session revocation, full governance proposal workflows, production
-key custody, and end-to-end acceptance tests remain outstanding. Auth route
-errors are rate-limited and audited, but malformed HTTP requests rejected
-before routing are not. The PostgreSQL audit service currently covers only
-gateway authentication.
+The gateway access-lookup route permits current-head versions under the file
+Read ACL and requires an explicit historical grant for older versions. It
+checks these conditions at one finalized block and durably audits before
+returning CIDs. The ciphertext route repeats those checks, audits before
+streaming the encrypted IPFS CAR, and never handles plaintext. Client-side
+manifest validation, envelope construction and recipient-membership checks,
+decryption, identity-directory/file/history listings, PostgreSQL role
+separation, audit-query controls, session revocation, full governance proposal
+workflows, production key custody, and end-to-end acceptance tests remain
+outstanding. The PostgreSQL audit service records authorization before
+streaming, not successful full receipt by the client.
+
+The gateway now also exposes `GET /v1/identities/{memberId}`. It reads public
+member identity and key status from `AccessGovernance.memberIdentity` at one
+QBFT-committed block and returns that block's number and hash. It is
+source-rate-limited and does not rely on the identity projection for
+authoritative values. File/folder listings, version history, audit queries,
+and state-changing routes remain outstanding.
+
+## Takeover progress (12 November 2026)
+
+The initial review found the Rust workspace could not compile: the access
+lookup route passed a typed-digest wrapper to a recovery helper expecting its
+32-byte digest. This is fixed by passing the wrapper's bytes without changing
+the EIP-712 operation. The missing gateway `crypto` dependency is now reflected
+in `Cargo.lock`. A finalized-state chain helper was connected to its member
+lookup, and strict Clippy findings were addressed.
+
+Verification after these changes: Rust workspace tests pass (69 passed, one
+live-Cluster test ignored); Hardhat passes 39 tests (32 Solidity, 7 TypeScript);
+formatting, strict Clippy, and `git diff --check` pass. PostgreSQL-backed tests
+were also run with the URL from the ignored local `.env`, but the database
+connection timed out. Compose resolved `.env` when passed explicitly, then
+reported that the Docker Desktop Engine named pipe is absent. Manual action:
+start Docker Desktop with its Linux Engine, then run
+`docker compose --env-file .env -f infra/compose.yaml up -d` and rerun
+PostgreSQL/Cluster integration checks. No credential edits are currently
+needed. The IPFS/PostgreSQL Compose project does not provision Besu; the
+separate `infra/besu-qbft/compose.yaml` provides the local QBFT network. Full
+gateway startup also requires deployed contract addresses in `.env`. The live
+two-peer Cluster test remains unverified as documented above.
 Phase 3 functionality has component and PostgreSQL integration coverage, but
 live two-peer replication and the full storage/indexer application workflow
 are **not verified**. Do not treat this as overall MVP acceptance.
@@ -181,14 +221,102 @@ cargo test --workspace --locked
 cargo clippy --workspace --all-targets --locked -- -D warnings
 ```
 
-The full Rust workspace passed with 67 tests and one ignored live-Cluster test;
+The full Rust workspace previously passed with 67 tests and one ignored live-Cluster test;
 strict Clippy with warnings denied, formatting, and `git diff --check` also
 passed. Gateway tests cover typed-data signature recovery and domain binding,
 request JSON shape, challenge replay rejection, session token hashing,
 transactional audit-chain integrity, and shared rate-limit buckets. The
 focused run also verified the new PostgreSQL migration and finalized-state
 member lookup. The live two-peer IPFS test remains ignored pending a verified
-Cluster quorum. The Hardhat suite passed 37 tests (30 Solidity, 7 TypeScript),
+Cluster quorum. The Hardhat suite previously passed 37 tests (30 Solidity, 7 TypeScript),
 including a shared Rust/`viem` login-challenge digest vector. PostgreSQL
 integration tests applied additive migrations; rollback-only feature tests do
 not reset or delete persistent database data.
+
+## Verification follow-up (12 November 2026)
+
+The local Docker stack is now running. Compose recreated Kubo, Kubo 2, and
+PostgreSQL without removing named volumes; all five services reported healthy.
+Both Kubo daemons report version `0.43.1`. Authenticated Cluster peer listing
+shows two distinct peers seeing one another. The documented replication
+verifier added one non-sensitive test object and waited for its two-peer pin:
+Cluster 1 reported `PINNED`, while Cluster 2 ended in `PIN_ERROR: context
+canceled`. Two-replica storage is still **not verified**. The failed object is
+left pinned as the verifier documents; no content or volume was deleted.
+
+The current Compose configuration includes loopback bindings for Kubo APIs on
+`127.0.0.1:15001` and `127.0.0.1:15002`. Docker reports those bindings in the
+container configuration, but requests from this coding environment to those
+host ports are refused. PostgreSQL tests similarly cannot connect from this
+shell after the containers were recreated. This is a host-to-Docker transport
+limitation under investigation; service health inside Docker does not establish
+host application connectivity.
+
+The previous `rrfs_dev` database has SQLx migration versions 1–3 recorded.
+Its version 3 checksum differs from the checked-in immutable migration file.
+After rebuilding the stale metadata-store artifact, the test correctly
+reported `VersionMismatch(3)`. We have not altered the database or its
+migration history. A dedicated empty database, `rrfs_indexer_test`, was
+created for safe integration verification, but this shell could not reach its
+published PostgreSQL port. Running the Rust test binary inside the PostgreSQL
+container was not viable because the host-built executable requires a newer
+glibc than that container provides. The attempted Rust test-runner image pull
+was stopped before completion.
+
+The infrastructure investigation is paused at this point rather than changing
+persistent data or migration checksums. Next actions when resumed: run tests
+from a Docker-networked Rust runner; inspect and reconcile the pre-existing
+`rrfs_dev` migration history through an additive, reviewed path; and diagnose
+Cluster 2's pin failure from its Kubo/Cluster logs and peer allocations. See
+[`docs/adr/local-integration-verification.md`](docs/adr/local-integration-verification.md)
+and [the local Cluster status](infra/ipfs-cluster/README.md).
+
+The separate Besu network setup is running. Its pinned image is Besu 26.11.0;
+the Compose definition has four validators plus a non-validator RPC node, with
+the RPC API bound to loopback. Genesis and validator keys are generated locally
+by the preparation script and are ignored by Git. Validators are producing
+blocks and the RPC node has four peers. The RPC endpoint is published only to
+host loopback. Verification confirmed chain ID 1337, four connected validator
+peers, four configured validators, and QBFT-committed block 969. Docker's
+generic `finalized` tag does not apply to this QBFT chain; the chain adapter
+uses the latest committed QBFT head and contract reads use its explicit block
+number. The initial Docker `internal: true` setting also prevented port
+publication and has been removed while leaving validator ports unpublished.
+See
+[`infra/besu-qbft/README.md`](infra/besu-qbft/README.md) and
+[`docs/adr/local-besu-qbft-network.md`](docs/adr/local-besu-qbft-network.md).
+
+The Rust workspace all-target tests pass after the QBFT finality correction.
+Database tests skip unless `DATABASE_URL` is explicitly configured; it was
+unset in this run. The live Kubo replication test remains ignored because the
+earlier two-peer verification reported a Cluster pin error. Contract
+deployment and gateway end-to-end verification remain outstanding.
+
+Phase 5 CLI work has started with a credential-free `rrds health [gateway-url]`
+command that checks the existing `/healthz` route. Its two configuration tests
+pass offline. This checks only the HTTP health route, not dependencies such as
+PostgreSQL, Besu, or IPFS. The specification's remaining CLI use cases
+(identity registration/display, listings, upload, download, modify, history,
+sharing, revocation, and recovery) are not available end-to-end: the gateway
+currently lacks those routes and the `application` crate has no use-case
+services. See [the CLI README](apps/cli/README.md) and
+[the Phase 5 CLI ADR](docs/adr/phase-5-cli-incremental-scope.md).
+
+**Integration verification update (12 November 2026):** the workspace test
+suite passes offline when allowed to open the local TCP listeners required by
+chain-adapter tests. The live Cluster check still fails replication: Kubo 2
+sees the CID in its Bitswap wantlist but has zero Bitswap partners, and a
+provider lookup finds none, while Kubo and Cluster membership are connected.
+The cause remains under investigation. PostgreSQL contains the isolated
+`rrfs_indexer_test` database, but the current shell cannot reach the published
+port; `rrfs_dev` and persistent volumes were left unchanged. The indexer README
+now correctly describes the QBFT committed head rather than Besu's generic
+`finalized` tag. See [`progress_report.md`](progress_report.md) and
+[`docs/adr/local-integration-verification.md`](docs/adr/local-integration-verification.md).
+
+**Replication verification update (12 November 2026):** the two-peer Cluster
+check now passes after configuring Kubo 0.43.1 with a private LAN DHT and its
+legacy provider for custom DHT routing. Both Cluster peers report the test CID
+`PINNED` with zero attempts, and Kubo 2 retrieves it from Kubo 1. The nodes
+remain on one host and do not demonstrate independent replica administration.
+PostgreSQL integration and host-side port checks remain open.

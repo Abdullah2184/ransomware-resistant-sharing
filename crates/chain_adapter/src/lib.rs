@@ -1,4 +1,4 @@
-//! Besu JSON-RPC client for finalized event indexing.
+//! Besu JSON-RPC client for QBFT-committed event indexing.
 
 use std::{
     error::Error,
@@ -92,9 +92,18 @@ pub struct FileHeadState {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MemberIdentityState {
+    pub organization_id: [u8; 32],
     pub signing_address: EvmAddress,
+    pub signing_key_version: u32,
     pub encryption_key_version: u32,
-    pub active: bool,
+    pub encryption_public_key: [u8; 32],
+    pub status: u64,
+}
+
+impl MemberIdentityState {
+    pub const fn active(&self) -> bool {
+        self.status == 1
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -109,8 +118,8 @@ pub struct EnvelopeSetState {
     pub revision: u32,
 }
 
-/// JSON-RPC client that never falls back from the node's `finalized` tag to a
-/// guessed confirmation count.
+/// JSON-RPC client for QBFT, where the latest committed head is final. This
+/// deliberately does not use the proof-of-stake `finalized` block tag.
 pub struct BesuClient {
     client: Client,
     endpoint: Url,
@@ -150,7 +159,7 @@ impl BesuClient {
 
     pub async fn finalized_block(&self) -> Result<FinalizedBlock, ChainError> {
         let header: Option<BlockHeader> = self
-            .rpc("eth_getBlockByNumber", json!(["finalized", false]))
+            .rpc("eth_getBlockByNumber", json!(["latest", false]))
             .await?;
         let header = header.ok_or(ChainError::InvalidResponse)?;
         let number = parse_quantity(&header.number)?;
@@ -221,7 +230,7 @@ impl BesuClient {
         Ok(logs)
     }
 
-    /// Reads the authoritative file head from the RPC node's finalized state.
+    /// Reads the authoritative file head from the QBFT-committed head state.
     pub async fn file_head(
         &self,
         file_registry: &EvmAddress,
@@ -237,7 +246,7 @@ impl BesuClient {
                 json!([{
                     "to": format_address(file_registry),
                     "data": format!("0x{}", encode_hex(&call_data)),
-                }, "finalized"]),
+                }, "latest"]),
             )
             .await?;
         let bytes = decode_hex(&result)?;
@@ -315,7 +324,7 @@ impl BesuClient {
         }))
     }
 
-    /// Returns the active member's signing address from finalized contract state.
+    /// Returns the active member's signing address from QBFT-committed state.
     ///
     /// Inactive or unregistered identities return `None`; malformed contract
     /// responses fail closed.
@@ -324,20 +333,9 @@ impl BesuClient {
         access_governance: &EvmAddress,
         member_id: &[u8; 32],
     ) -> Result<Option<EvmAddress>, ChainError> {
-        let selector = Keccak256::digest(b"memberIdentity(bytes32)");
-        let mut call_data = Vec::with_capacity(36);
-        call_data.extend_from_slice(&selector[..4]);
-        call_data.extend_from_slice(member_id);
-        let result: String = self
-            .rpc(
-                "eth_call",
-                json!([{
-                    "to": format_address(access_governance),
-                    "data": format!("0x{}", encode_hex(&call_data)),
-                }, "finalized"]),
-            )
+        let words = self
+            .eth_call(access_governance, "memberIdentity(bytes32)", member_id)
             .await?;
-        let words = decode_hex(&result)?;
         if words.len() != 6 * 32 {
             return Err(ChainError::InvalidResponse);
         }
@@ -414,10 +412,17 @@ impl BesuClient {
         {
             return Err(ChainError::InvalidResponse);
         }
+        let mut organization_id = [0; 32];
+        organization_id.copy_from_slice(organization);
+        let mut encryption_public_key = [0; 32];
+        encryption_public_key.copy_from_slice(encryption_key);
         Ok(Some(MemberIdentityState {
+            organization_id,
             signing_address: EvmAddress::from_bytes(signer),
+            signing_key_version,
             encryption_key_version,
-            active: status == 1,
+            encryption_public_key,
+            status,
         }))
     }
 
@@ -433,6 +438,36 @@ impl BesuClient {
         call_data.extend_from_slice(&selector[..4]);
         call_data.extend_from_slice(member_id);
         call_data.extend_from_slice(file_id);
+        let result: String = self
+            .rpc(
+                "eth_call",
+                json!([{
+                    "to": format_address(access_governance),
+                    "data": format!("0x{}", encode_hex(&call_data)),
+                }, quantity(block_number)]),
+            )
+            .await?;
+        let result = decode_hex(&result)?;
+        if result.len() != 32 || result[..31].iter().any(|byte| *byte != 0) || result[31] > 1 {
+            return Err(ChainError::InvalidResponse);
+        }
+        Ok(result[31] == 1)
+    }
+
+    pub async fn has_historical_read_access(
+        &self,
+        access_governance: &EvmAddress,
+        member_id: &[u8; 32],
+        file_id: &[u8; 32],
+        version_number: u64,
+        block_number: u64,
+    ) -> Result<bool, ChainError> {
+        let selector = Keccak256::digest(b"hasHistoricalReadAccess(bytes32,bytes32,uint64)");
+        let mut call_data = Vec::with_capacity(100);
+        call_data.extend_from_slice(&selector[..4]);
+        call_data.extend_from_slice(member_id);
+        call_data.extend_from_slice(file_id);
+        call_data.extend_from_slice(&abi_word_u64(version_number));
         let result: String = self
             .rpc(
                 "eth_call",
@@ -480,7 +515,9 @@ impl BesuClient {
         if tuple_offset < 32 || tuple_offset % 32 != 0 {
             return Err(ChainError::InvalidResponse);
         }
-        let tuple_end = tuple_offset.checked_add(9 * 32).ok_or(ChainError::InvalidResponse)?;
+        let tuple_end = tuple_offset
+            .checked_add(9 * 32)
+            .ok_or(ChainError::InvalidResponse)?;
         if encoded.get(tuple_offset..tuple_end).is_none() {
             return Err(ChainError::InvalidResponse);
         }
@@ -491,8 +528,8 @@ impl BesuClient {
         let content_offset = usize::try_from(read_word_u64(&encoded, tuple_offset + 3 * 32)?)
             .map_err(|_| ChainError::InvalidResponse)?;
         let content_cid = decode_abi_string(&encoded, tuple_offset, content_offset)?;
-        let cid = domain::ContentCid::parse(&content_cid)
-            .map_err(|_| ChainError::InvalidResponse)?;
+        let cid =
+            domain::ContentCid::parse(&content_cid).map_err(|_| ChainError::InvalidResponse)?;
         Ok(Some(FileVersionState {
             content_cid: cid.to_string(),
         }))
@@ -537,8 +574,7 @@ impl BesuClient {
             return Err(ChainError::InvalidResponse);
         }
         let cid = decode_abi_string(&encoded, 0, offset)?;
-        let cid = domain::EnvelopeSetCid::parse(&cid)
-            .map_err(|_| ChainError::InvalidResponse)?;
+        let cid = domain::EnvelopeSetCid::parse(&cid).map_err(|_| ChainError::InvalidResponse)?;
         Ok(Some(EnvelopeSetState {
             cid: cid.to_string(),
             epoch_id,
@@ -562,7 +598,7 @@ impl BesuClient {
                 json!([{
                     "to": format_address(contract),
                     "data": format!("0x{}", encode_hex(&call_data)),
-                }, "finalized"]),
+                }, "latest"]),
             )
             .await?;
         decode_hex(&result)
@@ -644,16 +680,20 @@ fn abi_word_u64(value: u64) -> [u8; 32] {
     word
 }
 
-fn decode_abi_string(encoded: &[u8], tuple_start: usize, offset: usize) -> Result<String, ChainError> {
-    if offset % 32 != 0 {
+fn decode_abi_string(
+    encoded: &[u8],
+    tuple_start: usize,
+    offset: usize,
+) -> Result<String, ChainError> {
+    if !offset.is_multiple_of(32) {
         return Err(ChainError::InvalidResponse);
     }
     let start = tuple_start
         .checked_add(offset)
         .ok_or(ChainError::InvalidResponse)?;
     let length_end = start.checked_add(32).ok_or(ChainError::InvalidResponse)?;
-    let length = usize::try_from(read_word_u64(encoded, start)?)
-        .map_err(|_| ChainError::InvalidResponse)?;
+    let length =
+        usize::try_from(read_word_u64(encoded, start)?).map_err(|_| ChainError::InvalidResponse)?;
     if length == 0 || length > 256 {
         return Err(ChainError::InvalidResponse);
     }
@@ -786,7 +826,47 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn queries_file_head_at_finalized_state() {
+    async fn queries_latest_qbft_committed_block_as_finalized_head() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = vec![0; 4096];
+            let read = stream.read(&mut request).await.unwrap();
+            let request_text = String::from_utf8_lossy(&request[..read]);
+            assert!(request_text.contains("eth_getBlockByNumber"));
+            assert!(request_text.contains("\"latest\""));
+
+            let body = json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {
+                    "number": "0x2a",
+                    "hash": format!("0x{}", "ab".repeat(32))
+                }
+            })
+            .to_string();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+        });
+
+        let client = BesuClient::new(&format!("http://{address}")).unwrap();
+        assert_eq!(
+            client.finalized_block().await.unwrap(),
+            FinalizedBlock {
+                number: 42,
+                hash: format!("0x{}", "ab".repeat(32)),
+            }
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn queries_file_head_at_qbft_committed_state() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
@@ -795,7 +875,7 @@ mod tests {
             let read = stream.read(&mut request).await.unwrap();
             let request_text = String::from_utf8_lossy(&request[..read]);
             assert!(request_text.contains("\"eth_call\""));
-            assert!(request_text.contains("\"finalized\""));
+            assert!(request_text.contains("\"latest\""));
 
             let mut output = String::new();
             output.push_str(&format!("{:064x}", 32));
@@ -838,7 +918,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn queries_active_member_signer_at_finalized_state() {
+    async fn queries_active_member_signer_at_qbft_committed_state() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
@@ -847,7 +927,7 @@ mod tests {
             let read = stream.read(&mut request).await.unwrap();
             let request_text = String::from_utf8_lossy(&request[..read]);
             assert!(request_text.contains("\"eth_call\""));
-            assert!(request_text.contains("\"finalized\""));
+            assert!(request_text.contains("\"latest\""));
 
             let mut output = String::new();
             output.push_str(&"00".repeat(32));
@@ -877,6 +957,99 @@ mod tests {
                 .await
                 .unwrap(),
             Some(EvmAddress::from_bytes([0x11; 20]))
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn queries_public_member_identity_at_the_requested_block() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = vec![0; 4096];
+            let read = stream.read(&mut request).await.unwrap();
+            let request_text = String::from_utf8_lossy(&request[..read]);
+            assert!(request_text.contains("\"eth_call\""));
+            assert!(request_text.contains("\"0x7\""));
+
+            let mut output = String::new();
+            output.push_str(&"11".repeat(32));
+            output.push_str(&format!("{}{}", "00".repeat(12), "22".repeat(20)));
+            output.push_str(&format!("{:064x}", 3));
+            output.push_str(&format!("{:064x}", 4));
+            output.push_str(&"33".repeat(32));
+            output.push_str(&format!("{:064x}", 2));
+            let body = json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": format!("0x{output}")
+            })
+            .to_string();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+        });
+
+        let client = BesuClient::new(&format!("http://{address}")).unwrap();
+        assert_eq!(
+            client
+                .member_identity(&EvmAddress::from_bytes([0x44; 20]), &[0x55; 32], 7)
+                .await
+                .unwrap(),
+            Some(MemberIdentityState {
+                organization_id: [0x11; 32],
+                signing_address: EvmAddress::from_bytes([0x22; 20]),
+                signing_key_version: 3,
+                encryption_key_version: 4,
+                encryption_public_key: [0x33; 32],
+                status: 2,
+            })
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn queries_version_scoped_historical_read_at_requested_block() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = vec![0; 4096];
+            let read = stream.read(&mut request).await.unwrap();
+            let request_text = String::from_utf8_lossy(&request[..read]);
+            assert!(request_text.contains("\"eth_call\""));
+            assert!(request_text.contains("\"0x7\""));
+
+            let body = json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": format!("0x{:064x}", 1)
+            })
+            .to_string();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+        });
+
+        let client = BesuClient::new(&format!("http://{address}")).unwrap();
+        assert!(
+            client
+                .has_historical_read_access(
+                    &EvmAddress::from_bytes([0x33; 20]),
+                    &[0x44; 32],
+                    &[0x55; 32],
+                    2,
+                    7,
+                )
+                .await
+                .unwrap()
         );
         server.await.unwrap();
     }
