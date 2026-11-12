@@ -3,20 +3,20 @@
 **Reviewed:** 12 November 2026  
 **Canonical guide:** [`TECHNICAL_SPECIFICATION.md`](TECHNICAL_SPECIFICATION.md)  
 **Branch:** `agent/development`  
-**Repository state:** the worktree contains uncommitted changes from prior
-implementation increments. This report describes that working tree; preserve
-those changes and do not reset or clean it as a troubleshooting step.
+**Implementation snapshot:** commit `8d40896` (`Continue implementation and verify local infrastructure`)
+**Repository state:** implementation and documentation changes are committed on
+`agent/development`; this report records the latest verification state.
 
 ## Current assessment
 
 The project has substantial foundations but is not an end-to-end MVP. Crypto
 primitives and formats, core contracts and local contract tests, a Kubo/Cluster
 adapter, an event indexer, and the gateway authentication/access-read paths
-exist. The application use-case crate is empty, the scanner is a stub, the CLI
-only checks gateway health, and state-changing application operations are not
-relayed. Storage replication and PostgreSQL-backed integration remain
-unverified. The specification's acceptance criteria in §15.4 have not been
-met.
+exist. The application use-case crate is still a stub, the scanner is a stub,
+the CLI only checks gateway health, and state-changing application operations
+are not relayed. Local two-peer storage replication is verified, while
+PostgreSQL-backed integration remains unverified. The specification's
+acceptance criteria in §15.4 have not been met.
 
 ## Phase status
 
@@ -49,17 +49,12 @@ met.
   routing, Kubo 2 discovered Kubo 1 as provider and retrieved the payload. The
   full verifier reports `PINNED` on both Cluster peers with zero attempts. The
   local two-node setup still shares a single host and failure domain.
-- PostgreSQL contains `rrfs_dev` and `rrfs_indexer_test`. Host-side port access
-  and live DB integration remain unverified; neither database was modified.
-  Compose declares loopback ports 5432/15001/15002 and `up -d` left all named
-  volumes in place, but the coding shell still cannot connect to Kubo on
-  15001; PostgreSQL's running container has no active network port allocation.
-- Current read-only Docker diagnostics confirm both Kubo and Cluster peer
-  connectivity, but the test CID is pinned only on Kubo 1. Kubo 2 reports no
-  local pin, its direct `ipfs cat` did not complete, and its log records the
-  failed pin as `context canceled`. The root cause is not yet established.
-  PostgreSQL has `rrfs_dev` and the isolated `rrfs_indexer_test` databases; no
-  database or persistent content was modified during this check.
+- PostgreSQL contains `rrfs_dev` and `rrfs_indexer_test`. Neither database was
+  modified. Host-side Kubo and PostgreSQL access and live DB integration remain
+  unverified: Compose declares loopback ports 5432/15001/15002, but Kubo's
+  `127.0.0.1:15001` endpoint refused connections from this coding shell and the
+  running PostgreSQL container had no active network port allocation. Applying
+  `docker compose up -d` did not remove or recreate named volumes.
 - The gateway currently exposes `/healthz`, public contract-backed identity,
   challenge/session, signed access lookup, and encrypted content streaming.
   Authorization and audit happen before releasing protected references or
@@ -107,9 +102,8 @@ environment access. Do not invent them or place secrets in tracked files:
 - Configure the deployed `CONTRACT_FILE_REGISTRY_ADDRESS` and
   `CONTRACT_ACCESS_GOVERNANCE_ADDRESS` in the ignored local environment after
   deployment.
-- Provide a `DATABASE_URL` for a fresh, isolated integration database. Do not
-  use `rrfs_dev` for new migration verification until its recorded migration
-  3 checksum/schema discrepancy has been reviewed.
+- Do not use `rrfs_dev` for new migration verification until its recorded
+  migration 3 checksum/schema discrepancy has been reviewed.
 - Decide the production HSM topology/provider, member onboarding authority,
   organization Safe thresholds, independent replica policy, retention/orphan
   cleanup policy, and emergency recovery policy before production work.
