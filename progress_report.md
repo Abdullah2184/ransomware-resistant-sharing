@@ -7,16 +7,6 @@
 **Repository state:** implementation and documentation changes are committed on
 `agent/development`; this report records the latest verification state.
 
-## GitHub synchronization
-
-The two commits `8d40896` and `a356374` are local on `agent/development`; the
-configured `origin` remote still points to `532a0a1`. The push attempt could not
-authenticate because this environment's configured VS Code askpass executable
-and IPC socket are missing. No GitHub CLI or SSH agent is available here. The
-commit author matches the maintainer identity `Abdullah2184
-<abdullahbiswasm@gmail.com>`. Retry the push after GitHub authentication is
-restored in the host's credential manager or VS Code integration.
-
 ## Current assessment
 
 The project has substantial foundations but is not an end-to-end MVP. Crypto
@@ -31,7 +21,7 @@ acceptance criteria in §15.4 have not been met.
 ## Phase status
 
 | Specification phase | Status | Remaining work |
-|---|---|---|
+|       ---           |   ---  |     ---        |
 | 0 — repository and decisions | Mostly established | Add/confirm CI and reconcile implementation documentation. Complete open operational decisions before production deployment. |
 | 1 — domain and cryptography | Substantial foundation | Add published/cross-implementation HPKE vectors and connect primitives to client/application workflows. |
 | 2 — contracts | Local contract implementation and tests exist | Deploy to Besu, provide approved Safe configuration, activate `FILE_REGISTRY_ROLE` through the timelock, and verify the deployed contracts. |
