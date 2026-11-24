@@ -8,3 +8,4 @@
 6. Why is the code for services like gateway and indexer in their own folder but also some of the functionality they execute are in the files in the crates folder?
 7. README.md should be rewritten to only include the project overview and architecture (based on the TECHNICAL_SPECIFICATIONS.md and the adr docs). A category for current progress and existing limitations will be included at the bottom and rewritten anytime significant changes are made. Progress notes will be shifted to the progress_report.md and should be dated. 
 8. Flag instances where inter-dependency or duplication occurs so that system comptability is ensured in any future development.
+9. In decisions folder, grounded justification for why certain languages, encryption standards and design, tech stacks, etc were used should be provided, along with a brief note on limitations. TECHNICAL_SPECIFICATIONS.md can be used as a reference for this.
