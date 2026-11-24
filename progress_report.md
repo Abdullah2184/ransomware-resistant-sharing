@@ -134,9 +134,3 @@ a reproducible local MVP is **6–10 weeks**, assuming timely Safe/address and
 database setup and no new protocol changes. Production HSM integration,
 independently operated consortium infrastructure, and production security
 review are outside that estimate.
-
-# Manual review notes:
-
-Ask agent to clearly outline what historical access means in this implementation.
-Also, ask it to clearly outline which folder goes where (i.e. on which server/endpoint) in the overall design of the system.
-Ask agent to pay attention to the designed tests to verify that they are well-designed and that the correct functionality is being tested.
