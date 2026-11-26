@@ -1,6 +1,9 @@
-//! Ports that isolate application workflows from key-custody infrastructure.
+//! Ports that isolate application workflows from infrastructure adapters.
 
 pub mod blob_store;
+pub mod clock;
+pub mod ledger;
+pub mod scanner;
 
 use std::{fmt, future::Future, pin::Pin};
 
@@ -10,7 +13,17 @@ use zeroize::Zeroizing;
 
 pub use blob_store::{
     BlobStore, ContentChunk, ContentPackage, ReplicationReceipt, StorageCid, StorageError,
-    StorageFuture, StorageReader, StoredContent, StoredEnvelopeSet,
+    StorageFuture, StorageReader, StoredContent, StoredEnvelopeSet, decode_content_package_frame,
+    encode_content_package_frame,
+};
+pub use clock::{Clock, SystemClock};
+pub use ledger::{
+    AuthenticatedSession, GatewayAuthPort, HeadState, LedgerPort, PortFuture,
+    SignedAccessLookupRequest, SignedAppendVersionRequest, SignedCreateFileRequest,
+    SignedEnvelopeUpdateRequest,
+};
+pub use scanner::{
+    PreUploadScanner, ScanOutcome, ScanVerdict, ScannerError, ScannerMode, evaluate_scan_outcome,
 };
 
 /// Opaque identifier for one key held by a custody provider.

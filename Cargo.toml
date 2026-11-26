@@ -16,6 +16,8 @@ members = [
 
     "services/gateway",
     "services/indexer",
+
+    "tests",
 ]
 
 [workspace.package]

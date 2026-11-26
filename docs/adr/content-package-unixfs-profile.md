@@ -24,12 +24,15 @@ constructs the directory DAG while returning each child CID and the root CID.
 - The manifest is the canonical compact JSON from the existing v1 schema.
   Chunk file bytes must match its ordered chunk references and declared byte
   lengths. The adapter rejects mismatched indexes or lengths before upload.
-- Import with Kubo CIDv1, `sha2-256`, fixed-size `size-4194320` chunking
-  (the maximum 4 MiB ciphertext chunk including its 16-byte AEAD tag),
-  raw UnixFS leaves, `wrap-with-directory=true`, and no local pin. Do not
-  preserve filesystem mode or modification time. These options make package
-  names and content, not host filesystem metadata or upload order, determine
-  the root DAG.
+- Import with Kubo CIDv1, `sha2-256`, fixed-size `size-1048592` chunking
+  (the maximum 1 MiB plaintext chunk of `1,048,576` bytes plus its 16-byte AEAD
+  tag; amended from `size-4194320` on 26 November 2026 because Kubo `0.43.1`
+  enforces a hard chunker maximum of `2,096,896` bytes and rejects
+  `size-4194320` with HTTP 500), raw UnixFS leaves, `wrap-with-directory=true`,
+  and no local pin. Do not preserve filesystem mode or modification time. These
+  options make package names and content, not host filesystem metadata or
+  upload order, determine the root DAG, while keeping each encrypted chunk as a
+  single raw SHA-256 leaf block matching `raw_sha256_cid`.
 - Validate the canonical CID returned for each chunk against its manifest
   entry. Return the root directory CID as the file's `ContentCid`.
 - Envelope sets remain separate canonical JSON objects imported as single

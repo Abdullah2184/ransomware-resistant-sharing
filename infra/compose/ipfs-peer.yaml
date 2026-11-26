@@ -1,0 +1,64 @@
+name: rrfs-ipfs-peer
+
+services:
+  kubo:
+    image: ipfs/kubo:v0.43.1@sha256:b293923d66e490e70ced64df42ea7a6cf7eac2740e3fb29101df18070fa7be48
+    restart: unless-stopped
+    environment:
+      IPFS_PROFILE: server
+      LIBP2P_TCP_MUX: "false"
+    ports:
+      - "${KUBO_API_BIND_IP:-127.0.0.1}:5001:5001"
+      - "${KUBO_SWARM_BIND_IP:-0.0.0.0}:4001:4001"
+    volumes:
+      - ipfs_data:/data/ipfs
+      - ../ipfs-cluster/start-kubo.sh:/opt/rrfs/start-kubo.sh:ro
+    entrypoint: ["/bin/sh", "/opt/rrfs/start-kubo.sh"]
+    command: ["daemon", "--migrate=true", "--agent-version-suffix=docker"]
+    secrets:
+      - source: ipfs_swarm_key
+        target: swarm-key
+    healthcheck:
+      test: ["CMD-SHELL", "gosu ipfs ipfs --api /ip4/127.0.0.1/tcp/5001 id >/dev/null"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 20s
+
+  cluster:
+    image: ipfs/ipfs-cluster:v1.1.6@sha256:a83266c524f1c0bc81d14fe3c8b46c5b83a7b2d8432fb8a50300f27d3c863dcd
+    restart: unless-stopped
+    depends_on:
+      kubo:
+        condition: service_healthy
+    environment:
+      CLUSTER_CONSENSUS: crdt
+      CLUSTER_PEERNAME: ${CLUSTER_PEERNAME:-rrfs-cluster-org}
+      CLUSTER_IPFSHTTP_NODEMULTIADDRESS: /dns4/kubo/tcp/5001
+      CLUSTER_RESTAPI_HTTPLISTENMULTIADDRESS: /ip4/0.0.0.0/tcp/9094
+      CLUSTER_MONITORPINGINTERVAL: 5s
+    ports:
+      - "${CLUSTER_API_BIND_IP:-127.0.0.1}:9094:9094"
+      - "${CLUSTER_SWARM_BIND_IP:-0.0.0.0}:9096:9096"
+    volumes:
+      - cluster_data:/data/ipfs-cluster
+      - ../ipfs-cluster/start-cluster-peer.sh:/opt/rrfs/start-cluster-peer.sh:ro
+    entrypoint: ["/bin/sh", "/opt/rrfs/start-cluster-peer.sh"]
+    command: ["daemon"]
+    secrets:
+      - source: cluster_secret
+        target: cluster-secret
+      - source: cluster_api_password
+        target: cluster-api-password
+
+volumes:
+  ipfs_data:
+  cluster_data:
+
+secrets:
+  ipfs_swarm_key:
+    file: ${IPFS_SWARM_KEY_FILE:-../ipfs-cluster/secrets/swarm-key}
+  cluster_secret:
+    file: ${CLUSTER_SECRET_FILE:-../ipfs-cluster/secrets/cluster-secret}
+  cluster_api_password:
+    file: ${CLUSTER_API_PASSWORD_FILE:-../ipfs-cluster/secrets/cluster-api-password}

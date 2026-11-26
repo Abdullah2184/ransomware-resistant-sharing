@@ -6,6 +6,9 @@ if [ ! -r /run/secrets/swarm-key ]; then
     exit 1
 fi
 
+mkdir -p /data/ipfs
+chown -R ipfs /data/ipfs
+
 if [ ! -f /data/ipfs/config ]; then
     gosu ipfs ipfs init --profile server
     gosu ipfs ipfs config Addresses.API /ip4/0.0.0.0/tcp/5001
@@ -39,7 +42,7 @@ if [ -n "${KUBO_BOOTSTRAP_FROM:-}" ]; then
     attempt=0
     while [ "$attempt" -lt 30 ] && [ -z "$bootstrap_peer_id" ]; do
         bootstrap_peer_id=$(
-            ipfs --api "$bootstrap_api" id -f='<id>' 2>/dev/null || true
+            gosu ipfs ipfs --api "$bootstrap_api" id -f='<id>' 2>/dev/null || true
         )
         attempt=$((attempt + 1))
         if [ -z "$bootstrap_peer_id" ]; then

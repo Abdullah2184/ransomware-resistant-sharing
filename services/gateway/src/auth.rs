@@ -1,13 +1,10 @@
 use std::fmt;
 
-use domain::{EvmAddress, MemberId};
+use crypto::{ChainId, Eip712Domain, LoginChallengeDigestInput};
+use domain::{EvmAddress, MemberId, OperationNonce};
 use k256::ecdsa::{RecoveryId, Signature, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use sha3::{Digest, Keccak256};
-
-const DOMAIN_TYPE: &str =
-    "EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)";
-const LOGIN_CHALLENGE_TYPE: &str = "LoginChallenge(bytes32 memberId,bytes32 nonce,uint64 issuedAt,uint64 expiresAt,string audience,uint32 protocolVersion)";
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -63,33 +60,19 @@ pub fn challenge_digest(
     verifying_contract: EvmAddress,
 ) -> Result<[u8; 32], AuthInputError> {
     let member_id = parse_member_id(&challenge.member_id)?;
-    let nonce = parse_nonce(&challenge.nonce)?;
-
-    let domain_separator = struct_hash(
-        DOMAIN_TYPE,
-        &[
-            keccak(b"RRDS Gateway"),
-            keccak(b"1"),
-            uint_word_u64(chain_id),
-            address_word(verifying_contract),
-        ],
-    );
-    let challenge_hash = struct_hash(
-        LOGIN_CHALLENGE_TYPE,
-        &[
-            member_id.into_bytes(),
-            nonce,
-            uint_word_u64(challenge.issued_at),
-            uint_word_u64(challenge.expires_at),
-            keccak(challenge.audience.as_bytes()),
-            uint_word_u32(challenge.protocol_version),
-        ],
-    );
-    let mut encoded = Vec::with_capacity(66);
-    encoded.extend_from_slice(b"\x19\x01");
-    encoded.extend_from_slice(&domain_separator);
-    encoded.extend_from_slice(&challenge_hash);
-    Ok(keccak(&encoded))
+    let nonce = OperationNonce::from_bytes(parse_nonce(&challenge.nonce)?);
+    let input = LoginChallengeDigestInput::new(
+        member_id,
+        nonce,
+        challenge.issued_at,
+        challenge.expires_at,
+        challenge.audience.clone(),
+        challenge.protocol_version,
+    )
+    .map_err(|_| AuthInputError::Nonce)?;
+    let domain = Eip712Domain::gateway(ChainId::from_u64(chain_id), verifying_contract);
+    let digest = input.digest(&domain).map_err(|_| AuthInputError::Nonce)?;
+    Ok(*digest.as_bytes())
 }
 
 pub fn recover_signer(digest: &[u8; 32], signature: &str) -> Result<EvmAddress, AuthInputError> {
@@ -123,33 +106,6 @@ pub fn parse_fixed_hex<const N: usize>(value: &str) -> Option<[u8; N]> {
         *byte = u8::from_str_radix(&value[offset..offset + 2], 16).ok()?;
     }
     Some(output)
-}
-
-fn struct_hash(type_name: &str, fields: &[[u8; 32]]) -> [u8; 32] {
-    let mut encoded = Vec::with_capacity(32 * (fields.len() + 1));
-    encoded.extend_from_slice(&keccak(type_name.as_bytes()));
-    for field in fields {
-        encoded.extend_from_slice(field);
-    }
-    keccak(&encoded)
-}
-
-fn uint_word_u64(value: u64) -> [u8; 32] {
-    let mut word = [0; 32];
-    word[24..].copy_from_slice(&value.to_be_bytes());
-    word
-}
-
-fn uint_word_u32(value: u32) -> [u8; 32] {
-    let mut word = [0; 32];
-    word[28..].copy_from_slice(&value.to_be_bytes());
-    word
-}
-
-fn address_word(address: EvmAddress) -> [u8; 32] {
-    let mut word = [0; 32];
-    word[12..].copy_from_slice(address.as_bytes());
-    word
 }
 
 fn keccak(bytes: &[u8]) -> [u8; 32] {

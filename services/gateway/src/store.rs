@@ -2,11 +2,76 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
 use sha3::{Digest, Keccak256};
-use sqlx::{PgPool, Postgres, Transaction};
+use sqlx::{PgPool, Postgres, Row, Transaction};
 
 use crate::auth::LoginChallenge;
 
 const AUDIT_STREAM_LOCK: i64 = 0x5252_4653;
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectedFolder {
+    pub folder_id: String,
+    pub organization_id: String,
+    pub parent_folder_id: String,
+    pub display_name: String,
+    pub updated_block_number: u64,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectedFile {
+    pub file_id: String,
+    pub organization_id: String,
+    pub creator_member_id: String,
+    pub display_name: String,
+    pub parent_folder_id: String,
+    pub file_status: u64,
+    pub current_version: u64,
+    pub current_head_manifest_hash: String,
+    pub updated_block_number: u64,
+}
+
+#[derive(Clone, Debug)]
+pub struct FileListingResult {
+    pub indexed_block: Option<u64>,
+    pub indexed_block_hash: Option<String>,
+    pub folders: Vec<ProjectedFolder>,
+    pub files: Vec<ProjectedFile>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectedVersion {
+    pub version_number: u64,
+    pub manifest_hash: String,
+    pub parent_manifest_hash: String,
+    pub epoch_id: String,
+    pub author_member_id: String,
+    pub author_signing_address: String,
+    pub content_cid: String,
+    pub current_envelope_set_cid: String,
+    pub envelope_revision: u32,
+    pub historical_read_granted: bool,
+    pub transaction_hash: String,
+    pub block_number: u64,
+}
+
+#[derive(Clone, Debug)]
+pub struct VersionHistoryResult {
+    pub indexed_block: Option<u64>,
+    pub indexed_block_hash: Option<String>,
+    pub versions: Vec<ProjectedVersion>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AuditEventRecord {
+    pub sequence: i64,
+    pub record: serde_json::Value,
+    pub previous_hash: String,
+    pub record_hash: String,
+}
 
 #[derive(Clone)]
 pub struct GatewayStore {
@@ -357,19 +422,417 @@ impl GatewayStore {
         transaction.commit().await
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub async fn record_envelope_attempt(
+        &self,
+        member_id: Option<&str>,
+        source_id: &str,
+        file_id: &str,
+        version: u64,
+        chain_id: u64,
+        block_number: Option<u64>,
+        outcome: &'static str,
+        reason_code: Option<&'static str>,
+    ) -> Result<(), sqlx::Error> {
+        let mut transaction = self.pool.begin().await?;
+        append_audit(
+            &mut transaction,
+            AuditRecord {
+                occurred_at_unix_ms: unix_millis()?,
+                action: "file.envelope_retrieval",
+                actor_member_id: member_id,
+                source_id,
+                outcome,
+                reason_code,
+                operation_id: None,
+                resource_type: Some("file-version"),
+                resource_id: Some(file_id),
+                resource_version: Some(version),
+                chain_id,
+                block_number,
+            },
+        )
+        .await?;
+        transaction.commit().await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn record_write_attempt_in_transaction(
+        &self,
+        transaction: &mut Transaction<'_, Postgres>,
+        action: &'static str,
+        member_id: Option<&str>,
+        source_id: &str,
+        file_id: &str,
+        version: u64,
+        operation_id: Option<&str>,
+        chain_id: u64,
+        block_number: Option<u64>,
+        outcome: &'static str,
+        reason_code: Option<&'static str>,
+    ) -> Result<(), sqlx::Error> {
+        append_audit(
+            transaction,
+            AuditRecord {
+                occurred_at_unix_ms: unix_millis()?,
+                action,
+                actor_member_id: member_id,
+                source_id,
+                outcome,
+                reason_code,
+                operation_id,
+                resource_type: Some("file-version"),
+                resource_id: Some(file_id),
+                resource_version: Some(version),
+                chain_id,
+                block_number,
+            },
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn record_write_attempt(
+        &self,
+        action: &'static str,
+        member_id: Option<&str>,
+        source_id: &str,
+        file_id: &str,
+        version: u64,
+        operation_id: Option<&str>,
+        chain_id: u64,
+        block_number: Option<u64>,
+        outcome: &'static str,
+        reason_code: Option<&'static str>,
+    ) -> Result<(), sqlx::Error> {
+        let mut transaction = self.pool.begin().await?;
+        self.record_write_attempt_in_transaction(
+            &mut transaction,
+            action,
+            member_id,
+            source_id,
+            file_id,
+            version,
+            operation_id,
+            chain_id,
+            block_number,
+            outcome,
+            reason_code,
+        )
+        .await?;
+        transaction.commit().await
+    }
+
     pub async fn active_session_member(
         &self,
         token_hash: &[u8; 32],
     ) -> Result<Option<String>, sqlx::Error> {
         sqlx::query_scalar(
             "SELECT member_id FROM gateway_sessions \
-             WHERE token_hash = $1 AND expires_at > $2",
+             WHERE token_hash = $1 AND expires_at > $2 AND revoked_at IS NULL",
         )
         .bind(token_hash.as_slice())
         .bind(unix_seconds()? as i64)
         .fetch_optional(&self.pool)
         .await
     }
+
+    async fn revoke_session_in_transaction(
+        &self,
+        transaction: &mut Transaction<'_, Postgres>,
+        token_hash: &[u8; 32],
+        source_id: &str,
+        chain_id: u64,
+    ) -> Result<bool, sqlx::Error> {
+        let member_id = sqlx::query_scalar::<_, String>(
+            "UPDATE gateway_sessions \
+             SET revoked_at = clock_timestamp() \
+             WHERE token_hash = $1 AND revoked_at IS NULL AND expires_at > $2 \
+             RETURNING member_id",
+        )
+        .bind(token_hash.as_slice())
+        .bind(unix_seconds()? as i64)
+        .fetch_optional(&mut **transaction)
+        .await?;
+        let Some(member_id) = member_id else {
+            return Ok(false);
+        };
+        append_audit(
+            transaction,
+            AuditRecord {
+                occurred_at_unix_ms: unix_millis()?,
+                action: "auth.session.revoke",
+                actor_member_id: Some(member_id.trim()),
+                source_id,
+                outcome: "revoked",
+                reason_code: None,
+                operation_id: None,
+                resource_type: None,
+                resource_id: None,
+                resource_version: None,
+                chain_id,
+                block_number: None,
+            },
+        )
+        .await?;
+        Ok(true)
+    }
+
+    pub async fn revoke_session(
+        &self,
+        token_hash: &[u8; 32],
+        source_id: &str,
+        chain_id: u64,
+    ) -> Result<bool, sqlx::Error> {
+        let mut transaction = self.pool.begin().await?;
+        let revoked = self
+            .revoke_session_in_transaction(&mut transaction, token_hash, source_id, chain_id)
+            .await?;
+        if revoked {
+            transaction.commit().await?;
+        } else {
+            transaction.rollback().await?;
+        }
+        Ok(revoked)
+    }
+
+    pub async fn list_files_and_folders(
+        &self,
+        chain_id: u64,
+        member_id: &str,
+        organization_id: &str,
+        parent_folder_id: &str,
+    ) -> Result<FileListingResult, sqlx::Error> {
+        let checkpoint = read_indexer_checkpoint(&self.pool, chain_id).await?;
+        let folder_rows = sqlx::query(
+            "SELECT folder_id, organization_id, parent_folder_id, display_name, updated_block_number \
+             FROM folders_projection \
+             WHERE organization_id = $1 AND parent_folder_id = $2 \
+             ORDER BY display_name ASC, folder_id ASC",
+        )
+        .bind(organization_id)
+        .bind(parent_folder_id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut folders = Vec::with_capacity(folder_rows.len());
+        for row in folder_rows {
+            folders.push(ProjectedFolder {
+                folder_id: row.try_get::<String, _>("folder_id")?.trim().to_owned(),
+                organization_id: row
+                    .try_get::<String, _>("organization_id")?
+                    .trim()
+                    .to_owned(),
+                parent_folder_id: row
+                    .try_get::<String, _>("parent_folder_id")?
+                    .trim()
+                    .to_owned(),
+                display_name: row.try_get("display_name")?,
+                updated_block_number: u64::try_from(row.try_get::<i64, _>("updated_block_number")?)
+                    .unwrap_or_default(),
+            });
+        }
+
+        let file_rows = sqlx::query(
+            "SELECT f.file_id, f.organization_id, f.creator_member_id, f.display_name, \
+                    f.parent_folder_id, f.file_status, f.current_version, \
+                    f.current_head_manifest_hash, f.updated_block_number \
+             FROM files_projection f \
+             INNER JOIN access_projection a \
+                ON a.file_id = f.file_id AND a.member_id = $1 AND a.permission = 0 AND a.granted = TRUE \
+             WHERE f.organization_id = $2 AND f.parent_folder_id = $3 \
+               AND f.display_name IS NOT NULL AND f.current_version IS NOT NULL \
+               AND f.current_head_manifest_hash IS NOT NULL \
+             ORDER BY f.display_name ASC, f.file_id ASC",
+        )
+        .bind(member_id)
+        .bind(organization_id)
+        .bind(parent_folder_id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut files = Vec::with_capacity(file_rows.len());
+        for row in file_rows {
+            files.push(ProjectedFile {
+                file_id: row.try_get::<String, _>("file_id")?.trim().to_owned(),
+                organization_id: row
+                    .try_get::<String, _>("organization_id")?
+                    .trim()
+                    .to_owned(),
+                creator_member_id: row
+                    .try_get::<String, _>("creator_member_id")?
+                    .trim()
+                    .to_owned(),
+                display_name: row.try_get("display_name")?,
+                parent_folder_id: row
+                    .try_get::<String, _>("parent_folder_id")?
+                    .trim()
+                    .to_owned(),
+                file_status: u64::try_from(row.try_get::<i16, _>("file_status")?)
+                    .unwrap_or_default(),
+                current_version: u64::try_from(row.try_get::<i64, _>("current_version")?)
+                    .unwrap_or_default(),
+                current_head_manifest_hash: row
+                    .try_get::<String, _>("current_head_manifest_hash")?
+                    .trim()
+                    .to_owned(),
+                updated_block_number: u64::try_from(row.try_get::<i64, _>("updated_block_number")?)
+                    .unwrap_or_default(),
+            });
+        }
+
+        Ok(FileListingResult {
+            indexed_block: checkpoint.as_ref().map(|(block, _)| *block),
+            indexed_block_hash: checkpoint.map(|(_, hash)| hash),
+            folders,
+            files,
+        })
+    }
+
+    pub async fn list_file_versions(
+        &self,
+        chain_id: u64,
+        file_id: &str,
+        member_id: &str,
+    ) -> Result<VersionHistoryResult, sqlx::Error> {
+        let checkpoint = read_indexer_checkpoint(&self.pool, chain_id).await?;
+        let rows = sqlx::query(
+            "SELECT v.version_number, v.manifest_hash, v.parent_manifest_hash, v.epoch_id, \
+                    v.author_member_id, v.author_signing_address, v.content_cid, \
+                    COALESCE(e.envelope_set_cid, v.initial_envelope_set_cid) AS current_envelope_set_cid, \
+                    COALESCE(e.revision, 1) AS envelope_revision, \
+                    COALESCE(h.granted, FALSE) AS historical_read_granted, \
+                    v.transaction_hash, v.block_number \
+             FROM versions_projection v \
+             LEFT JOIN envelope_sets_projection e \
+                ON e.file_id = v.file_id AND e.version_number = v.version_number \
+             LEFT JOIN historical_read_access_projection h \
+                ON h.file_id = v.file_id AND h.version_number = v.version_number AND h.member_id = $2 \
+             WHERE v.file_id = $1 \
+             ORDER BY v.version_number ASC",
+        )
+        .bind(file_id)
+        .bind(member_id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut versions = Vec::with_capacity(rows.len());
+        for row in rows {
+            versions.push(ProjectedVersion {
+                version_number: u64::try_from(row.try_get::<i64, _>("version_number")?)
+                    .unwrap_or_default(),
+                manifest_hash: row.try_get::<String, _>("manifest_hash")?.trim().to_owned(),
+                parent_manifest_hash: row
+                    .try_get::<String, _>("parent_manifest_hash")?
+                    .trim()
+                    .to_owned(),
+                epoch_id: row.try_get::<String, _>("epoch_id")?.trim().to_owned(),
+                author_member_id: row
+                    .try_get::<String, _>("author_member_id")?
+                    .trim()
+                    .to_owned(),
+                author_signing_address: row
+                    .try_get::<String, _>("author_signing_address")?
+                    .trim()
+                    .to_owned(),
+                content_cid: row.try_get("content_cid")?,
+                current_envelope_set_cid: row.try_get("current_envelope_set_cid")?,
+                envelope_revision: u32::try_from(row.try_get::<i32, _>("envelope_revision")?)
+                    .unwrap_or(1),
+                historical_read_granted: row.try_get("historical_read_granted")?,
+                transaction_hash: row
+                    .try_get::<String, _>("transaction_hash")?
+                    .trim()
+                    .to_owned(),
+                block_number: u64::try_from(row.try_get::<i64, _>("block_number")?)
+                    .unwrap_or_default(),
+            });
+        }
+
+        Ok(VersionHistoryResult {
+            indexed_block: checkpoint.as_ref().map(|(block, _)| *block),
+            indexed_block_hash: checkpoint.map(|(_, hash)| hash),
+            versions,
+        })
+    }
+
+    pub async fn query_member_audit_events(
+        &self,
+        member_id: &str,
+        source_id: &str,
+        chain_id: u64,
+        block_number: u64,
+        action_filter: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<AuditEventRecord>, sqlx::Error> {
+        let mut transaction = self.pool.begin().await?;
+        append_audit(
+            &mut transaction,
+            AuditRecord {
+                occurred_at_unix_ms: unix_millis()?,
+                action: "audit.query",
+                actor_member_id: Some(member_id),
+                source_id,
+                outcome: "authorized",
+                reason_code: None,
+                operation_id: None,
+                resource_type: Some("audit-stream"),
+                resource_id: Some(member_id),
+                resource_version: None,
+                chain_id,
+                block_number: Some(block_number),
+            },
+        )
+        .await?;
+
+        let rows = sqlx::query(
+            "SELECT sequence, record, previous_hash, record_hash \
+             FROM gateway_audit_events \
+             WHERE record->>'actor_member_id' = $1 \
+               AND ($2::text IS NULL OR record->>'action' = $2) \
+             ORDER BY sequence DESC \
+             LIMIT $3",
+        )
+        .bind(member_id)
+        .bind(action_filter)
+        .bind(i64::from(limit))
+        .fetch_all(&mut *transaction)
+        .await?;
+        transaction.commit().await?;
+
+        let mut events = Vec::with_capacity(rows.len());
+        for row in rows {
+            let previous_hash: Vec<u8> = row.try_get("previous_hash")?;
+            let record_hash: Vec<u8> = row.try_get("record_hash")?;
+            events.push(AuditEventRecord {
+                sequence: row.try_get("sequence")?,
+                record: row.try_get("record")?,
+                previous_hash: encode_hex(&previous_hash),
+                record_hash: encode_hex(&record_hash),
+            });
+        }
+        Ok(events)
+    }
+}
+
+async fn read_indexer_checkpoint(
+    pool: &PgPool,
+    chain_id: u64,
+) -> Result<Option<(u64, String)>, sqlx::Error> {
+    let Ok(chain_id) = i64::try_from(chain_id) else {
+        return Ok(None);
+    };
+    let row =
+        sqlx::query("SELECT block_number, block_hash FROM indexer_checkpoints WHERE chain_id = $1")
+            .bind(chain_id)
+            .fetch_optional(pool)
+            .await?;
+    row.map(|row| {
+        let block_number = u64::try_from(row.try_get::<i64, _>("block_number")?).unwrap_or(0);
+        let block_hash = row.try_get::<String, _>("block_hash")?.trim().to_owned();
+        Ok((block_number, block_hash))
+    })
+    .transpose()
 }
 
 async fn take_rate_limit_token_in_transaction(
@@ -606,6 +1069,74 @@ mod tests {
                 assert_eq!(previous, &audit_rows[0].2);
             }
         }
+
+        let write_op_id = format!("0x{}", "ef".repeat(32));
+        store
+            .record_write_attempt_in_transaction(
+                &mut transaction,
+                "file.create",
+                Some(&challenge.member_id),
+                "test-source",
+                &format!("0x{}", "22".repeat(32)),
+                1,
+                Some(&write_op_id),
+                1337,
+                Some(42),
+                "committed",
+                None,
+            )
+            .await
+            .expect("persist write attempt audit record");
+        let write_row: (String, Vec<u8>, Vec<u8>) = sqlx::query_as(
+            "SELECT record_canonical, previous_hash, record_hash \
+             FROM gateway_audit_events WHERE record->>'operation_id' = $1",
+        )
+        .bind(&write_op_id)
+        .fetch_one(&mut *transaction)
+        .await
+        .expect("read write attempt audit record");
+        assert_eq!(write_row.1, audit_rows[1].2);
+        let mut write_hasher = Keccak256::new();
+        write_hasher.update(&write_row.1);
+        write_hasher.update(write_row.0.as_bytes());
+        assert_eq!(&write_hasher.finalize()[..], write_row.2);
+
+        assert!(
+            store
+                .revoke_session_in_transaction(&mut transaction, &token_hash, "test-source", 1337)
+                .await
+                .expect("revoke active session once")
+        );
+        assert!(
+            !store
+                .revoke_session_in_transaction(&mut transaction, &token_hash, "test-source", 1337)
+                .await
+                .expect("reject double session revocation")
+        );
+        let active_after_revoke: Option<String> = sqlx::query_scalar(
+            "SELECT member_id FROM gateway_sessions \
+             WHERE token_hash = $1 AND expires_at > $2 AND revoked_at IS NULL",
+        )
+        .bind(token_hash.as_slice())
+        .bind(unix_seconds().unwrap() as i64)
+        .fetch_optional(&mut *transaction)
+        .await
+        .expect("verify revoked session is inactive");
+        assert!(active_after_revoke.is_none());
+        let revoke_row: (String, Vec<u8>, Vec<u8>) = sqlx::query_as(
+            "SELECT record_canonical, previous_hash, record_hash \
+             FROM gateway_audit_events \
+             WHERE record->>'action' = 'auth.session.revoke' \
+             ORDER BY sequence DESC LIMIT 1",
+        )
+        .fetch_one(&mut *transaction)
+        .await
+        .expect("read revoke audit record");
+        assert_eq!(revoke_row.1, write_row.2);
+        let mut revoke_hasher = Keccak256::new();
+        revoke_hasher.update(&revoke_row.1);
+        revoke_hasher.update(revoke_row.0.as_bytes());
+        assert_eq!(&revoke_hasher.finalize()[..], revoke_row.2);
 
         let audit_sequence: i64 = sqlx::query_scalar(
             "SELECT sequence FROM gateway_audit_events \

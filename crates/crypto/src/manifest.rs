@@ -1,6 +1,8 @@
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use cid::Cid;
 use domain::{ContentCid, EpochId, FileId, ManifestHash, VersionNumber};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest as _, Sha256};
 
 use crate::{CryptoError, NoncePrefix};
 
@@ -9,7 +11,7 @@ const CIPHER: &str = "AES-256-GCM";
 const NONCE_SCHEME: &str = "prefix64-index32-v1";
 const GCM_TAG_BYTES: usize = 16;
 const NONCE_PREFIX_BYTES: usize = 8;
-const MAX_CHUNK_SIZE_BYTES: u32 = 4 * 1024 * 1024;
+const MAX_CHUNK_SIZE_BYTES: u32 = 1024 * 1024;
 
 /// A reference to one immutable ciphertext chunk in the encrypted package.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -146,6 +148,15 @@ impl EncryptedFileManifest {
         self.validate()?;
         serde_json::to_vec(&ManifestDto::from(self))
             .map_err(|_| CryptoError::ManifestEncodingFailed)
+    }
+
+    /// Computes the SHA-256 digest of the canonical manifest JSON bytes.
+    pub fn manifest_hash(&self) -> Result<ManifestHash, CryptoError> {
+        let canonical = self.canonical_bytes()?;
+        let digest = Sha256::digest(&canonical);
+        let mut bytes = [0; 32];
+        bytes.copy_from_slice(&digest);
+        Ok(ManifestHash::from_bytes(bytes))
     }
 
     pub fn parse_canonical(bytes: &[u8]) -> Result<Self, CryptoError> {
@@ -319,6 +330,16 @@ struct ChunkDto {
     cid: String,
     #[serde(rename = "ciphertextBytes")]
     ciphertext_bytes: u64,
+}
+
+/// Computes the canonical CIDv1 (`raw` codec `0x55`, `sha2-256` multihash `0x12`)
+/// for a single encrypted chunk or raw leaf block under the UnixFS package profile.
+pub fn raw_sha256_cid(bytes: &[u8]) -> Result<ContentCid, CryptoError> {
+    let digest = Sha256::digest(bytes);
+    let multihash = cid::multihash::Multihash::<64>::wrap(0x12, &digest)
+        .map_err(|_| CryptoError::ManifestEncodingFailed)?;
+    let cid = Cid::new_v1(0x55, multihash).to_string();
+    ContentCid::parse(&cid).map_err(|_| CryptoError::ManifestEncodingFailed)
 }
 
 fn parse_bytes32(value: &str) -> Result<[u8; 32], CryptoError> {

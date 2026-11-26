@@ -12,6 +12,72 @@ use ports::{
 use sha3::{Digest, Keccak256};
 use zeroize::Zeroizing;
 
+/// Startup policy governing whether test-only or exportable key providers are allowed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CustodyStartupPolicy {
+    /// Rejects unhealthy, test-only, or exportable-key providers (required in production).
+    Production,
+    /// Explicitly opts into a local development/test provider.
+    UnsafeDevelopment,
+}
+
+/// Reason why a configured key-custody provider failed startup validation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CustodyPolicyError {
+    Custody(CustodyError),
+    UnhealthyProvider,
+    MissingRequiredCapabilities,
+    TestProviderRejectedInProduction,
+    ExportableKeysRejectedInProduction,
+}
+
+impl fmt::Display for CustodyPolicyError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let message = match self {
+            Self::Custody(error) => return error.fmt(formatter),
+            Self::UnhealthyProvider => "key-custody provider reported unhealthy",
+            Self::MissingRequiredCapabilities => {
+                "key-custody provider lacks required secp256k1 signing or HPKE X25519 unwrap"
+            }
+            Self::TestProviderRejectedInProduction => {
+                "test-only key-custody provider is forbidden outside unsafe development mode"
+            }
+            Self::ExportableKeysRejectedInProduction => {
+                "exportable private keys are forbidden outside unsafe development mode"
+            }
+        };
+        formatter.write_str(message)
+    }
+}
+
+impl std::error::Error for CustodyPolicyError {}
+
+/// Validates that the configured key-custody provider satisfies startup policy.
+pub async fn verify_provider_policy(
+    provider: &dyn KeyCustodyProvider,
+    policy: CustodyStartupPolicy,
+) -> Result<CustodyHealth, CustodyPolicyError> {
+    let health = provider
+        .health_check()
+        .await
+        .map_err(CustodyPolicyError::Custody)?;
+    if !health.healthy {
+        return Err(CustodyPolicyError::UnhealthyProvider);
+    }
+    if !health.capabilities.secp256k1_signing || !health.capabilities.hpke_x25519_unwrap {
+        return Err(CustodyPolicyError::MissingRequiredCapabilities);
+    }
+    if policy == CustodyStartupPolicy::Production {
+        if health.capabilities.test_only {
+            return Err(CustodyPolicyError::TestProviderRejectedInProduction);
+        }
+        if !health.capabilities.private_keys_non_exportable {
+            return Err(CustodyPolicyError::ExportableKeysRejectedInProduction);
+        }
+    }
+    Ok(health)
+}
+
 /// Software-held ECDSA and HPKE keys for local development and tests only.
 ///
 /// The private keys reside in process memory and are not protected by an HSM.
@@ -38,6 +104,42 @@ impl DevelopmentKeyCustody {
         let encryption_key =
             HpkeRecipientKeyPair::generate().map_err(|_| CustodyError::KeyGenerationFailed)?;
         let signing_address = evm_address(signing_key.verifying_key());
+
+        let identity = PublicIdentityKeys {
+            member_id,
+            signing_key_id,
+            signing_key_version,
+            signing_address,
+            encryption_key_id,
+            encryption_key_version,
+            encryption_public_key: encryption_key.public_key().clone(),
+        };
+
+        Ok(Self {
+            identity,
+            signing_key,
+            encryption_key,
+        })
+    }
+
+    /// Builds a deterministic software development provider from explicit
+    /// 32-byte secrets. Rejected by [`CustodyStartupPolicy::Production`].
+    pub fn from_dev_secrets(
+        member_id: MemberId,
+        signing_key_version: KeyVersion,
+        encryption_key_version: KeyVersion,
+        signing_secret: [u8; 32],
+        encryption_seed: [u8; 32],
+    ) -> Result<Self, CustodyError> {
+        let signing_secret = Zeroizing::new(signing_secret);
+        let encryption_seed = Zeroizing::new(encryption_seed);
+        let signing_key = SigningKey::from_bytes(signing_secret.as_slice().into())
+            .map_err(|_| CustodyError::KeyGenerationFailed)?;
+        let encryption_key = HpkeRecipientKeyPair::derive_from_seed(&encryption_seed)
+            .map_err(|_| CustodyError::KeyGenerationFailed)?;
+        let signing_address = evm_address(signing_key.verifying_key());
+        let signing_key_id = KeyId::from_bytes(derive_dev_key_id(b"sign", member_id.as_bytes()));
+        let encryption_key_id = KeyId::from_bytes(derive_dev_key_id(b"enc", member_id.as_bytes()));
 
         let identity = PublicIdentityKeys {
             member_id,
@@ -159,6 +261,17 @@ fn evm_address(verifying_key: &VerifyingKey) -> EvmAddress {
     let mut address = [0; 20];
     address.copy_from_slice(&hash[12..]);
     EvmAddress::from_bytes(address)
+}
+
+fn derive_dev_key_id(domain: &[u8], member_id: &[u8; 32]) -> [u8; 32] {
+    let mut hasher = Keccak256::new();
+    hasher.update(b"rrds/dev-key-id/");
+    hasher.update(domain);
+    hasher.update(member_id);
+    let digest = hasher.finalize();
+    let mut id = [0u8; 32];
+    id.copy_from_slice(&digest);
+    id
 }
 
 #[cfg(test)]
@@ -303,5 +416,47 @@ mod tests {
 
     fn empty_envelope() -> KeyEnvelope {
         KeyEnvelope::from_parts(vec![0; 32], vec![0; 48]).unwrap()
+    }
+
+    #[tokio::test]
+    async fn production_policy_rejects_development_key_custody() {
+        let provider = provider();
+        assert_eq!(
+            verify_provider_policy(&provider, CustodyStartupPolicy::Production).await,
+            Err(CustodyPolicyError::TestProviderRejectedInProduction)
+        );
+        let health = verify_provider_policy(&provider, CustodyStartupPolicy::UnsafeDevelopment)
+            .await
+            .unwrap();
+        assert!(health.healthy);
+        assert!(health.capabilities.test_only);
+    }
+
+    #[tokio::test]
+    async fn deterministic_dev_secrets_match_and_remain_rejected_in_production() {
+        let a = DevelopmentKeyCustody::from_dev_secrets(
+            MemberId::from_bytes([7; 32]),
+            KeyVersion::new(1).unwrap(),
+            KeyVersion::new(2).unwrap(),
+            [0x11; 32],
+            [0x22; 32],
+        )
+        .unwrap();
+        let b = DevelopmentKeyCustody::from_dev_secrets(
+            MemberId::from_bytes([7; 32]),
+            KeyVersion::new(1).unwrap(),
+            KeyVersion::new(2).unwrap(),
+            [0x11; 32],
+            [0x22; 32],
+        )
+        .unwrap();
+        assert_eq!(
+            a.public_identity().await.unwrap(),
+            b.public_identity().await.unwrap()
+        );
+        assert_eq!(
+            verify_provider_policy(&a, CustodyStartupPolicy::Production).await,
+            Err(CustodyPolicyError::TestProviderRejectedInProduction)
+        );
     }
 }

@@ -1,0 +1,34 @@
+[package]
+name = "rrds-tests"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[[test]]
+name = "end_to_end_acceptance"
+path = "end_to_end/acceptance.rs"
+
+[[test]]
+name = "security_invariants"
+path = "security/invariants.rs"
+
+[[test]]
+name = "cross_component_integration"
+path = "integration/cross_component.rs"
+
+[dev-dependencies]
+application = { path = "../crates/application" }
+chain-adapter = { path = "../crates/chain_adapter" }
+crypto = { path = "../crates/crypto" }
+domain = { path = "../crates/domain" }
+key-custody = { path = "../crates/key_custody" }
+ports = { path = "../crates/ports" }
+scanner = { path = "../crates/scanner" }
+serde_json.workspace = true
+sha3.workspace = true
+tokio.workspace = true
+zeroize.workspace = true

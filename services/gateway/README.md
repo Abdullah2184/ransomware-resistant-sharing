@@ -10,9 +10,46 @@ endpoints:
   atomically consumes the stored challenge and creates a short-lived session.
 - `GET /v1/auth/session` validates a bearer session and returns only the
   authenticated member ID.
+- `DELETE /v1/auth/session` atomically revokes the bearer session
+  (`revoked_at`), appends an `auth.session.revoke` audit record, and returns
+  `204 No Content`.
 - `GET /v1/identities/{memberId}` returns contract-backed public identity and
   key status at a single finalized block; it is source-rate-limited and does
   not use the PostgreSQL identity projection.
+- `GET /v1/files` (optional `?folderId=...`) returns indexer-backed folder and
+  file listings for an active member's organization (`authoritative: false`)
+  with finalized and indexed block cursors.
+- `GET /v1/files/{fileId}/versions` checks authoritative Read ACL at one
+  committed block, then returns the authoritative head and projected version
+  history.
+- `POST /v1/files/{fileId}/versions/{version}/access` validates a signed
+  EIP-712 `AccessLookup`, checks finalized ACL and historical-read grants,
+  consumes the one-time nonce in PostgreSQL, audits, and returns CID references.
+- `GET /v1/files/{fileId}/versions/{version}/content` repeats finalized ACL
+  checks, audits, and streams the encrypted IPFS CAR (`Cache-Control: no-store`).
+- `GET /v1/files/{fileId}/versions/{version}/envelope` repeats finalized ACL
+  checks, fetches and validates the canonical `KeyEnvelopeSet` against the
+  on-chain pointer and recipient key version, audits, and returns JSON
+  (`Cache-Control: no-store`).
+- `POST /v1/blobs/content` validates a framed (`RRDSPKG1`) client-encrypted
+  content package (manifest + chunk CIDs), pins it to `MIN_PIN_REPLICAS` via
+  Cluster, and audits `blob.content_upload` (`201`). Bounded by
+  `GATEWAY_MAX_BLOB_UPLOAD_BYTES` (default 64 MiB).
+- `POST /v1/blobs/envelopes` validates a canonical `KeyEnvelopeSet` JSON
+  (max 512 KiB), pins it to `MIN_PIN_REPLICAS`, and audits
+  `blob.envelope_upload` (`201`).
+- `POST /v1/files` validates a signed EIP-712 `VersionAppend` for version 1,
+  verifies Cluster pin quorum on both `contentCid` and `envelopeSetCid`, relays
+  `FileRegistry.createFile`, and audits the outcome (`201` on commit).
+- `POST /v1/files/{fileId}/versions` checks authoritative Write ACL, head
+  continuity (`409 stale_head`), EIP-712 signature, and pin quorum before
+  relaying `FileRegistry.appendVersion` (`201` on commit).
+- `POST /v1/files/{fileId}/versions/{version}/envelopes` checks Read ACL,
+  envelope pointer continuity (`409 stale_head`), EIP-712 `EnvelopeSetUpdate`
+  signature, pin quorum, and canonical `KeyEnvelopeSet` at `revision + 1`
+  before relaying `AccessGovernance.updateEnvelopeSet` (`200` on commit).
+- `GET /v1/audit` returns an active member's own audit records after recording
+  the `audit.query` event itself.
 - `GET /healthz` is an unauthenticated process health response.
 
 Challenges and token-bucket rate limits are stored in PostgreSQL for sharing
@@ -54,27 +91,31 @@ directly to an untrusted network.
 
 ## Current limits
 
-The service has signed access-lookup and authorized ciphertext-stream routes,
-but does not provide file-listing/history or audit-query routes. The lookup checks
-finalized member, file Read ACL, head, version and envelope pointer state, then
-records the attempt before returning CIDs. The current head is authorized by
-the file Read ACL; historical versions additionally require an explicit
-version-scoped grant under the same configured Read ACL Safe policy. Revoking
-file Read invalidates old history grants, so a later file Read re-grant does
-not restore them. The decision is recorded in
-[`version-scoped-historical-read-access.md`](../../docs/adr/version-scoped-historical-read-access.md).
-The lookup returns CIDs after authorization and audit; neither lookup nor the
-stream route validates envelope contents or proves that the recipient has a
-usable envelope. Historical sharing and client-side download/decryption are
-not yet end-to-end workflows. The stream route returns an IPFS CAR response;
-its audit indicates authorization before streaming, not full client receipt.
+The service provides authentication, contract-backed identity lookup, signed
+access lookup, authorized ciphertext streaming, authorized canonical envelope
+retrieval with recipient-membership validation, indexer-backed file/folder
+listings and version history, self-audited member audit queries, and relayed
+file/version/envelope write routes (with pin-before-commit quorum enforcement
+and explicit commit/revert/timeout reporting). When no relayer signer is
+configured at startup, the gateway runs in read-only mode and returns `503` on
+write routes; software dev relayer keys require explicit
+`GATEWAY_ALLOW_UNSAFE_DEV_RELAYER=true` opt-in and are rejected under
+production policy. Multi-sig ACL/governance proposal execution remains handled
+through Safe/Timelock governance.
+The stream route returns an IPFS CAR response; its audit indicates
+authorization before streaming, not full client receipt.
 
-The current audit work covers challenge issuance, rate-limited auth calls,
-well-formed session attempts, and signed access-lookup attempts. Authentication
-JSON parsing errors are rate-limited and audited, but malformed HTTP requests
-rejected before routing are not. PostgreSQL role separation, audit read
-controls, session revocation, production TLS, and complete request/correlation
-IDs are also outstanding.
+The current audit work covers challenge issuance, session issuance/validation/
+revocation, rate-limited auth calls, signed access lookups, content/envelope
+retrieval, ciphertext blob staging, relayed writes, and audit queries. Every
+response includes an `X-Request-Id` correlation header and emits structured JSON
+operational logs (without tokens or raw IPs). Rate limiting enforces independent
+per-source, per-member (`GATEWAY_MEMBER_RATE_LIMIT_*`), and per-source
+invalid-signature (`GATEWAY_INVALID_SIG_LIMIT_*`) token buckets. Least-privilege
+PostgreSQL role separation grants are provided in
+[`infra/postgres/init-roles.sql`](../../infra/postgres/init-roles.sql).
+Production TLS termination and malformed pre-routing HTTP audit hooks remain
+operational deployment tasks.
 
 Verify the service with:
 

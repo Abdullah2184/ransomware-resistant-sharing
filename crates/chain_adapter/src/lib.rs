@@ -1,4 +1,7 @@
-//! Besu JSON-RPC client for QBFT-committed event indexing.
+//! Besu JSON-RPC client for QBFT-committed event indexing, contract queries,
+//! and Type-2 transaction relaying.
+
+pub mod relayer;
 
 use std::{
     error::Error,
@@ -8,6 +11,12 @@ use std::{
 };
 
 use domain::EvmAddress;
+pub use relayer::{
+    DevelopmentRelayerSigner, EnvelopeSetUpdateCall, RelayError, RelayOutcome, RelayerConfig,
+    RelayerSigner, RelayerStartupPolicy, TransactionRelayer, TxSignature, VersionAppendCall,
+    encode_append_version_calldata, encode_create_file_calldata, encode_eip1559_signed_tx,
+    encode_eip1559_unsigned_tx, encode_update_envelope_set_calldata,
+};
 use reqwest::{Client, Url};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
@@ -118,6 +127,25 @@ pub struct EnvelopeSetState {
     pub revision: u32,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EvmTransactionReceipt {
+    pub transaction_hash: [u8; 32],
+    pub block_number: u64,
+    pub block_hash: String,
+    pub status: bool,
+    pub gas_used: u64,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RpcTransactionReceipt {
+    transaction_hash: String,
+    block_number: String,
+    block_hash: String,
+    status: String,
+    gas_used: String,
+}
+
 /// JSON-RPC client for QBFT, where the latest committed head is final. This
 /// deliberately does not use the proof-of-stake `finalized` block tag.
 pub struct BesuClient {
@@ -159,7 +187,7 @@ impl BesuClient {
 
     pub async fn finalized_block(&self) -> Result<FinalizedBlock, ChainError> {
         let header: Option<BlockHeader> = self
-            .rpc("eth_getBlockByNumber", json!(["latest", false]))
+            .rpc_nullable("eth_getBlockByNumber", json!(["latest", false]))
             .await?;
         let header = header.ok_or(ChainError::InvalidResponse)?;
         let number = parse_quantity(&header.number)?;
@@ -173,7 +201,7 @@ impl BesuClient {
     pub async fn block_hash(&self, number: u64) -> Result<String, ChainError> {
         let tag = quantity(number);
         let header: Option<BlockHeader> = self
-            .rpc("eth_getBlockByNumber", json!([tag, false]))
+            .rpc_nullable("eth_getBlockByNumber", json!([tag, false]))
             .await?;
         let header = header.ok_or(ChainError::InvalidResponse)?;
         if parse_quantity(&header.number)? != number {
@@ -454,6 +482,34 @@ impl BesuClient {
         Ok(result[31] == 1)
     }
 
+    pub async fn has_write_access(
+        &self,
+        access_governance: &EvmAddress,
+        member_id: &[u8; 32],
+        file_id: &[u8; 32],
+        block_number: u64,
+    ) -> Result<bool, ChainError> {
+        let selector = Keccak256::digest(b"hasWriteAccess(bytes32,bytes32)");
+        let mut call_data = Vec::with_capacity(68);
+        call_data.extend_from_slice(&selector[..4]);
+        call_data.extend_from_slice(member_id);
+        call_data.extend_from_slice(file_id);
+        let result: String = self
+            .rpc(
+                "eth_call",
+                json!([{
+                    "to": format_address(access_governance),
+                    "data": format!("0x{}", encode_hex(&call_data)),
+                }, quantity(block_number)]),
+            )
+            .await?;
+        let result = decode_hex(&result)?;
+        if result.len() != 32 || result[..31].iter().any(|byte| *byte != 0) || result[31] > 1 {
+            return Err(ChainError::InvalidResponse);
+        }
+        Ok(result[31] == 1)
+    }
+
     pub async fn has_historical_read_access(
         &self,
         access_governance: &EvmAddress,
@@ -582,6 +638,85 @@ impl BesuClient {
         }))
     }
 
+    pub async fn pending_nonce(&self, address: &EvmAddress) -> Result<u64, ChainError> {
+        let quantity: String = self
+            .rpc(
+                "eth_getTransactionCount",
+                json!([format_address(address), "pending"]),
+            )
+            .await?;
+        parse_quantity(&quantity)
+    }
+
+    pub async fn estimate_gas(
+        &self,
+        from: &EvmAddress,
+        to: &EvmAddress,
+        data: &[u8],
+    ) -> Result<u64, ChainError> {
+        let quantity: String = self
+            .rpc(
+                "eth_estimateGas",
+                json!([{
+                    "from": format_address(from),
+                    "to": format_address(to),
+                    "data": format!("0x{}", encode_hex(data)),
+                }]),
+            )
+            .await?;
+        parse_quantity(&quantity)
+    }
+
+    pub async fn send_raw_transaction(&self, raw_tx: &[u8]) -> Result<[u8; 32], ChainError> {
+        let hash_hex: String = self
+            .rpc(
+                "eth_sendRawTransaction",
+                json!([format!("0x{}", encode_hex(raw_tx))]),
+            )
+            .await?;
+        let bytes = decode_hex(&hash_hex)?;
+        let hash: [u8; 32] = bytes.try_into().map_err(|_| ChainError::InvalidResponse)?;
+        Ok(hash)
+    }
+
+    pub async fn transaction_receipt(
+        &self,
+        tx_hash: &[u8; 32],
+    ) -> Result<Option<EvmTransactionReceipt>, ChainError> {
+        let receipt: Option<RpcTransactionReceipt> = self
+            .rpc_nullable(
+                "eth_getTransactionReceipt",
+                json!([format!("0x{}", encode_hex(tx_hash))]),
+            )
+            .await?;
+        let Some(receipt) = receipt else {
+            return Ok(None);
+        };
+        let returned_hash_bytes = decode_hex(&receipt.transaction_hash)?;
+        let returned_hash: [u8; 32] = returned_hash_bytes
+            .try_into()
+            .map_err(|_| ChainError::InvalidResponse)?;
+        if returned_hash != *tx_hash {
+            return Err(ChainError::InvalidResponse);
+        }
+        let block_number = parse_quantity(&receipt.block_number)?;
+        validate_hash(&receipt.block_hash)?;
+        let status_quantity = parse_quantity(&receipt.status)?;
+        let status = match status_quantity {
+            0 => false,
+            1 => true,
+            _ => return Err(ChainError::InvalidResponse),
+        };
+        let gas_used = parse_quantity(&receipt.gas_used)?;
+        Ok(Some(EvmTransactionReceipt {
+            transaction_hash: returned_hash,
+            block_number,
+            block_hash: receipt.block_hash.to_ascii_lowercase(),
+            status,
+            gas_used,
+        }))
+    }
+
     async fn eth_call(
         &self,
         contract: &EvmAddress,
@@ -605,6 +740,25 @@ impl BesuClient {
     }
 
     async fn rpc<T: DeserializeOwned>(&self, method: &str, params: Value) -> Result<T, ChainError> {
+        let value = self.rpc_raw(method, params).await?;
+        serde_json::from_value(value).map_err(|_| ChainError::InvalidResponse)
+    }
+
+    async fn rpc_nullable<T: DeserializeOwned>(
+        &self,
+        method: &str,
+        params: Value,
+    ) -> Result<Option<T>, ChainError> {
+        let value = self.rpc_raw(method, params).await?;
+        if value.is_null() {
+            return Ok(None);
+        }
+        serde_json::from_value(value)
+            .map(Some)
+            .map_err(|_| ChainError::InvalidResponse)
+    }
+
+    async fn rpc_raw(&self, method: &str, params: Value) -> Result<Value, ChainError> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let response = self
             .client
@@ -621,7 +775,7 @@ impl BesuClient {
         if !response.status().is_success() {
             return Err(ChainError::TransportUnavailable);
         }
-        let body: RpcResponse<T> = response
+        let body: RpcResponse = response
             .json()
             .await
             .map_err(|_| ChainError::InvalidResponse)?;
@@ -644,11 +798,19 @@ struct RpcRequest<'a> {
 }
 
 #[derive(Deserialize)]
-struct RpcResponse<T> {
+struct RpcResponse {
     jsonrpc: String,
     id: u64,
-    result: Option<T>,
+    #[serde(default, deserialize_with = "deserialize_present_value")]
+    result: Option<Value>,
     error: Option<RpcErrorObject>,
+}
+
+fn deserialize_present_value<'de, D>(deserializer: D) -> Result<Option<Value>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Value::deserialize(deserializer).map(Some)
 }
 
 #[derive(Deserialize)]
@@ -775,7 +937,7 @@ pub fn decode_hex(value: &str) -> Result<Vec<u8>, ChainError> {
     Ok(output)
 }
 
-fn encode_hex(bytes: &[u8]) -> String {
+pub(crate) fn encode_hex(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut output = String::with_capacity(bytes.len() * 2);
     for byte in bytes {
@@ -1131,6 +1293,49 @@ mod tests {
 
         let rejected = client.logs(5, 5, &[configured_address]).await;
         assert_eq!(rejected, Err(ChainError::InvalidResponse));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn queries_write_access_at_requested_block() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = vec![0; 4096];
+            let read = stream.read(&mut request).await.unwrap();
+            let request_text = String::from_utf8_lossy(&request[..read]);
+            assert!(request_text.contains("\"eth_call\""));
+            assert!(request_text.contains("\"0x9\""));
+            let selector = Keccak256::digest(b"hasWriteAccess(bytes32,bytes32)");
+            assert!(request_text.contains(&encode_hex(&selector[..4])));
+
+            let body = json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": format!("0x{:064x}", 1)
+            })
+            .to_string();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+        });
+
+        let client = BesuClient::new(&format!("http://{address}")).unwrap();
+        assert!(
+            client
+                .has_write_access(
+                    &EvmAddress::from_bytes([0x33; 20]),
+                    &[0x44; 32],
+                    &[0x55; 32],
+                    9,
+                )
+                .await
+                .unwrap()
+        );
         server.await.unwrap();
     }
 }

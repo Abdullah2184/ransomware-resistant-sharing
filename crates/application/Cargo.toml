@@ -3,3 +3,14 @@ name = "application"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+
+[dependencies]
+crypto = { path = "../crypto" }
+domain = { path = "../domain" }
+getrandom.workspace = true
+ports = { path = "../ports" }
+tokio.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+key-custody = { path = "../key_custody" }

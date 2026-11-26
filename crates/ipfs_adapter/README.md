@@ -23,12 +23,14 @@ cargo test -p ipfs-adapter --locked
 ```
 
 The two-peer integration test requires the local Kubo and Cluster services and
-is ignored during ordinary test runs. Run it explicitly only after the
-two-peer replication verifier succeeds:
+is ignored during ordinary offline test runs. With the local Compose stack
+running (`docker compose --env-file .env -f infra/compose.yaml up -d`), run it
+with:
 
 ```shell
+set -a && . ./.env && set +a
 cargo test -p ipfs-adapter --locked --test cluster_integration -- --ignored
 ```
 
-The current replication limitation is documented in
-`infra/ipfs-cluster/README.md`.
+Live two-peer integration status and host-independence limitations are
+documented in `infra/ipfs-cluster/README.md`.

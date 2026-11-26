@@ -9,10 +9,12 @@ and persist with those volumes.
 
 - Both Kubo nodes use one generated private-network swarm key and disable
   public bootstrap peers. `kubo2` discovers `kubo`'s current identity at
-  startup and configures it as its private swarm bootstrap peer. The Docker
-  network is internal to this Compose project. Kubo's default private-address
-  filters are cleared so peers can reach each other on the isolated Docker
-  bridge; the Kubo swarm ports are not published to the host.
+  startup and configures it as its private swarm bootstrap peer. The Compose
+  bridge (`rrfs-private`) does not publish Kubo swarm ports or HTTP gateway
+  ports; commit `01e361f` removed Docker's `internal: true` flag so the host
+  loopback bindings below can publish on Docker Desktop. Kubo's default
+  private-address filters are cleared so peers can reach each other on the
+  Docker bridge.
 - For the host-run gateway and adapter, Kubo's administrative APIs are bound
   only to host loopback at `127.0.0.1:15001` and `127.0.0.1:15002`. They are
   not reachable from other machines or the public internet, but any process on
@@ -61,29 +63,34 @@ Docker daemon, network, power source, and administrative boundary. This
 environment verifies local allocation/replication only. It does **not**
 establish two-organization independence or production fault tolerance.
 
-## Current development status
+## Current development status (updated 26 November 2026)
 
-- Takeover check (12 November 2026): Compose could read the root `.env` when
-  supplied explicitly, but Docker Desktop's Linux Engine named pipe was
-  unavailable. Services could not be started or checked in this session.
-  Start Docker Desktop before running the verification commands below.
+- **Live two-peer replication and Rust adapter integration verified (26 November 2026):**
+  - All five Compose services (`postgres`, `kubo`, `kubo2`, `cluster1`, `cluster2`)
+    are healthy with host loopback bindings (`127.0.0.1:5432`, `127.0.0.1:15001`,
+    `127.0.0.1:15002`, `127.0.0.1:9094`).
+  - `sh infra/ipfs-cluster/verify.sh` passed with both `rrfs-cluster-1` and
+    `rrfs-cluster-2` reporting `PINNED` (0 attempts).
+  - `cargo test -p ipfs-adapter --locked --test cluster_integration -- --ignored`
+    passed (`1 passed; 0 failed` in 1.66s), verifying encrypted content-package
+    upload, manifest/chunk/root CID verification, two-peer authenticated Cluster
+    pin quorum, DAG export, and envelope-set upload/retrieval.
+  - Fixes applied during live verification:
+    1. `start-kubo.sh` now normalizes `/data/ipfs` ownership (`chown -R ipfs`)
+       and runs bootstrap API queries via `gosu ipfs`; `infra/compose.yaml`
+       healthchecks query Kubo over HTTP (`/ip4/127.0.0.1/tcp/5001`) as `ipfs`
+       so healthchecks never open `/data/ipfs/datastore` as `root`.
+    2. Amended the UnixFS profile (`docs/adr/content-package-unixfs-profile.md`)
+       to 1 MiB plaintext chunks (`1,048,576` bytes; `1,048,592` ciphertext+tag)
+       with `chunker=size-1048592` to stay within Kubo `0.43.1`'s `2,096,896`-byte
+       chunker cap.
+    3. Updated `ipfs_adapter` to accept Kubo's intermediate `"chunks"` directory
+       entry on `wrap-with-directory=true` uploads and poll Cluster's `GET /pins/{cid}`
+       pin-status endpoint.
+  - Reminder: these two peers share one host and failure domain and do not
+    demonstrate independent multi-organization operation.
 
-- At the last read-only status check, both Kubo containers were healthy and
-  reported one connected private-swarm peer. Both Cluster containers were
-  healthy, had distinct persisted identities, and reported the other peer as
-  connected.
-- The last replication verification did **not** confirm two-peer allocation:
-  the test CID was `PINNED` on `rrfs-cluster-1`, while
-  `rrfs-cluster-2` entered `PIN_ERROR` (`context canceled`). Two-peer
-  replication is therefore unverified.
-- Further Kubo/Cluster setup and troubleshooting are deferred for manual
-  follow-up. No service restart, volume operation, or new replication attempt
-  was made during the Phase 3 feature work. Do not treat peer membership as
-  proof of replicated storage.
-- PostgreSQL was a separate healthy service at the last environment check. No
-  Besu network has been added as part of this infrastructure setup.
-
-## Bring-up issues encountered
+### Historical bring-up notes (12 November 2026)
 
 - Overriding the Cluster image entrypoint also removed its default command;
   the Compose services now explicitly invoke `daemon`.

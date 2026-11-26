@@ -1,0 +1,124 @@
+name: CI
+
+on:
+  push:
+    branches: [main, agent/development]
+  pull_request:
+    branches: [main, agent/development]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust-checks:
+    name: Rust fmt, clippy, unit/HTTP tests & boundaries
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache Cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run strict Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Run workspace tests
+        run: cargo test --workspace --all-targets --locked
+
+      - name: Verify crate dependency boundaries
+        run: |
+          set -eu
+          ! grep -Eq 'chain-adapter|ipfs-adapter|metadata-store|sqlx|axum|reqwest' crates/domain/Cargo.toml
+          ! grep -Eq 'chain-adapter|ipfs-adapter|metadata-store|sqlx|axum|reqwest|key-custody' crates/crypto/Cargo.toml
+          ! grep -Eq 'chain-adapter|ipfs-adapter|metadata-store|sqlx|axum|reqwest' crates/application/Cargo.toml
+          ! grep -Eq 'chain-adapter|ipfs-adapter|metadata-store|sqlx|axum' apps/cli/Cargo.toml
+          ! awk '/^\[dependencies\]/,/^\[/' services/gateway/Cargo.toml | grep -q 'key-custody'
+
+  postgres-integration:
+    name: PostgreSQL migration, indexer & gateway tests
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:18.6-bookworm
+        env:
+          POSTGRES_USER: rrfs_ci
+          POSTGRES_PASSWORD: rrfs_ci_password
+          POSTGRES_DB: rrfs_ci_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U rrfs_ci -d rrfs_ci_test"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run live PostgreSQL integration tests
+        env:
+          DATABASE_URL: postgres://rrfs_ci:rrfs_ci_password@127.0.0.1:5432/rrfs_ci_test
+        run: cargo test -p metadata-store -p indexer -p gateway --locked
+
+  contracts:
+    name: Solidity & Hardhat tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 12
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: pnpm
+          cache-dependency-path: contracts/pnpm-lock.yaml
+
+      - name: Install contract dependencies
+        run: pnpm --dir contracts install --frozen-lockfile
+
+      - name: Run Hardhat test suite
+        run: pnpm --dir contracts exec hardhat test
+
+  hygiene:
+    name: Diff hygiene & Compose config validation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check trailing whitespace and conflict markers
+        run: git diff --check
+
+      - name: Validate Compose templates
+        env:
+          POSTGRES_PASSWORD: ci-placeholder-not-a-secret
+        run: |
+          docker compose -f infra/compose.yaml config --quiet
+          docker compose -f infra/besu-qbft/compose.yaml config --quiet
+          docker compose -f infra/compose/database.yaml config --quiet
+          docker compose -f infra/compose/ipfs-peer.yaml config --quiet
+          docker compose -f infra/compose/besu-validator.yaml config --quiet
+          docker compose -f infra/compose/besu-rpc.yaml config --quiet

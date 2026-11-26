@@ -172,7 +172,7 @@ impl IpfsClusterStore {
             .query(&[
                 ("cid-version", "1"),
                 ("hash", "sha2-256"),
-                ("chunker", "size-4194320"),
+                ("chunker", "size-1048592"),
                 ("raw-leaves", "true"),
                 (
                     "wrap-with-directory",
@@ -242,7 +242,7 @@ impl IpfsClusterStore {
         let cid_text = storage_cid_string(&cid);
         let status_url = self
             .cluster_api_url
-            .join(&format!("pins/{cid_text}/status"))
+            .join(&format!("pins/{cid_text}"))
             .map_err(|_| StorageError::InvalidCid)?;
         let deadline = Instant::now() + self.replication_timeout;
         let mut delay = Duration::from_millis(250);
@@ -539,6 +539,11 @@ fn parse_add_output(
                 return Err(StorageError::IntegrityCheckFailed);
             }
         }
+        if !manifest.chunks().is_empty() {
+            // Kubo emits an intermediate UnixFS directory entry for `chunks`
+            // when wrapping `chunks/00000001..N` with a root directory.
+            files.remove("chunks");
+        }
         if !files.is_empty() {
             return Err(StorageError::InvalidResponse);
         }
@@ -596,12 +601,9 @@ fn env_u64(name: &str, default: u64) -> Result<u64, StorageError> {
 }
 
 fn raw_chunk_cid(bytes: &[u8]) -> Result<String, StorageError> {
-    use sha2::{Digest, Sha256};
-
-    let digest = Sha256::digest(bytes);
-    let multihash = cid::multihash::Multihash::<64>::wrap(0x12, &digest)
-        .map_err(|_| StorageError::IntegrityCheckFailed)?;
-    Ok(cid::Cid::new_v1(0x55, multihash).to_string())
+    crypto::raw_sha256_cid(bytes)
+        .map(|cid| cid.to_string())
+        .map_err(|_| StorageError::IntegrityCheckFailed)
 }
 
 fn verify_block_cid(expected: &cid::Cid, block: &[u8]) -> bool {
@@ -798,7 +800,7 @@ mod tests {
                         .await
                         .unwrap();
                 } else {
-                    assert!(request.starts_with("GET /pins/"));
+                    assert!(request.starts_with(&format!("GET /pins/{server_cid} ")));
                     let body = serde_json::json!({
                         "cid": server_cid,
                         "peer_map": {
@@ -847,7 +849,7 @@ mod tests {
             ManifestHash::ZERO,
             EpochId::from_bytes([2; 32]),
             NoncePrefix::from_bytes([3; 8]),
-            4 * 1024 * 1024,
+            crypto::DEFAULT_CHUNK_SIZE_BYTES as u32,
             vec![EncryptedChunkRef::new(1, chunk_cid.clone(), ciphertext.len() as u64).unwrap()],
             None,
         )
@@ -860,7 +862,8 @@ mod tests {
         let valid = format!(
             "{{\"Name\":\"\",\"Hash\":\"{root_cid}\"}}\n\
              {{\"Name\":\"manifest.json\",\"Hash\":\"{manifest_cid}\"}}\n\
-             {{\"Name\":\"chunks/00000001\",\"Hash\":\"{chunk_cid}\"}}\n"
+             {{\"Name\":\"chunks/00000001\",\"Hash\":\"{chunk_cid}\"}}\n\
+             {{\"Name\":\"chunks\",\"Hash\":\"{root_cid}\"}}\n"
         );
         assert!(parse_add_output(valid.as_bytes(), true, Some((&manifest, &manifest_cid))).is_ok());
 

@@ -13,12 +13,14 @@ const VERSION_APPEND_TYPE: &str = "VersionAppend(bytes32 fileId,uint64 versionNu
 const ACCESS_LOOKUP_TYPE: &str = "AccessLookup(bytes32 memberId,bytes32 fileId,uint64 versionNumber,uint32 encryptionKeyVersion,bytes32 operationNonce,uint256 deadline)";
 const ENVELOPE_SET_UPDATE_TYPE: &str = "EnvelopeSetUpdate(bytes32 fileId,uint64 versionNumber,bytes32 epochId,string oldEnvelopeSetCid,string newEnvelopeSetCid,bytes32 actorMemberId,bytes32 proposalId,bytes32 operationNonce,uint256 deadline)";
 const MEMBER_KEY_PROOF_TYPE: &str = "MemberKeyProof(bytes32 memberId,bytes32 organizationId,address signingAddress,uint32 signingKeyVersion,uint32 encryptionKeyVersion,bytes32 encryptionPublicKey,bytes32 operationNonce,uint256 deadline)";
+const LOGIN_CHALLENGE_TYPE: &str = "LoginChallenge(bytes32 memberId,bytes32 nonce,uint64 issuedAt,uint64 expiresAt,string audience,uint32 protocolVersion)";
 
 /// Domain contract that binds a typed message to the contract responsible for it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum VerifyingContractKind {
     FileRegistry,
     AccessGovernance,
+    Gateway,
 }
 
 /// An EVM chain identifier represented as a full unsigned 256-bit EIP-712 word.
@@ -79,6 +81,14 @@ impl Eip712Domain {
         }
     }
 
+    pub const fn gateway(chain_id: ChainId, verifying_contract: EvmAddress) -> Self {
+        Self {
+            kind: VerifyingContractKind::Gateway,
+            chain_id,
+            verifying_contract,
+        }
+    }
+
     pub const fn kind(&self) -> VerifyingContractKind {
         self.kind
     }
@@ -87,6 +97,7 @@ impl Eip712Domain {
         let name = match self.kind {
             VerifyingContractKind::FileRegistry => "RRDS FileRegistry",
             VerifyingContractKind::AccessGovernance => "RRDS AccessGovernance",
+            VerifyingContractKind::Gateway => "RRDS Gateway",
         };
         let fields = [
             keccak(name.as_bytes()),
@@ -148,6 +159,7 @@ pub enum SigningError {
     WrongVerifyingContract,
     UnchangedEnvelopeSet,
     InvalidKeyProof,
+    InvalidChallenge,
 }
 
 impl fmt::Display for SigningError {
@@ -158,6 +170,7 @@ impl fmt::Display for SigningError {
             Self::WrongVerifyingContract => "typed operation has the wrong verifying contract",
             Self::UnchangedEnvelopeSet => "envelope update must change the envelope-set CID",
             Self::InvalidKeyProof => "member key proof contains an invalid key",
+            Self::InvalidChallenge => "login challenge contains invalid fields",
         };
         formatter.write_str(message)
     }
@@ -410,6 +423,64 @@ impl MemberKeyProof {
     }
 }
 
+/// EIP-712 login challenge signed by a member's registered signing key.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LoginChallengeDigestInput {
+    member_id: MemberId,
+    nonce: OperationNonce,
+    issued_at: u64,
+    expires_at: u64,
+    audience: String,
+    protocol_version: u32,
+}
+
+impl LoginChallengeDigestInput {
+    pub fn new(
+        member_id: MemberId,
+        nonce: OperationNonce,
+        issued_at: u64,
+        expires_at: u64,
+        audience: String,
+        protocol_version: u32,
+    ) -> Result<Self, SigningError> {
+        validate_nonce(nonce)?;
+        if member_id.as_bytes() == &[0; 32]
+            || issued_at == 0
+            || expires_at <= issued_at
+            || audience.is_empty()
+            || audience.len() > 512
+            || audience.chars().any(char::is_control)
+            || protocol_version == 0
+        {
+            return Err(SigningError::InvalidChallenge);
+        }
+        Ok(Self {
+            member_id,
+            nonce,
+            issued_at,
+            expires_at,
+            audience,
+            protocol_version,
+        })
+    }
+
+    pub fn digest(&self, domain: &Eip712Domain) -> Result<TypedDigest, SigningError> {
+        require_kind(domain, VerifyingContractKind::Gateway)?;
+        let fields = [
+            self.member_id.into_bytes(),
+            self.nonce.into_bytes(),
+            uint_word_u64(self.issued_at),
+            uint_word_u64(self.expires_at),
+            keccak(self.audience.as_bytes()),
+            uint_word_u32(self.protocol_version),
+        ];
+        Ok(typed_digest(
+            domain,
+            struct_hash(LOGIN_CHALLENGE_TYPE, &fields),
+        ))
+    }
+}
+
 fn validate_nonce(nonce: OperationNonce) -> Result<(), SigningError> {
     if nonce.as_bytes() == &[0; 32] {
         return Err(SigningError::ZeroOperationNonce);
@@ -574,6 +645,25 @@ mod tests {
                 .unwrap()
                 .as_bytes(),
             &fixture_digest("memberKeyProof")
+        );
+        let gateway_domain =
+            Eip712Domain::gateway(ChainId::from_u64(1337), EvmAddress::from_bytes([0x33; 20]));
+        let login_challenge = LoginChallengeDigestInput::new(
+            MemberId::from_bytes([0x11; 32]),
+            OperationNonce::from_bytes([0x22; 32]),
+            1_800_000_000,
+            1_800_000_120,
+            "rrds-local".to_owned(),
+            1,
+        )
+        .unwrap();
+        assert_eq!(
+            login_challenge.digest(&gateway_domain).unwrap().as_bytes(),
+            &fixture_digest("loginChallenge")
+        );
+        assert_eq!(
+            login_challenge.digest(&governance_domain()),
+            Err(SigningError::WrongVerifyingContract)
         );
         assert_eq!(
             version.digest(&governance_domain()),

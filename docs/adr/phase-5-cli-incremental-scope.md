@@ -26,12 +26,21 @@ operations.
 
 ## Consequences
 
-- The first CLI increment is intentionally limited and does not satisfy the
-  full Phase 5 acceptance criteria.
-- The health command verifies only that the HTTP gateway responds
-  successfully; it does not establish database, chain, or storage health.
-- Phase 5 remains in progress until the required use cases are available and
-  exercised end-to-end.
+- The initial `health` baseline has now been expanded (P4, 26 November 2026) to
+  thin CLI commands backed by `crates/application` (`AuthService`,
+  `UploadService`, `DownloadService`, `ShareService`) and `GatewayHttpClient`:
+  `health`, `login`, `whoami`, `identity`, `ls`, `history`, `upload`, `modify`,
+  `download`, `share`, `restore`, and `audit`.
+- To preserve endpoint-to-storage isolation (never exposing Kubo/Cluster admin
+  credentials to user endpoints), encrypted packages and canonical envelope sets
+  are staged via authenticated ciphertext-only gateway routes
+  (`POST /v1/blobs/content` using the `RRDSPKG1` frame in `crates/ports`, and
+  `POST /v1/blobs/envelopes`).
+- Multisig governance actions (member registration, Read/Write ACL grants and
+  revocations, emergency suspension) remain executed through the configured
+  Safe/Timelock governance workflow rather than unguarded CLI shortcuts.
+- Production HSM integration and full end-to-end live-Besu acceptance tests
+  remain tracked under P5–P7.
 
 ## Specification references
 

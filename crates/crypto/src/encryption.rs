@@ -5,12 +5,12 @@ use aes_gcm::{
 use domain::{EpochId, FileId, VersionNumber};
 use zeroize::Zeroizing;
 
-use crate::NoncePrefix;
+use crate::{NoncePrefix, PrivateMetadataCiphertext};
 
 const AAD_DOMAIN: &[u8] = b"rrds/encrypted-content/v1";
 const GCM_TAG_BYTES: usize = 16;
 
-pub const DEFAULT_CHUNK_SIZE_BYTES: usize = 4 * 1024 * 1024;
+pub const DEFAULT_CHUNK_SIZE_BYTES: usize = 1024 * 1024;
 
 /// Errors from the versioned AES-256-GCM chunk format.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -122,6 +122,14 @@ pub struct EncryptedChunk {
 }
 
 impl EncryptedChunk {
+    /// Reconstructs an encrypted chunk from verified storage bytes for decryption.
+    pub fn from_parts(index: u32, ciphertext_and_tag: Vec<u8>) -> Self {
+        Self {
+            index,
+            ciphertext_and_tag,
+        }
+    }
+
     pub const fn index(&self) -> u32 {
         self.index
     }
@@ -279,6 +287,52 @@ impl ChunkDecryptor {
         }
         Ok(())
     }
+}
+
+/// Encrypts optional private metadata using reserved nonce index zero.
+pub fn encrypt_private_metadata(
+    key: &DataEncryptionKey,
+    nonce_prefix: NoncePrefix,
+    context: EncryptionContext,
+    total_chunks: u32,
+    plaintext: &[u8],
+) -> Result<PrivateMetadataCiphertext, CryptoError> {
+    let cipher = key.cipher()?;
+    let nonce = Nonce::from(nonce_prefix.for_chunk_index(0));
+    let aad = context.associated_data(0, total_chunks);
+    let ciphertext = cipher
+        .encrypt(
+            &nonce,
+            Payload {
+                msg: plaintext,
+                aad: &aad,
+            },
+        )
+        .map_err(|_| CryptoError::InvalidKey)?;
+    PrivateMetadataCiphertext::new(ciphertext)
+}
+
+/// Decrypts and authenticates optional private metadata at reserved nonce index zero.
+pub fn decrypt_private_metadata(
+    key: &DataEncryptionKey,
+    nonce_prefix: NoncePrefix,
+    context: EncryptionContext,
+    total_chunks: u32,
+    metadata: &PrivateMetadataCiphertext,
+) -> Result<Zeroizing<Vec<u8>>, CryptoError> {
+    let cipher = key.cipher()?;
+    let nonce = Nonce::from(nonce_prefix.for_chunk_index(0));
+    let aad = context.associated_data(0, total_chunks);
+    let plaintext = cipher
+        .decrypt(
+            &nonce,
+            Payload {
+                msg: metadata.ciphertext_and_tag(),
+                aad: &aad,
+            },
+        )
+        .map_err(|_| CryptoError::AuthenticationFailed)?;
+    Ok(Zeroizing::new(plaintext))
 }
 
 /// Calculates the number of content chunks while preserving index zero for metadata.
@@ -532,5 +586,27 @@ mod tests {
             encryptor.encrypt_next(b"again"),
             Err(CryptoError::UnexpectedChunk)
         ));
+    }
+
+    #[test]
+    fn private_metadata_uses_reserved_index_zero_and_binds_context() {
+        let context = test_context(1, 1, 1);
+        let nonce_prefix = NoncePrefix::from_bytes([12; 8]);
+        let dek = key(12);
+        let encrypted =
+            encrypt_private_metadata(&dek, nonce_prefix, context, 2, b"original-name.pdf").unwrap();
+
+        let decrypted =
+            decrypt_private_metadata(&dek, nonce_prefix, context, 2, &encrypted).unwrap();
+        assert_eq!(decrypted.as_slice(), b"original-name.pdf");
+
+        assert_eq!(
+            decrypt_private_metadata(&dek, nonce_prefix, context, 3, &encrypted),
+            Err(CryptoError::AuthenticationFailed)
+        );
+        assert_eq!(
+            decrypt_private_metadata(&dek, nonce_prefix, test_context(2, 1, 1), 2, &encrypted),
+            Err(CryptoError::AuthenticationFailed)
+        );
     }
 }

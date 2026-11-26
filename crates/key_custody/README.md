@@ -1,11 +1,15 @@
 # Key custody
 
-This crate implements the `ports::KeyCustodyProvider` boundary. Its
-`DevelopmentKeyCustody` holds software-generated secp256k1 and X25519 keys in
-process memory and is explicitly test/development only. It reports that
-private keys are exportable; it is not an HSM adapter and must not be used in
-production. A production startup guard and hardware provider remain
-unimplemented.
+This crate implements the `ports::KeyCustodyProvider` boundary and startup
+custody policy enforcement. Its `DevelopmentKeyCustody` holds
+software-generated secp256k1 and X25519 keys in process memory and is explicitly
+test/development only. It reports `test_only: true` and exportable private keys;
+it is not an HSM adapter and must not be used in production.
+
+`verify_provider_policy` enforces `CustodyStartupPolicy::Production` by
+rejecting unhealthy, test-only, or exportable-key providers unless
+`CustodyStartupPolicy::UnsafeDevelopment` is explicitly configured. A hardware
+PKCS#11/HSM provider remains unimplemented.
 
 Run its behavior tests with:
 

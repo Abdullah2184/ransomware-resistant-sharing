@@ -1,0 +1,27 @@
+name: rrfs-besu-validator
+
+services:
+  validator:
+    image: ${BESU_IMAGE:-hyperledger/besu:26.11.0@sha256:3d6ac0368d449c13c4ba075acac90d6b96afa5b3113295385d88c4d5122c8808}
+    restart: unless-stopped
+    environment:
+      BESU_NODE_PRIVATE_KEY_FILE: /node-key/key
+    command:
+      - --genesis-file=/config/genesis.json
+      - --data-path=/data
+      - --min-gas-price=0
+      - --p2p-host=0.0.0.0
+      - --p2p-port=30303
+      - --bootnodes=/config/bootnodes.txt
+      - --logging=INFO
+    ports:
+      - "${BESU_P2P_BIND_IP:-0.0.0.0}:30303:30303/tcp"
+      - "${BESU_P2P_BIND_IP:-0.0.0.0}:30303:30303/udp"
+    volumes:
+      - validator_data:/data
+      - ${BESU_GENESIS_FILE:-../besu-qbft/generated/genesis.json}:/config/genesis.json:ro
+      - ${BESU_BOOTNODES_FILE:-../besu-qbft/generated/bootnodes.txt}:/config/bootnodes.txt:ro
+      - ${BESU_VALIDATOR_KEY_DIR:-../besu-qbft/generated/validators/validator1}:/node-key:ro
+
+volumes:
+  validator_data:

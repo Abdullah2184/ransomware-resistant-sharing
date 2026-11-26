@@ -20,3 +20,7 @@ sha3.workspace = true
 sqlx.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
+
+[dev-dependencies]
+key-custody = { path = "../../crates/key_custody" }
+reqwest.workspace = true

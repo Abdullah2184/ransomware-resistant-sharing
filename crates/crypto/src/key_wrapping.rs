@@ -109,6 +109,19 @@ impl HpkeRecipientKeyPair {
         })
     }
 
+    /// Deterministically derives an X25519 keypair from a 32-byte seed for
+    /// local development and testing only. Never use in production.
+    pub fn derive_from_seed(seed: &[u8; 32]) -> Result<Self, CryptoError> {
+        if seed == &[0u8; 32] {
+            return Err(CryptoError::InvalidRecipientPublicKey);
+        }
+        let (private_key, public_key) = RecipientKem::derive_keypair(seed);
+        Ok(Self {
+            private_key,
+            public_key: HpkeRecipientPublicKey(public_key),
+        })
+    }
+
     pub const fn public_key(&self) -> &HpkeRecipientPublicKey {
         &self.public_key
     }

@@ -48,6 +48,15 @@ checksum = "683d7910e743518b0e34f1186f92494becacb047c7b6bf616c96772180fef923"
 [[package]]
 name = "application"
 version = "0.1.0"
+dependencies = [
+ "crypto",
+ "domain",
+ "getrandom 0.3.4",
+ "key-custody",
+ "ports",
+ "tokio",
+ "zeroize",
+]
 
 [[package]]
 name = "atoi"
@@ -270,11 +279,14 @@ name = "chain-adapter"
 version = "0.1.0"
 dependencies = [
  "domain",
+ "getrandom 0.3.4",
+ "k256",
  "reqwest",
  "serde",
  "serde_json",
  "sha3",
  "tokio",
+ "zeroize",
 ]
 
 [[package]]
@@ -303,8 +315,17 @@ dependencies = [
 name = "cli"
 version = "0.1.0"
 dependencies = [
+ "application",
+ "cid",
+ "crypto",
+ "domain",
+ "key-custody",
+ "ports",
  "reqwest",
+ "serde",
+ "serde_json",
  "tokio",
+ "zeroize",
 ]
 
 [[package]]
@@ -426,6 +447,7 @@ dependencies = [
  "hpke",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "sha3",
  "zeroize",
 ]
@@ -818,8 +840,10 @@ dependencies = [
  "getrandom 0.3.4",
  "ipfs-adapter",
  "k256",
+ "key-custody",
  "metadata-store",
  "ports",
+ "reqwest",
  "serde",
  "serde_json",
  "sha3",
@@ -1793,6 +1817,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "rrds-tests"
+version = "0.1.0"
+dependencies = [
+ "application",
+ "chain-adapter",
+ "crypto",
+ "domain",
+ "key-custody",
+ "ports",
+ "scanner",
+ "serde_json",
+ "sha3",
+ "tokio",
+ "zeroize",
+]
+
+[[package]]
 name = "rustc-hash"
 version = "2.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1907,6 +1948,11 @@ dependencies = [
 [[package]]
 name = "scanner"
 version = "0.1.0"
+dependencies = [
+ "domain",
+ "ports",
+ "tokio",
+]
 
 [[package]]
 name = "schannel"

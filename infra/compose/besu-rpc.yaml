@@ -1,0 +1,31 @@
+name: rrfs-besu-rpc
+
+services:
+  rpcnode:
+    image: ${BESU_IMAGE:-hyperledger/besu:26.11.0@sha256:3d6ac0368d449c13c4ba075acac90d6b96afa5b3113295385d88c4d5122c8808}
+    restart: unless-stopped
+    command:
+      - --genesis-file=/config/genesis.json
+      - --data-path=/data
+      - --min-gas-price=0
+      - --p2p-host=0.0.0.0
+      - --p2p-port=30303
+      - --bootnodes=/config/bootnodes.txt
+      - --rpc-http-enabled=true
+      - --rpc-http-host=0.0.0.0
+      - --rpc-http-port=8545
+      - --rpc-http-api=ETH,NET,WEB3,QBFT
+      - --rpc-http-max-active-connections=64
+      - --host-allowlist=${BESU_RPC_HOST_ALLOWLIST:-localhost,127.0.0.1}
+      - --logging=INFO
+    ports:
+      - "${BESU_RPC_BIND_IP:-127.0.0.1}:8545:8545"
+      - "${BESU_P2P_BIND_IP:-0.0.0.0}:30303:30303/tcp"
+      - "${BESU_P2P_BIND_IP:-0.0.0.0}:30303:30303/udp"
+    volumes:
+      - rpcnode_data:/data
+      - ${BESU_GENESIS_FILE:-../besu-qbft/generated/genesis.json}:/config/genesis.json:ro
+      - ${BESU_BOOTNODES_FILE:-../besu-qbft/generated/bootnodes.txt}:/config/bootnodes.txt:ro
+
+volumes:
+  rpcnode_data:

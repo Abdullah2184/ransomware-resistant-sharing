@@ -1,8 +1,11 @@
-use std::{error::Error, fmt, future::Future, pin::Pin};
+use std::{error::Error, fmt, future::Future, io::Cursor, pin::Pin};
 
-use crypto::EncryptedFileManifest;
+use crypto::{EncryptedFileManifest, raw_sha256_cid};
 use domain::{ContentCid, DomainError, EnvelopeSetCid};
-use tokio::io::AsyncRead;
+use tokio::io::{AsyncRead, AsyncReadExt};
+
+const PACKAGE_FRAME_MAGIC: &[u8; 8] = b"RRDSPKG1";
+const MAX_MANIFEST_FRAME_BYTES: usize = 512 * 1024;
 
 pub type StorageReader = Pin<Box<dyn AsyncRead + Send + Unpin + 'static>>;
 pub type StorageFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, StorageError>> + Send + 'a>>;
@@ -176,4 +179,204 @@ pub trait BlobStore: Send + Sync {
     ) -> StorageFuture<'a, ReplicationReceipt>;
 
     fn verify_retrievable<'a>(&'a self, cid: StorageCid) -> StorageFuture<'a, ()>;
+}
+
+/// Serializes an encrypted [`ContentPackage`] into the canonical length-prefixed
+/// binary frame (`RRDSPKG1`) accepted by the gateway's `POST /v1/blobs/content` route.
+pub async fn encode_content_package_frame(
+    package: ContentPackage,
+    max_total_bytes: usize,
+) -> Result<Vec<u8>, StorageError> {
+    let (manifest, chunks) = package.into_parts();
+    let manifest_bytes = manifest
+        .canonical_bytes()
+        .map_err(|_| StorageError::InvalidPackage)?;
+    if manifest_bytes.len() > MAX_MANIFEST_FRAME_BYTES {
+        return Err(StorageError::SizeLimitExceeded);
+    }
+    let manifest_len =
+        u32::try_from(manifest_bytes.len()).map_err(|_| StorageError::InvalidPackage)?;
+    let chunk_count = u32::try_from(chunks.len()).map_err(|_| StorageError::InvalidPackage)?;
+
+    let mut out = Vec::new();
+    out.extend_from_slice(PACKAGE_FRAME_MAGIC);
+    out.extend_from_slice(&manifest_len.to_be_bytes());
+    out.extend_from_slice(&manifest_bytes);
+    out.extend_from_slice(&chunk_count.to_be_bytes());
+    if out.len() > max_total_bytes {
+        return Err(StorageError::SizeLimitExceeded);
+    }
+
+    for chunk in chunks {
+        let index = chunk.index();
+        let declared_len = chunk.ciphertext_bytes();
+        let mut bytes = Vec::new();
+        chunk
+            .into_reader()
+            .read_to_end(&mut bytes)
+            .await
+            .map_err(|_| StorageError::TransportUnavailable)?;
+        if u64::try_from(bytes.len()).ok() != Some(declared_len) {
+            return Err(StorageError::InvalidPackage);
+        }
+        let next_len = out
+            .len()
+            .checked_add(12)
+            .and_then(|v| v.checked_add(bytes.len()))
+            .ok_or(StorageError::SizeLimitExceeded)?;
+        if next_len > max_total_bytes {
+            return Err(StorageError::SizeLimitExceeded);
+        }
+        out.extend_from_slice(&index.to_be_bytes());
+        out.extend_from_slice(&declared_len.to_be_bytes());
+        out.extend_from_slice(&bytes);
+    }
+    Ok(out)
+}
+
+/// Validates and decodes an `RRDSPKG1` encrypted package frame into a
+/// [`ContentPackage`], verifying canonical manifest structure and every chunk's
+/// length and SHA-256 CID before accepting it for storage.
+pub fn decode_content_package_frame(frame: &[u8]) -> Result<ContentPackage, StorageError> {
+    if frame.len() < 16 || &frame[..8] != PACKAGE_FRAME_MAGIC {
+        return Err(StorageError::InvalidPackage);
+    }
+    let manifest_len = u32::from_be_bytes(
+        frame[8..12]
+            .try_into()
+            .map_err(|_| StorageError::InvalidPackage)?,
+    ) as usize;
+    if manifest_len == 0 || manifest_len > MAX_MANIFEST_FRAME_BYTES {
+        return Err(StorageError::InvalidPackage);
+    }
+    let manifest_end = 12usize
+        .checked_add(manifest_len)
+        .ok_or(StorageError::InvalidPackage)?;
+    let count_end = manifest_end
+        .checked_add(4)
+        .ok_or(StorageError::InvalidPackage)?;
+    let manifest_bytes = frame
+        .get(12..manifest_end)
+        .ok_or(StorageError::InvalidPackage)?;
+    let manifest = EncryptedFileManifest::parse_canonical(manifest_bytes)
+        .map_err(|_| StorageError::InvalidPackage)?;
+
+    let chunk_count = u32::from_be_bytes(
+        frame
+            .get(manifest_end..count_end)
+            .ok_or(StorageError::InvalidPackage)?
+            .try_into()
+            .map_err(|_| StorageError::InvalidPackage)?,
+    ) as usize;
+    if chunk_count != manifest.chunks().len() {
+        return Err(StorageError::InvalidPackage);
+    }
+
+    let mut cursor = count_end;
+    let mut chunks = Vec::with_capacity(chunk_count);
+    for expected_ref in manifest.chunks() {
+        let header_end = cursor.checked_add(12).ok_or(StorageError::InvalidPackage)?;
+        let header = frame
+            .get(cursor..header_end)
+            .ok_or(StorageError::InvalidPackage)?;
+        let index = u32::from_be_bytes(
+            header[0..4]
+                .try_into()
+                .map_err(|_| StorageError::InvalidPackage)?,
+        );
+        let declared_len = u64::from_be_bytes(
+            header[4..12]
+                .try_into()
+                .map_err(|_| StorageError::InvalidPackage)?,
+        );
+        let byte_len = usize::try_from(declared_len).map_err(|_| StorageError::InvalidPackage)?;
+        let data_end = header_end
+            .checked_add(byte_len)
+            .ok_or(StorageError::InvalidPackage)?;
+        let chunk_bytes = frame
+            .get(header_end..data_end)
+            .ok_or(StorageError::InvalidPackage)?;
+        if index != expected_ref.index() || declared_len != expected_ref.ciphertext_bytes() {
+            return Err(StorageError::InvalidPackage);
+        }
+        let actual_cid =
+            raw_sha256_cid(chunk_bytes).map_err(|_| StorageError::IntegrityCheckFailed)?;
+        if actual_cid != *expected_ref.cid() {
+            return Err(StorageError::IntegrityCheckFailed);
+        }
+        chunks.push(ContentChunk::new(
+            index,
+            declared_len,
+            Box::pin(Cursor::new(chunk_bytes.to_vec())) as StorageReader,
+        ));
+        cursor = data_end;
+    }
+    if cursor != frame.len() {
+        return Err(StorageError::InvalidPackage);
+    }
+    ContentPackage::new(manifest, chunks)
+}
+
+#[cfg(test)]
+mod tests {
+    use crypto::{EncryptedChunkRef, NoncePrefix};
+    use domain::{EpochId, FileId, ManifestHash, VersionNumber};
+
+    use super::*;
+
+    #[tokio::test]
+    async fn content_package_frame_round_trips_and_rejects_tamper_or_trailing_bytes() {
+        let chunk_data = vec![0x5a; 48];
+        let chunk_cid = raw_sha256_cid(&chunk_data).unwrap();
+        let manifest = EncryptedFileManifest::new(
+            FileId::from_bytes([0x11; 32]),
+            VersionNumber::ONE,
+            ManifestHash::ZERO,
+            EpochId::from_bytes([0x22; 32]),
+            NoncePrefix::from_bytes([0x33; 8]),
+            64,
+            vec![EncryptedChunkRef::new(1, chunk_cid, chunk_data.len() as u64).unwrap()],
+            None,
+        )
+        .unwrap();
+        let pkg = ContentPackage::new(
+            manifest.clone(),
+            vec![ContentChunk::new(
+                1,
+                chunk_data.len() as u64,
+                Box::pin(Cursor::new(chunk_data.clone())) as StorageReader,
+            )],
+        )
+        .unwrap();
+
+        let frame = encode_content_package_frame(pkg, 1024 * 1024)
+            .await
+            .unwrap();
+        let decoded = decode_content_package_frame(&frame).unwrap();
+        assert_eq!(decoded.manifest(), &manifest);
+        assert_eq!(decoded.chunks().len(), 1);
+
+        // Tampered chunk fails CID integrity check.
+        let mut tampered = frame.clone();
+        let last = tampered.len() - 1;
+        tampered[last] ^= 0xff;
+        assert_eq!(
+            decode_content_package_frame(&tampered).err(),
+            Some(StorageError::IntegrityCheckFailed)
+        );
+
+        // Trailing garbage rejected.
+        let mut trailing = frame;
+        trailing.push(0x00);
+        assert_eq!(
+            decode_content_package_frame(&trailing).err(),
+            Some(StorageError::InvalidPackage)
+        );
+
+        // Plaintext / wrong magic rejected.
+        assert_eq!(
+            decode_content_package_frame(b"not-an-encrypted-package").err(),
+            Some(StorageError::InvalidPackage)
+        );
+    }
 }

@@ -984,6 +984,10 @@ async fn project_event_inner(
         "ReadAccessGranted" | "ReadAccessRevoked" | "WriteAccessGranted" | "WriteAccessRevoked" => {
             let permission: i16 = if event_name.starts_with("Read") { 0 } else { 1 };
             let granted = event_name.ends_with("Granted");
+            let file_id = field_string(fields, "file_id")?;
+            let member_id = field_string(fields, "member_id")?;
+            let actor = field_string(fields, "actor")?;
+            let proposal_id = field_string(fields, "proposal_id")?;
             sqlx::query(
                 "INSERT INTO access_projection \
                  (file_id, member_id, permission, granted, actor, proposal_id, updated_block_number) \
@@ -991,16 +995,34 @@ async fn project_event_inner(
                  DO UPDATE SET granted = EXCLUDED.granted, actor = EXCLUDED.actor, \
                  proposal_id = EXCLUDED.proposal_id, updated_block_number = EXCLUDED.updated_block_number",
             )
-            .bind(field_string(fields, "file_id")?)
-            .bind(field_string(fields, "member_id")?)
+            .bind(file_id)
+            .bind(member_id)
             .bind(permission)
             .bind(granted)
-            .bind(field_string(fields, "actor")?)
-            .bind(field_string(fields, "proposal_id")?)
+            .bind(actor)
+            .bind(proposal_id)
             .bind(block_number)
             .execute(&mut **transaction)
             .await
             .map_err(|_| IndexerError::Database)?;
+
+            // Mirrors AccessGovernance.setFilePermission: revoking file-level Read
+            // invalidates all prior version-scoped historical grants for that member/file.
+            if event_name == "ReadAccessRevoked" {
+                sqlx::query(
+                    "UPDATE historical_read_access_projection \
+                     SET granted = FALSE, actor = $3, proposal_id = $4, updated_block_number = $5 \
+                     WHERE file_id = $1 AND member_id = $2 AND granted = TRUE",
+                )
+                .bind(file_id)
+                .bind(member_id)
+                .bind(actor)
+                .bind(proposal_id)
+                .bind(block_number)
+                .execute(&mut **transaction)
+                .await
+                .map_err(|_| IndexerError::Database)?;
+            }
         }
         "HistoricalReadAccessGranted" | "HistoricalReadAccessRevoked" => {
             let granted = event_name == "HistoricalReadAccessGranted";
@@ -1027,9 +1049,9 @@ async fn project_event_inner(
             sqlx::query(
                 "INSERT INTO envelope_sets_projection \
                  (file_id, version_number, epoch_id, envelope_set_cid, revision, updated_block_number) \
-                 VALUES ($1,$2,$3,$4,0,$5) ON CONFLICT (file_id, version_number) DO UPDATE SET \
+                 VALUES ($1,$2,$3,$4,1,$5) ON CONFLICT (file_id, version_number) DO UPDATE SET \
                  epoch_id = EXCLUDED.epoch_id, envelope_set_cid = EXCLUDED.envelope_set_cid, \
-                 revision = 0, updated_block_number = EXCLUDED.updated_block_number",
+                 revision = 1, updated_block_number = EXCLUDED.updated_block_number",
             )
             .bind(field_string(fields, "file_id")?)
             .bind(field_i64(fields, "version_number")?)
@@ -1280,7 +1302,7 @@ mod tests {
                 topic_word(&member_id[2..]),
             ],
             &format!(
-                "{}{}",
+                "0x{}{}",
                 format_args!("{}{}", "00".repeat(12), "55".repeat(20)),
                 "aa".repeat(32)
             ),

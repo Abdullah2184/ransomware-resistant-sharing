@@ -38,12 +38,21 @@ macro_rules! bytes32_identifier {
 }
 
 bytes32_identifier!(FileId);
+bytes32_identifier!(FolderId);
 bytes32_identifier!(MemberId);
 bytes32_identifier!(OrganizationId);
 bytes32_identifier!(EpochId);
 bytes32_identifier!(ManifestHash);
 bytes32_identifier!(ProposalId);
 bytes32_identifier!(OperationNonce);
+
+impl FolderId {
+    pub const ROOT: Self = Self([0; 32]);
+
+    pub fn is_root(&self) -> bool {
+        self.0 == [0; 32]
+    }
+}
 
 impl ManifestHash {
     pub const ZERO: Self = Self([0; 32]);

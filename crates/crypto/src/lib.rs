@@ -9,13 +9,16 @@ pub mod signing;
 
 pub use encryption::{
     ChunkDecryptor, ChunkEncryptor, CryptoError, DEFAULT_CHUNK_SIZE_BYTES, DataEncryptionKey,
-    EncryptedChunk, EncryptionContext, chunk_count_for_len,
+    EncryptedChunk, EncryptionContext, chunk_count_for_len, decrypt_private_metadata,
+    encrypt_private_metadata,
 };
 pub use envelope_set::{KeyEnvelopeEntry, KeyEnvelopeSet, MAX_ENVELOPE_SET_ENTRIES};
 pub use key_wrapping::{HpkeRecipientKeyPair, HpkeRecipientPublicKey, KeyEnvelope, WrapContext};
-pub use manifest::{EncryptedChunkRef, EncryptedFileManifest, PrivateMetadataCiphertext};
+pub use manifest::{
+    EncryptedChunkRef, EncryptedFileManifest, PrivateMetadataCiphertext, raw_sha256_cid,
+};
 pub use nonce::NoncePrefix;
 pub use signing::{
-    AccessLookup, ChainId, Eip712Domain, EnvelopeSetUpdate, MemberKeyProof, SigningError,
-    TypedDigest, UnixDeadline, VerifyingContractKind, VersionAppend,
+    AccessLookup, ChainId, Eip712Domain, EnvelopeSetUpdate, LoginChallengeDigestInput,
+    MemberKeyProof, SigningError, TypedDigest, UnixDeadline, VerifyingContractKind, VersionAppend,
 };
