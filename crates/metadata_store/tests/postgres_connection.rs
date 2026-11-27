@@ -1,14 +1,10 @@
 use metadata_store::{MetadataStoreError, MigrationMode, PostgresPoolConfig, PostgresStore};
 
 #[tokio::test]
+#[ignore = "requires DATABASE_URL (PostgreSQL)"]
 async fn migrates_metadata_schema_and_verifies_all_tables_indexes_and_triggers() {
-    let database_url = match std::env::var("DATABASE_URL") {
-        Ok(url) => url,
-        Err(_) => {
-            eprintln!("Skipping PostgreSQL integration test: DATABASE_URL is not set.");
-            return;
-        }
-    };
+    let database_url = std::env::var("DATABASE_URL")
+        .expect("DATABASE_URL must be set when running ignored PostgreSQL tests");
 
     let store = PostgresStore::connect_with_config(&database_url, PostgresPoolConfig::default())
         .await
@@ -118,16 +114,12 @@ async fn migrates_metadata_schema_and_verifies_all_tables_indexes_and_triggers()
 }
 
 #[tokio::test]
+#[ignore = "requires DATABASE_GATEWAY_URL and DATABASE_INDEXER_URL (PostgreSQL)"]
 async fn least_privilege_roles_enforce_gateway_and_indexer_trust_boundaries() {
-    let (Ok(gateway_url), Ok(indexer_url)) = (
-        std::env::var("DATABASE_GATEWAY_URL"),
-        std::env::var("DATABASE_INDEXER_URL"),
-    ) else {
-        eprintln!(
-            "Skipping least-privilege PostgreSQL RBAC test: DATABASE_GATEWAY_URL / DATABASE_INDEXER_URL not set."
-        );
-        return;
-    };
+    let gateway_url = std::env::var("DATABASE_GATEWAY_URL")
+        .expect("DATABASE_GATEWAY_URL must be set when running ignored RBAC PostgreSQL tests");
+    let indexer_url = std::env::var("DATABASE_INDEXER_URL")
+        .expect("DATABASE_INDEXER_URL must be set when running ignored RBAC PostgreSQL tests");
 
     let gateway = PostgresStore::connect(&gateway_url)
         .await

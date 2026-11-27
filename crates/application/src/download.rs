@@ -173,23 +173,9 @@ where
             })
             .ok_or(DomainError::Unauthorized)?;
 
-        let wrap_context = WrapContext::new(
-            access.file_id,
-            access.version_number,
-            access.epoch_id,
-            identity.member_id,
-            identity.encryption_key_version,
-        );
-        let dek_secret = self
-            .custody
-            .unwrap_dek(
-                &identity.encryption_key_id,
-                recipient_entry.envelope(),
-                wrap_context,
-            )
-            .await
-            .map_err(map_unwrap_custody_error)?;
-
+        // Verify the untrusted manifest, manifest hash, chunk layout, and every
+        // chunk CID BEFORE invoking key custody so corrupted packages never
+        // unwrap a DEK into client memory (§5.5, §9.3, §14).
         let manifest = EncryptedFileManifest::parse_canonical(&package.manifest_bytes)
             .map_err(|_| DomainError::InvalidManifest)?;
         if manifest.file_id() != access.file_id
@@ -212,6 +198,20 @@ where
         if package.chunks.len() != manifest.chunks().len() {
             return Err(DomainError::IntegrityCheckFailed);
         }
+        for (manifest_chunk, (chunk_index, chunk_bytes)) in
+            manifest.chunks().iter().zip(&package.chunks)
+        {
+            if *chunk_index != manifest_chunk.index()
+                || u64::try_from(chunk_bytes.len()).ok() != Some(manifest_chunk.ciphertext_bytes())
+            {
+                return Err(DomainError::IntegrityCheckFailed);
+            }
+            let actual_cid =
+                raw_sha256_cid(chunk_bytes).map_err(|_| DomainError::IntegrityCheckFailed)?;
+            if actual_cid != *manifest_chunk.cid() {
+                return Err(DomainError::IntegrityCheckFailed);
+            }
+        }
 
         let context = EncryptionContext::new(
             manifest.file_id(),
@@ -220,6 +220,23 @@ where
         );
         let chunk_size = usize::try_from(manifest.chunk_size_bytes())
             .map_err(|_| DomainError::InvalidManifest)?;
+
+        let wrap_context = WrapContext::new(
+            access.file_id,
+            access.version_number,
+            access.epoch_id,
+            identity.member_id,
+            identity.encryption_key_version,
+        );
+        let dek_secret = self
+            .custody
+            .unwrap_dek(
+                &identity.encryption_key_id,
+                recipient_entry.envelope(),
+                wrap_context,
+            )
+            .await
+            .map_err(map_unwrap_custody_error)?;
 
         let dek = DataEncryptionKey::from_secret(dek_secret);
         let private_metadata = manifest
@@ -246,19 +263,7 @@ where
         .map_err(|_| DomainError::InvalidManifest)?;
 
         let mut plaintext = Zeroizing::new(Vec::new());
-        for (manifest_chunk, (chunk_index, chunk_bytes)) in
-            manifest.chunks().iter().zip(&package.chunks)
-        {
-            if *chunk_index != manifest_chunk.index()
-                || u64::try_from(chunk_bytes.len()).ok() != Some(manifest_chunk.ciphertext_bytes())
-            {
-                return Err(DomainError::IntegrityCheckFailed);
-            }
-            let actual_cid =
-                raw_sha256_cid(chunk_bytes).map_err(|_| DomainError::IntegrityCheckFailed)?;
-            if actual_cid != *manifest_chunk.cid() {
-                return Err(DomainError::IntegrityCheckFailed);
-            }
+        for (chunk_index, chunk_bytes) in &package.chunks {
             let chunk = build_encrypted_chunk(*chunk_index, chunk_bytes.clone());
             let decrypted = decryptor
                 .decrypt_next(&chunk)

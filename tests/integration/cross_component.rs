@@ -640,7 +640,7 @@ async fn upload_service_integrates_scanner_kubo_failover_and_relayed_type2_ledge
             format!("http://{bad_kubo_addr}"),
             format!("http://{good_kubo_addr}"),
         ],
-        cluster_api_url: format!("http://{cluster_addr}"),
+        cluster_api_urls: vec![format!("http://{cluster_addr}")],
         cluster_credentials: ClusterCredentials::new("rrfs-admin", "test-secret"),
         request_timeout: Duration::from_secs(3),
         replication_timeout: Duration::from_secs(3),
@@ -786,4 +786,463 @@ fn schemas_and_cross_language_crypto_fixtures_enforce_strict_contracts() {
     assert_eq!(hpke["suite"]["kemId"], 32);
     assert_eq!(hpke["suite"]["kdfId"], 1);
     assert_eq!(hpke["suite"]["aeadId"], 2);
+}
+
+#[tokio::test]
+#[ignore = "requires running local Kubo (2 peers) and IPFS Cluster services"]
+async fn live_dual_node_ipfs_application_upload_share_download_and_negative_access() {
+    use std::{
+        collections::BTreeMap,
+        env,
+        path::Path,
+        sync::{Arc, Mutex},
+        time::Duration,
+    };
+
+    use application::{
+        DownloadConfig, DownloadService, EncryptedPackageBytes, ShareConfig, ShareService,
+        UploadConfig, UploadService,
+    };
+    use crypto::{DEFAULT_CHUNK_SIZE_BYTES, extract_verified_car_package};
+    use domain::{
+        AccessReference, DomainError, EvmAddress, FileId, FileStatus, FolderId, KeyVersion,
+        ManifestHash, MemberId, MemberStatus, OrganizationId, ProposalId, PublicMemberIdentity,
+        TransactionReceipt, VersionNumber,
+    };
+    use ipfs_adapter::{ClusterCredentials, IpfsClusterStore, IpfsConfig};
+    use key_custody::DevelopmentKeyCustody;
+    use ports::{
+        BlobStore, Clock, HeadState, KeyCustodyProvider, LedgerPort, PortFuture,
+        SignedAccessLookupRequest, SignedAppendVersionRequest, SignedCreateFileRequest,
+        SignedEnvelopeUpdateRequest,
+    };
+    use tokio::io::AsyncReadExt;
+
+    let kubo_urls: Vec<String> = env::var("IPFS_API_URLS")
+        .expect("set IPFS_API_URLS with two Kubo peers (e.g. from .env)")
+        .split(',')
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(str::to_owned)
+        .collect();
+    assert!(kubo_urls.len() >= 2, "two Kubo endpoints required");
+    let cluster_urls: Vec<String> = env::var("IPFS_CLUSTER_API_URLS")
+        .or_else(|_| env::var("IPFS_CLUSTER_API_URL"))
+        .expect("set IPFS_CLUSTER_API_URL(S)")
+        .split(',')
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(str::to_owned)
+        .collect();
+    let username = env::var("IPFS_CLUSTER_USERNAME").expect("set IPFS_CLUSTER_USERNAME");
+    let raw_pw_path =
+        env::var("IPFS_CLUSTER_PASSWORD_FILE").expect("set IPFS_CLUSTER_PASSWORD_FILE");
+    let pw_path = if Path::new(&raw_pw_path).is_file() {
+        Path::new(&raw_pw_path).to_path_buf()
+    } else {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join(&raw_pw_path)
+    };
+    let password = std::fs::read_to_string(&pw_path)
+        .expect("read Cluster password file")
+        .trim_end()
+        .to_owned();
+
+    let make_kubo_store = |url: String| {
+        Arc::new(
+            IpfsClusterStore::new(IpfsConfig {
+                kubo_api_urls: vec![url],
+                cluster_api_urls: cluster_urls.clone(),
+                cluster_credentials: ClusterCredentials::new(username.clone(), password.clone()),
+                request_timeout: Duration::from_secs(120),
+                replication_timeout: Duration::from_secs(120),
+                replication_poll_interval: Duration::from_millis(500),
+                max_upload_bytes: 128 * 1024 * 1024,
+            })
+            .unwrap(),
+        )
+    };
+    let kubo1 = make_kubo_store(kubo_urls[0].clone());
+    let kubo2 = make_kubo_store(kubo_urls[1].clone());
+
+    #[derive(Clone)]
+    struct SharedStore(Arc<IpfsClusterStore>);
+    impl BlobStore for SharedStore {
+        fn put_content<'a>(
+            &'a self,
+            package: ports::ContentPackage,
+            min_replicas: usize,
+        ) -> ports::StorageFuture<'a, ports::StoredContent> {
+            self.0.put_content(package, min_replicas)
+        }
+        fn put_envelope_set<'a>(
+            &'a self,
+            reader: ports::StorageReader,
+            byte_length: u64,
+            min_replicas: usize,
+        ) -> ports::StorageFuture<'a, ports::StoredEnvelopeSet> {
+            self.0.put_envelope_set(reader, byte_length, min_replicas)
+        }
+        fn get_content<'a>(
+            &'a self,
+            cid: &'a domain::ContentCid,
+        ) -> ports::StorageFuture<'a, ports::StorageReader> {
+            self.0.get_content(cid)
+        }
+        fn get_envelope_set<'a>(
+            &'a self,
+            cid: &'a domain::EnvelopeSetCid,
+        ) -> ports::StorageFuture<'a, ports::StorageReader> {
+            self.0.get_envelope_set(cid)
+        }
+        fn ensure_replication<'a>(
+            &'a self,
+            cid: ports::StorageCid,
+            min_replicas: usize,
+        ) -> ports::StorageFuture<'a, ports::ReplicationReceipt> {
+            self.0.ensure_replication(cid, min_replicas)
+        }
+        fn verify_retrievable<'a>(
+            &'a self,
+            cid: ports::StorageCid,
+        ) -> ports::StorageFuture<'a, ()> {
+            self.0.verify_retrievable(cid)
+        }
+    }
+
+    #[derive(Clone)]
+    struct FixedClock(u64);
+    impl Clock for FixedClock {
+        fn now_unix_seconds(&self) -> Result<u64, DomainError> {
+            Ok(self.0)
+        }
+    }
+
+    #[derive(Clone)]
+    struct StoredVer {
+        manifest_hash: ManifestHash,
+        content_cid: domain::ContentCid,
+        envelope_set_cid: domain::EnvelopeSetCid,
+        epoch_id: domain::EpochId,
+        revision: u32,
+    }
+    #[derive(Default)]
+    struct MemLedgerState {
+        members: BTreeMap<MemberId, PublicMemberIdentity>,
+        heads: BTreeMap<FileId, HeadState>,
+        versions: BTreeMap<(FileId, u64), StoredVer>,
+        read_acl: BTreeMap<(FileId, MemberId), bool>,
+        block: u64,
+    }
+    #[derive(Clone, Default)]
+    struct MemLedger(Arc<Mutex<MemLedgerState>>);
+    impl LedgerPort for MemLedger {
+        fn get_member(&self, member_id: MemberId) -> PortFuture<'_, Option<PublicMemberIdentity>> {
+            Box::pin(async move { Ok(self.0.lock().unwrap().members.get(&member_id).cloned()) })
+        }
+        fn get_file_head(&self, file_id: FileId) -> PortFuture<'_, Option<HeadState>> {
+            Box::pin(async move { Ok(self.0.lock().unwrap().heads.get(&file_id).cloned()) })
+        }
+        fn authorize_read<'a>(
+            &'a self,
+            req: &'a SignedAccessLookupRequest,
+        ) -> PortFuture<'a, AccessReference> {
+            Box::pin(async move {
+                let st = self.0.lock().unwrap();
+                let member = st
+                    .members
+                    .get(&req.member_id)
+                    .ok_or(DomainError::Unauthorized)?;
+                if !member.is_active() {
+                    return Err(DomainError::MemberSuspended);
+                }
+                if !st
+                    .read_acl
+                    .get(&(req.file_id, req.member_id))
+                    .copied()
+                    .unwrap_or(false)
+                {
+                    return Err(DomainError::Unauthorized);
+                }
+                let ver = st
+                    .versions
+                    .get(&(req.file_id, req.version_number.get()))
+                    .ok_or(DomainError::Unauthorized)?;
+                Ok(AccessReference {
+                    file_id: req.file_id,
+                    version_number: req.version_number,
+                    manifest_hash: ver.manifest_hash,
+                    content_cid: ver.content_cid.clone(),
+                    envelope_set_cid: ver.envelope_set_cid.clone(),
+                    epoch_id: ver.epoch_id,
+                    envelope_revision: ver.revision,
+                    finalized_block: st.block,
+                })
+            })
+        }
+        fn create_file<'a>(
+            &'a self,
+            req: &'a SignedCreateFileRequest,
+        ) -> PortFuture<'a, TransactionReceipt> {
+            Box::pin(async move {
+                let mut st = self.0.lock().unwrap();
+                st.block += 1;
+                let block = st.block;
+                st.heads.insert(
+                    req.file_id,
+                    HeadState {
+                        file_id: req.file_id,
+                        status: FileStatus::Active,
+                        current_version: req.version_number,
+                        current_head_manifest_hash: req.manifest_hash,
+                    },
+                );
+                st.versions.insert(
+                    (req.file_id, req.version_number.get()),
+                    StoredVer {
+                        manifest_hash: req.manifest_hash,
+                        content_cid: req.content_cid.clone(),
+                        envelope_set_cid: req.envelope_set_cid.clone(),
+                        epoch_id: req.epoch_id,
+                        revision: 1,
+                    },
+                );
+                st.read_acl
+                    .insert((req.file_id, req.author_member_id), true);
+                Ok(TransactionReceipt {
+                    transaction_hash: [0xaa; 32],
+                    block_number: block,
+                    finalized: true,
+                    succeeded: true,
+                })
+            })
+        }
+        fn append_version<'a>(
+            &'a self,
+            _req: &'a SignedAppendVersionRequest,
+        ) -> PortFuture<'a, TransactionReceipt> {
+            Box::pin(async { Err(DomainError::Internal) })
+        }
+        fn update_envelope_set<'a>(
+            &'a self,
+            req: &'a SignedEnvelopeUpdateRequest,
+        ) -> PortFuture<'a, TransactionReceipt> {
+            Box::pin(async move {
+                let mut st = self.0.lock().unwrap();
+                st.block += 1;
+                let block = st.block;
+                let ver = st
+                    .versions
+                    .get_mut(&(req.file_id, req.version_number.get()))
+                    .ok_or(DomainError::ContractRejected)?;
+                ver.envelope_set_cid = req.new_envelope_set_cid.clone();
+                ver.revision += 1;
+                Ok(TransactionReceipt {
+                    transaction_hash: [0xbb; 32],
+                    block_number: block,
+                    finalized: true,
+                    succeeded: true,
+                })
+            })
+        }
+    }
+
+    async fn make_member(seed: u8) -> (Arc<DevelopmentKeyCustody>, PublicMemberIdentity) {
+        let id = MemberId::from_bytes([seed; 32]);
+        let custody = Arc::new(
+            DevelopmentKeyCustody::generate(
+                id,
+                KeyVersion::new(1).unwrap(),
+                KeyVersion::new(1).unwrap(),
+            )
+            .unwrap(),
+        );
+        let pub_keys = custody.public_identity().await.unwrap();
+        let mut enc_key = [0u8; 32];
+        enc_key.copy_from_slice(&pub_keys.encryption_public_key.to_bytes());
+        let identity = PublicMemberIdentity {
+            member_id: id,
+            organization_id: OrganizationId::from_bytes([1; 32]),
+            signing_address: pub_keys.signing_address,
+            signing_key_version: pub_keys.signing_key_version,
+            encryption_key_version: pub_keys.encryption_key_version,
+            encryption_public_key: enc_key,
+            status: MemberStatus::Active,
+            finalized_block: 1,
+        };
+        (custody, identity)
+    }
+
+    let (alice_custody, alice) = make_member(0x81).await;
+    let (bob_custody, bob) = make_member(0x82).await;
+    let (charlie_custody, charlie) = make_member(0x83).await;
+    let ledger = MemLedger::default();
+    for member in [&alice, &bob, &charlie] {
+        ledger
+            .0
+            .lock()
+            .unwrap()
+            .members
+            .insert(member.member_id, member.clone());
+    }
+
+    // Alice uploads a multi-chunk (> 1 MiB) encrypted file strictly through Kubo node 1!
+    let alice_upload_kubo1 = UploadService::new(
+        alice_custody.clone(),
+        SharedStore(kubo1.clone()),
+        ledger.clone(),
+        FixedClock(1_800_000_000),
+        UploadConfig {
+            chain_id: 1337,
+            file_registry: EvmAddress::from_bytes([0x11; 20]),
+            min_pin_replicas: 2,
+            chunk_size_bytes: DEFAULT_CHUNK_SIZE_BYTES,
+            max_file_bytes: 16 * 1024 * 1024,
+            operation_ttl_seconds: 120,
+        },
+    );
+    let mut plaintext = vec![0u8; DEFAULT_CHUNK_SIZE_BYTES + 2048];
+    for (idx, b) in plaintext.iter_mut().enumerate() {
+        *b = ((idx * 17 + 5) % 251) as u8;
+    }
+    let receipt = alice_upload_kubo1
+        .create_file(
+            None,
+            "dual-node-live.bin".to_owned(),
+            FolderId::ROOT,
+            &plaintext,
+            Some(b"live-confidential-title.pdf"),
+            &[],
+        )
+        .await
+        .expect("upload via Kubo 1 with 2-peer Cluster quorum");
+    assert_eq!(receipt.content_replication.pinned_peers.len(), 2);
+    assert_eq!(receipt.envelope_replication.pinned_peers.len(), 2);
+
+    // Alice downloads strictly from Kubo node 2, extracts via production CARv1 verifier, and decrypts!
+    let alice_download_kubo2 = DownloadService::new(
+        alice_custody.clone(),
+        SharedStore(kubo2.clone()),
+        ledger.clone(),
+        FixedClock(1_800_000_010),
+        DownloadConfig {
+            chain_id: 1337,
+            access_governance: EvmAddress::from_bytes([0x22; 20]),
+            operation_ttl_seconds: 120,
+        },
+    );
+    let access = alice_download_kubo2
+        .authorize_version(receipt.file_id, VersionNumber::ONE)
+        .await
+        .unwrap();
+    let mut car_from_kubo2 = Vec::new();
+    kubo2
+        .get_content(&access.content_cid)
+        .await
+        .expect("dag/export from Kubo 2")
+        .read_to_end(&mut car_from_kubo2)
+        .await
+        .unwrap();
+    let verified_car = extract_verified_car_package(&car_from_kubo2, &access)
+        .expect("production CARv1 2-level UnixFS verification on real Kubo 2 export");
+    let pkg = EncryptedPackageBytes {
+        manifest_bytes: verified_car.manifest_bytes,
+        chunks: verified_car.chunks,
+    };
+    let decrypted = alice_download_kubo2
+        .decrypt_authorized_package(access.clone(), Some(receipt.manifest_hash), &pkg)
+        .await
+        .unwrap();
+    assert_eq!(decrypted.plaintext.as_slice(), plaintext.as_slice());
+    assert_eq!(
+        decrypted.private_metadata.as_deref().map(Vec::as_slice),
+        Some(b"live-confidential-title.pdf".as_slice())
+    );
+
+    // Share V1 to Bob via Kubo node 2 without re-encrypting ciphertext; Bob retrieves from Kubo node 1!
+    ledger
+        .0
+        .lock()
+        .unwrap()
+        .read_acl
+        .insert((receipt.file_id, bob.member_id), true);
+    let alice_share_kubo2 = ShareService::new(
+        alice_custody,
+        SharedStore(kubo2.clone()),
+        ledger.clone(),
+        FixedClock(1_800_000_020),
+        ShareConfig {
+            chain_id: 1337,
+            access_governance: EvmAddress::from_bytes([0x22; 20]),
+            min_pin_replicas: 2,
+            operation_ttl_seconds: 120,
+        },
+    );
+    let share_receipt = alice_share_kubo2
+        .share_version_envelope(&access, bob.member_id, ProposalId::from_bytes([0x77; 32]))
+        .await
+        .expect("share envelope uploaded via Kubo 2 and pinned on both peers");
+    assert_eq!(share_receipt.new_revision, 2);
+
+    let bob_download_kubo1 = DownloadService::new(
+        bob_custody,
+        SharedStore(kubo1.clone()),
+        ledger.clone(),
+        FixedClock(1_800_000_030),
+        DownloadConfig {
+            chain_id: 1337,
+            access_governance: EvmAddress::from_bytes([0x22; 20]),
+            operation_ttl_seconds: 120,
+        },
+    );
+    let bob_access = bob_download_kubo1
+        .authorize_version(receipt.file_id, VersionNumber::ONE)
+        .await
+        .unwrap();
+    let mut car_from_kubo1 = Vec::new();
+    kubo1
+        .get_content(&bob_access.content_cid)
+        .await
+        .expect("dag/export from Kubo 1")
+        .read_to_end(&mut car_from_kubo1)
+        .await
+        .unwrap();
+    let bob_verified_car = extract_verified_car_package(&car_from_kubo1, &bob_access).unwrap();
+    let bob_pkg = EncryptedPackageBytes {
+        manifest_bytes: bob_verified_car.manifest_bytes,
+        chunks: bob_verified_car.chunks,
+    };
+    let bob_decrypted = bob_download_kubo1
+        .decrypt_authorized_package(bob_access.clone(), Some(receipt.manifest_hash), &bob_pkg)
+        .await
+        .unwrap();
+    assert_eq!(bob_decrypted.plaintext.as_slice(), plaintext.as_slice());
+
+    // Negative / insecure access: unauthorized Charlie fails closed on authorize_version AND decrypt even if handed Bob's AccessReference & live CAR!
+    let charlie_download_kubo1 = DownloadService::new(
+        charlie_custody,
+        SharedStore(kubo1),
+        ledger,
+        FixedClock(1_800_000_040),
+        DownloadConfig {
+            chain_id: 1337,
+            access_governance: EvmAddress::from_bytes([0x22; 20]),
+            operation_ttl_seconds: 120,
+        },
+    );
+    assert_eq!(
+        charlie_download_kubo1
+            .authorize_version(receipt.file_id, VersionNumber::ONE)
+            .await
+            .err(),
+        Some(DomainError::Unauthorized)
+    );
+    assert_eq!(
+        charlie_download_kubo1
+            .decrypt_authorized_package(bob_access, None, &bob_pkg)
+            .await
+            .err(),
+        Some(DomainError::Unauthorized)
+    );
 }

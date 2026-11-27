@@ -922,38 +922,11 @@ fn tuple_word_offset(base: usize, index: usize) -> Result<usize, ChainError> {
 }
 
 pub fn decode_hex(value: &str) -> Result<Vec<u8>, ChainError> {
-    let digits = value
-        .strip_prefix("0x")
-        .ok_or(ChainError::InvalidResponse)?;
-    if digits.len() % 2 != 0 {
-        return Err(ChainError::InvalidResponse);
-    }
-    let mut output = Vec::with_capacity(digits.len() / 2);
-    for pair in digits.as_bytes().as_chunks::<2>().0 {
-        let high = hex_nibble(pair[0]).ok_or(ChainError::InvalidResponse)?;
-        let low = hex_nibble(pair[1]).ok_or(ChainError::InvalidResponse)?;
-        output.push((high << 4) | low);
-    }
-    Ok(output)
+    domain::hex::decode_prefixed_hex(value).ok_or(ChainError::InvalidResponse)
 }
 
 pub(crate) fn encode_hex(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut output = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        output.push(char::from(HEX[usize::from(byte >> 4)]));
-        output.push(char::from(HEX[usize::from(byte & 0x0f)]));
-    }
-    output
-}
-
-fn hex_nibble(value: u8) -> Option<u8> {
-    match value {
-        b'0'..=b'9' => Some(value - b'0'),
-        b'a'..=b'f' => Some(value - b'a' + 10),
-        b'A'..=b'F' => Some(value - b'A' + 10),
-        _ => None,
-    }
+    domain::hex::encode_hex(bytes)
 }
 
 #[cfg(test)]

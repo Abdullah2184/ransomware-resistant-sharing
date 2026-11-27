@@ -112,12 +112,20 @@ impl KeyEnvelopeSet {
     }
 
     pub fn validate(&self) -> Result<(), CryptoError> {
-        if self.revision == 0 || self.envelopes.len() > MAX_ENVELOPE_SET_ENTRIES {
+        if self.file_id.as_bytes() == &[0; 32]
+            || self.epoch_id.as_bytes() == &[0; 32]
+            || self.revision == 0
+            || self.envelopes.is_empty()
+            || self.envelopes.len() > MAX_ENVELOPE_SET_ENTRIES
+        {
             return Err(CryptoError::InvalidEnvelopeSet);
         }
 
         let mut previous_member = None;
         for entry in &self.envelopes {
+            if entry.member_id.as_bytes() == &[0; 32] {
+                return Err(CryptoError::InvalidEnvelopeSet);
+            }
             if previous_member.is_some_and(|previous| previous >= entry.member_id) {
                 return Err(CryptoError::InvalidEnvelopeSet);
             }
@@ -225,17 +233,7 @@ struct EnvelopeEntryDto {
 }
 
 fn parse_bytes32(value: &str) -> Result<[u8; 32], CryptoError> {
-    let bytes = value
-        .strip_prefix("0x")
-        .filter(|value| value.len() == 64)
-        .ok_or(CryptoError::InvalidEnvelopeSet)?;
-    let mut output = [0; 32];
-    for (index, byte) in output.iter_mut().enumerate() {
-        let start = index * 2;
-        *byte = u8::from_str_radix(&bytes[start..start + 2], 16)
-            .map_err(|_| CryptoError::InvalidEnvelopeSet)?;
-    }
-    Ok(output)
+    domain::hex::parse_lowercase_fixed_hex::<32>(value).ok_or(CryptoError::InvalidEnvelopeSet)
 }
 
 fn decode_fixed<const N: usize>(value: &str) -> Result<Vec<u8>, CryptoError> {
@@ -390,6 +388,37 @@ mod tests {
 
         let mut dto: EnvelopeSetDto = serde_json::from_slice(&canonical).unwrap();
         dto.envelopes[0].wrapped_dek.push('=');
+        assert_eq!(
+            KeyEnvelopeSet::try_from(dto),
+            Err(CryptoError::InvalidEnvelopeSet)
+        );
+
+        // Empty envelopes, zero file/epoch/member IDs, and uppercase hex are rejected.
+        assert_eq!(set(Vec::new()), Err(CryptoError::InvalidEnvelopeSet));
+        assert_eq!(
+            KeyEnvelopeSet::new(
+                FileId::from_bytes([0; 32]),
+                VersionNumber::ONE,
+                EpochId::from_bytes([2; 32]),
+                1,
+                vec![entry(1)],
+            ),
+            Err(CryptoError::InvalidEnvelopeSet)
+        );
+        assert_eq!(
+            KeyEnvelopeSet::new(
+                FileId::from_bytes([1; 32]),
+                VersionNumber::ONE,
+                EpochId::from_bytes([0; 32]),
+                1,
+                vec![entry(1)],
+            ),
+            Err(CryptoError::InvalidEnvelopeSet)
+        );
+        assert_eq!(set(vec![entry(0)]), Err(CryptoError::InvalidEnvelopeSet));
+
+        let mut dto: EnvelopeSetDto = serde_json::from_slice(&canonical).unwrap();
+        dto.file_id = format!("0x{}", "AB".repeat(32));
         assert_eq!(
             KeyEnvelopeSet::try_from(dto),
             Err(CryptoError::InvalidEnvelopeSet)

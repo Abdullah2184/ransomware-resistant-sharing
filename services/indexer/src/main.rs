@@ -361,26 +361,11 @@ async fn reconcile_head(
 }
 
 fn parse_bytes32(value: &str) -> Result<[u8; 32], IndexerError> {
-    let digits = value.strip_prefix("0x").ok_or(IndexerError::InvalidRange)?;
-    if digits.len() != 64 {
-        return Err(IndexerError::InvalidRange);
-    }
-    let mut output = [0; 32];
-    for (index, pair) in digits.as_bytes().as_chunks::<2>().0.iter().enumerate() {
-        output[index] = (parse_hex_nibble(pair[0]).ok_or(IndexerError::InvalidRange)? << 4)
-            | parse_hex_nibble(pair[1]).ok_or(IndexerError::InvalidRange)?;
-    }
-    Ok(output)
+    domain::hex::parse_fixed_hex::<32>(value).ok_or(IndexerError::InvalidRange)
 }
 
 fn encode_hex(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut output = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        output.push(char::from(HEX[usize::from(byte >> 4)]));
-        output.push(char::from(HEX[usize::from(byte & 0x0f)]));
-    }
-    output
+    domain::hex::encode_hex(bytes)
 }
 
 fn parse_env_u64(name: &str, default: &str) -> Result<u64, IndexerError> {
@@ -392,31 +377,12 @@ fn parse_env_u64(name: &str, default: &str) -> Result<u64, IndexerError> {
 
 fn parse_address_env(name: &str) -> Result<EvmAddress, IndexerError> {
     let value = env::var(name).map_err(|_| IndexerError::InvalidConfiguration)?;
-    let digits = value
-        .strip_prefix("0x")
-        .ok_or(IndexerError::InvalidConfiguration)?;
-    if digits.len() != 40 {
-        return Err(IndexerError::InvalidConfiguration);
-    }
-    let mut bytes = [0; 20];
-    for (index, pair) in digits.as_bytes().as_chunks::<2>().0.iter().enumerate() {
-        let high = parse_hex_nibble(pair[0]).ok_or(IndexerError::InvalidConfiguration)?;
-        let low = parse_hex_nibble(pair[1]).ok_or(IndexerError::InvalidConfiguration)?;
-        bytes[index] = (high << 4) | low;
-    }
+    let bytes =
+        domain::hex::parse_fixed_hex::<20>(&value).ok_or(IndexerError::InvalidConfiguration)?;
     if bytes == [0; 20] {
         return Err(IndexerError::InvalidConfiguration);
     }
     Ok(EvmAddress::from_bytes(bytes))
-}
-
-fn parse_hex_nibble(value: u8) -> Option<u8> {
-    match value {
-        b'0'..=b'9' => Some(value - b'0'),
-        b'a'..=b'f' => Some(value - b'a' + 10),
-        b'A'..=b'F' => Some(value - b'A' + 10),
-        _ => None,
-    }
 }
 
 async fn read_checkpoint(
@@ -1129,15 +1095,9 @@ mod tests {
 
     static TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-    async fn integration_transaction()
-    -> Option<(PgPool, sqlx::Transaction<'static, sqlx::Postgres>)> {
-        let database_url = match env::var("DATABASE_URL") {
-            Ok(value) => value,
-            Err(_) => {
-                eprintln!("Skipping indexer PostgreSQL integration test: DATABASE_URL is not set");
-                return None;
-            }
-        };
+    async fn integration_transaction() -> (PgPool, sqlx::Transaction<'static, sqlx::Postgres>) {
+        let database_url = env::var("DATABASE_URL")
+            .expect("DATABASE_URL must be set when running ignored indexer PostgreSQL tests");
         let store = PostgresStore::connect(&database_url)
             .await
             .expect("connect to PostgreSQL for indexer integration test");
@@ -1152,7 +1112,7 @@ mod tests {
             .execute(&mut *transaction)
             .await
             .expect("serialize rollback-only indexer tests");
-        Some((pool, transaction))
+        (pool, transaction)
     }
 
     fn topic_word(value: &str) -> String {
@@ -1223,11 +1183,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires DATABASE_URL (PostgreSQL)"]
     async fn event_replay_is_idempotent_and_projection_rebuild_is_atomic() {
         let _guard = TEST_LOCK.lock().await;
-        let Some((pool, mut transaction)) = integration_transaction().await else {
-            return;
-        };
+        let (pool, mut transaction) = integration_transaction().await;
         let file_id = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         let organization_id = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
         let creator_id = "0xcccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
@@ -1363,6 +1322,19 @@ mod tests {
         assert_eq!(projected_head.0, 1);
         assert_eq!(projected_head.1.trim(), manifest_hash);
         assert_eq!(projected_head.2, "quarterly-report");
+        let projected_envelope: (String, i32) = sqlx::query_as(
+            "SELECT envelope_set_cid, revision FROM envelope_sets_projection \
+             WHERE file_id = $1 AND version_number = 1",
+        )
+        .bind(file_id)
+        .fetch_one(&mut *transaction)
+        .await
+        .expect("read envelope set projection");
+        assert_eq!(projected_envelope.0, envelope_cid);
+        assert_eq!(
+            projected_envelope.1, 1,
+            "EnvelopeSetInitialized must initialize revision to 1"
+        );
         let checkpoint_in_transaction: (i64, String) = sqlx::query_as(
             "SELECT block_number, block_hash FROM indexer_checkpoints WHERE chain_id = $1",
         )
@@ -1426,11 +1398,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires DATABASE_URL (PostgreSQL)"]
     async fn failed_event_decode_rolls_back_events_and_checkpoint() {
         let _guard = TEST_LOCK.lock().await;
-        let Some((pool, transaction)) = integration_transaction().await else {
-            return;
-        };
+        let (pool, transaction) = integration_transaction().await;
         let organization = log(
             "OrganizationRegistered(bytes32,address)",
             &[
@@ -1464,11 +1435,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires DATABASE_URL (PostgreSQL)"]
     async fn identity_and_key_projections_follow_registration_and_supersession_events() {
         let _guard = TEST_LOCK.lock().await;
-        let Some((_, mut transaction)) = integration_transaction().await else {
-            return;
-        };
+        let (_, mut transaction) = integration_transaction().await;
         let organization_id = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         let member_id = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
         let organization = log(
@@ -1592,11 +1562,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires DATABASE_URL (PostgreSQL)"]
     async fn read_revocation_invalidates_historical_grants_and_reindex_reset_clears_state() {
         let _guard = TEST_LOCK.lock().await;
-        let Some((pool, mut transaction)) = integration_transaction().await else {
-            return;
-        };
+        let (pool, mut transaction) = integration_transaction().await;
 
         let file_id = format!("0x{}", "88".repeat(32));
         let member_id = format!("0x{}", "77".repeat(32));
@@ -1704,9 +1673,42 @@ mod tests {
                 .unwrap();
         assert_eq!((events_left, checkpoint_left, hist_left), (0, 0, 0));
 
-        // Reconcile rejects missing on-chain file head (None -> ChainMismatch).
+        // Reconcile rejects missing on-chain file head (None -> ChainMismatch),
+        // and updates a 0x-prefixed files_projection row when given authoritative state.
         let missing_err = reconcile_head(&pool, &[0x88; 32], None, 31).await;
         assert!(matches!(missing_err, Err(IndexerError::ChainMismatch)));
+
+        let reconcile_id = [0x91u8; 32];
+        let reconcile_hex = format!("0x{}", encode_hex(&reconcile_id));
+        let manifest_hex = format!("0x{}", "cd".repeat(32));
+        reconcile_head(
+            &pool,
+            &reconcile_id,
+            Some(FileHeadState {
+                version_number: 3,
+                manifest_hash: manifest_hex.clone(),
+                status: 1,
+            }),
+            32,
+        )
+        .await
+        .expect("reconcile_head should upsert 0x-prefixed file_id");
+        let reconciled: (i64, String, i16) = sqlx::query_as(
+            "SELECT current_version, current_head_manifest_hash, file_status \
+             FROM files_projection WHERE file_id = $1",
+        )
+        .bind(&reconcile_hex)
+        .fetch_one(&pool)
+        .await
+        .expect("reconciled 0x-prefixed row must exist");
+        assert_eq!(reconciled.0, 3);
+        assert_eq!(reconciled.1.trim(), manifest_hex);
+        assert_eq!(reconciled.2, 1);
+        sqlx::query("DELETE FROM files_projection WHERE file_id = $1")
+            .bind(&reconcile_hex)
+            .execute(&pool)
+            .await
+            .expect("clean up reconciled probe row");
 
         transaction
             .rollback()

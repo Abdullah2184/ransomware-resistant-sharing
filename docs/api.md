@@ -135,8 +135,8 @@ Successful responses contain the content CID, current envelope-set CID,
 epoch ID, envelope revision, and finalized block number. CIDs are not access
 credentials. This route does not fetch or validate the envelope contents and
 does not stream ciphertext; a successful lookup therefore does not prove that
-the member has a usable envelope. End-to-end historical sharing and download
-remain incomplete.
+the member has a usable envelope until `GET /v1/files/{fileId}/versions/{version}/envelope`
+verifies a recipient entry for the caller's active encryption key version.
 
 File-level Read access covers the current head and future versions. Each
 non-head version requires an explicit `setHistoricalReadAccess` grant under

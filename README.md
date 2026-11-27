@@ -33,6 +33,7 @@ The system provides:
 - **Canonical Specification:** [`docs/specifications/TECHNICAL_SPECIFICATION.md`](docs/specifications/TECHNICAL_SPECIFICATION.md)
 - **System Architecture & Trust Boundaries:** [`docs/architecture/README.md`](docs/architecture/README.md)
   - [Deployment Placement, Crate Boundaries & Data Isolation](docs/architecture/deployment-and-boundaries.md)
+  - [Cryptography, Key Custody & Encrypted IPFS Storage](docs/architecture/cryptography-custody-and-storage.md)
   - [Authentication and Challenge-Response Workflow](docs/architecture/authentication-and-challenge.md)
   - [Historical Access Model](docs/architecture/historical-access.md)
   - [Data Recovery and Key Revocation](docs/architecture/recovery-and-revocation.md)

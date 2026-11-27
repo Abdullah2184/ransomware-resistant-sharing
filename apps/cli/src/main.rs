@@ -182,11 +182,13 @@ async fn load_custody_from_env() -> Result<DevelopmentKeyCustody, String> {
     };
     let member_raw = env::var("RRDS_DEV_MEMBER_ID")
         .map_err(|_| "no hardware key-custody provider configured (for local dev only, set RRDS_ALLOW_UNSAFE_DEV_CUSTODY=true and RRDS_DEV_* keys)".to_owned())?;
-    let sign_raw = env::var("RRDS_DEV_SIGNING_KEY")
-        .map_err(|_| "RRDS_DEV_SIGNING_KEY must be set in unsafe dev custody mode".to_owned())?;
-    let enc_raw = env::var("RRDS_DEV_ENCRYPTION_SEED").map_err(|_| {
+    let sign_raw =
+        Zeroizing::new(env::var("RRDS_DEV_SIGNING_KEY").map_err(|_| {
+            "RRDS_DEV_SIGNING_KEY must be set in unsafe dev custody mode".to_owned()
+        })?);
+    let enc_raw = Zeroizing::new(env::var("RRDS_DEV_ENCRYPTION_SEED").map_err(|_| {
         "RRDS_DEV_ENCRYPTION_SEED must be set in unsafe dev custody mode".to_owned()
-    })?;
+    })?);
     let sign_ver = env::var("RRDS_DEV_SIGNING_KEY_VERSION")
         .ok()
         .map(|v| v.parse::<u32>())
@@ -203,16 +205,18 @@ async fn load_custody_from_env() -> Result<DevelopmentKeyCustody, String> {
     let member_id = MemberId::from_bytes(
         parse_hex_32(&member_raw).map_err(|_| "RRDS_DEV_MEMBER_ID must be 32-byte hex")?,
     );
-    let signing_secret =
-        parse_hex_32(&sign_raw).map_err(|_| "RRDS_DEV_SIGNING_KEY must be 32-byte hex")?;
-    let encryption_seed =
-        parse_hex_32(&enc_raw).map_err(|_| "RRDS_DEV_ENCRYPTION_SEED must be 32-byte hex")?;
+    let signing_secret = Zeroizing::new(
+        parse_hex_32(&sign_raw).map_err(|_| "RRDS_DEV_SIGNING_KEY must be 32-byte hex")?,
+    );
+    let encryption_seed = Zeroizing::new(
+        parse_hex_32(&enc_raw).map_err(|_| "RRDS_DEV_ENCRYPTION_SEED must be 32-byte hex")?,
+    );
     let provider = DevelopmentKeyCustody::from_dev_secrets(
         member_id,
         KeyVersion::new(sign_ver).map_err(|e| e.to_string())?,
         KeyVersion::new(enc_ver).map_err(|e| e.to_string())?,
-        signing_secret,
-        encryption_seed,
+        *signing_secret,
+        *encryption_seed,
     )
     .map_err(|e| e.to_string())?;
     verify_provider_policy(&provider, policy)

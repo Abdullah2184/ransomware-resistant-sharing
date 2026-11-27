@@ -1,8 +1,9 @@
-//! Kubo and IPFS Cluster adapter for the approved UnixFS directory profile.
+//! Kubo and IPFS Cluster adapter for the approved UnixFS directory profile
+//! (`docs/adr/content-package-unixfs-profile.md`).
 
 use std::{collections::HashMap, env, fmt, io, time::Duration};
 
-use crypto::EncryptedFileManifest;
+use crypto::{EncryptedFileManifest, verify_sha256_cid};
 use domain::{ContentCid, EnvelopeSetCid};
 use futures_util::{StreamExt, TryStreamExt};
 use ports::{
@@ -12,6 +13,7 @@ use ports::{
 use reqwest::{
     Client, Response, StatusCode, Url,
     multipart::{Form, Part},
+    redirect::Policy,
 };
 use serde::Deserialize;
 use tokio::{
@@ -24,6 +26,8 @@ const ADD_RESPONSE_LIMIT_BYTES: usize = 4 * 1024 * 1024;
 const PIN_STATUS_LIMIT_BYTES: usize = 1024 * 1024;
 const ROOT_BLOCK_LIMIT_BYTES: usize = 4 * 1024 * 1024;
 const MAX_REPLICA_COUNT: usize = 64;
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const HEALTH_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Clone)]
 pub struct ClusterCredentials {
@@ -52,7 +56,7 @@ impl fmt::Debug for ClusterCredentials {
 
 pub struct IpfsConfig {
     pub kubo_api_urls: Vec<String>,
-    pub cluster_api_url: String,
+    pub cluster_api_urls: Vec<String>,
     pub cluster_credentials: ClusterCredentials,
     pub request_timeout: Duration,
     pub replication_timeout: Duration,
@@ -62,16 +66,8 @@ pub struct IpfsConfig {
 
 impl IpfsConfig {
     pub fn from_env() -> Result<Self, StorageError> {
-        let kubo_api_urls = env::var("IPFS_API_URLS")
-            .or_else(|_| env::var("IPFS_API_URL"))
-            .map_err(|_| StorageError::TransportUnavailable)?
-            .split(',')
-            .map(str::trim)
-            .filter(|url| !url.is_empty())
-            .map(str::to_owned)
-            .collect::<Vec<_>>();
-        let cluster_api_url =
-            env::var("IPFS_CLUSTER_API_URL").map_err(|_| StorageError::TransportUnavailable)?;
+        let kubo_api_urls = parse_csv_env("IPFS_API_URLS", "IPFS_API_URL")?;
+        let cluster_api_urls = parse_csv_env("IPFS_CLUSTER_API_URLS", "IPFS_CLUSTER_API_URL")?;
         let username =
             env::var("IPFS_CLUSTER_USERNAME").map_err(|_| StorageError::TransportUnavailable)?;
         let password_path = env::var("IPFS_CLUSTER_PASSWORD_FILE")
@@ -82,7 +78,7 @@ impl IpfsConfig {
 
         Ok(Self {
             kubo_api_urls,
-            cluster_api_url,
+            cluster_api_urls,
             cluster_credentials: credentials,
             request_timeout: Duration::from_secs(env_u64("IPFS_REQUEST_TIMEOUT_SECONDS", 120)?),
             replication_timeout: Duration::from_secs(env_u64(
@@ -98,10 +94,27 @@ impl IpfsConfig {
     }
 }
 
+fn parse_csv_env(primary: &str, fallback: &str) -> Result<Vec<String>, StorageError> {
+    let raw = env::var(primary)
+        .or_else(|_| env::var(fallback))
+        .map_err(|_| StorageError::TransportUnavailable)?;
+    let urls = raw
+        .split(',')
+        .map(str::trim)
+        .filter(|url| !url.is_empty())
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    if urls.is_empty() {
+        return Err(StorageError::InvalidPackage);
+    }
+    Ok(urls)
+}
+
 pub struct IpfsClusterStore {
     client: Client,
+    probe_client: Client,
     kubo_api_urls: Vec<Url>,
-    cluster_api_url: Url,
+    cluster_api_urls: Vec<Url>,
     credentials: ClusterCredentials,
     replication_timeout: Duration,
     replication_poll_interval: Duration,
@@ -113,7 +126,7 @@ impl fmt::Debug for IpfsClusterStore {
         formatter
             .debug_struct("IpfsClusterStore")
             .field("kubo_api_urls", &self.kubo_api_urls.len())
-            .field("cluster_api_url", &"<redacted>")
+            .field("cluster_api_urls", &self.cluster_api_urls.len())
             .field("credentials", &self.credentials)
             .finish_non_exhaustive()
     }
@@ -122,6 +135,7 @@ impl fmt::Debug for IpfsClusterStore {
 impl IpfsClusterStore {
     pub fn new(config: IpfsConfig) -> Result<Self, StorageError> {
         if config.kubo_api_urls.is_empty()
+            || config.cluster_api_urls.is_empty()
             || config.max_upload_bytes == 0
             || config.request_timeout.is_zero()
             || config.replication_timeout.is_zero()
@@ -137,16 +151,33 @@ impl IpfsClusterStore {
             .iter()
             .map(|url| parse_http_url(url))
             .collect::<Result<Vec<_>, _>>()?;
-        let cluster_api_url = parse_http_url(&config.cluster_api_url)?;
+        let cluster_api_urls = config
+            .cluster_api_urls
+            .iter()
+            .map(|url| parse_http_url(url))
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let connect_timeout = CONNECT_TIMEOUT.min(config.request_timeout);
+        let probe_timeout = HEALTH_PROBE_TIMEOUT.min(config.request_timeout);
+
         let client = Client::builder()
+            .connect_timeout(connect_timeout)
             .timeout(config.request_timeout)
+            .redirect(Policy::none())
+            .build()
+            .map_err(|_| StorageError::TransportUnavailable)?;
+        let probe_client = Client::builder()
+            .connect_timeout(connect_timeout)
+            .timeout(probe_timeout)
+            .redirect(Policy::none())
             .build()
             .map_err(|_| StorageError::TransportUnavailable)?;
 
         Ok(Self {
             client,
+            probe_client,
             kubo_api_urls,
-            cluster_api_url,
+            cluster_api_urls,
             credentials: config.cluster_credentials,
             replication_timeout: config.replication_timeout,
             replication_poll_interval: config.replication_poll_interval,
@@ -165,7 +196,7 @@ impl IpfsClusterStore {
             let Ok(url) = base.join("api/v0/id") else {
                 continue;
             };
-            if let Ok(response) = self.client.post(url).send().await
+            if let Ok(response) = self.probe_client.post(url).send().await
                 && response.status().is_success()
             {
                 return Ok(base);
@@ -213,6 +244,85 @@ impl IpfsClusterStore {
         parse_add_output(&output, wrap_with_directory, expected_content)
     }
 
+    async fn post_pin(&self, cid_text: &str, min_replicas: usize) -> Result<(), StorageError> {
+        let mut last_err = StorageError::TransportUnavailable;
+        for base in &self.cluster_api_urls {
+            let url = base
+                .join(&format!("pins/{cid_text}"))
+                .map_err(|_| StorageError::InvalidCid)?;
+            let response = match self
+                .client
+                .post(url)
+                .query(&[
+                    ("replication-min", min_replicas.to_string()),
+                    ("replication-max", min_replicas.to_string()),
+                ])
+                .basic_auth(&self.credentials.username, Some(&self.credentials.password))
+                .send()
+                .await
+            {
+                Ok(response) => response,
+                Err(_) => {
+                    last_err = StorageError::TransportUnavailable;
+                    continue;
+                }
+            };
+            let status = response.status();
+            if status.is_success() || status == StatusCode::ACCEPTED {
+                return Ok(());
+            }
+            if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
+                return Err(StorageError::TransportUnavailable);
+            }
+            last_err = StorageError::TransportUnavailable;
+        }
+        Err(last_err)
+    }
+
+    async fn fetch_pin_status(
+        &self,
+        cid_text: &str,
+    ) -> Result<Option<ClusterPinStatus>, StorageError> {
+        let mut not_found = false;
+        for base in &self.cluster_api_urls {
+            let status_url = base
+                .join(&format!("pins/{cid_text}"))
+                .map_err(|_| StorageError::InvalidCid)?;
+            let response = match self
+                .client
+                .get(status_url)
+                .basic_auth(&self.credentials.username, Some(&self.credentials.password))
+                .send()
+                .await
+            {
+                Ok(response) => response,
+                Err(_) => continue,
+            };
+            let status = response.status();
+            if status.is_success() {
+                let body = bounded_response_body(response, PIN_STATUS_LIMIT_BYTES).await?;
+                let parsed: ClusterPinStatus =
+                    serde_json::from_slice(&body).map_err(|_| StorageError::InvalidResponse)?;
+                if parsed.cid != cid_text {
+                    return Err(StorageError::InvalidResponse);
+                }
+                return Ok(Some(parsed));
+            }
+            if status == StatusCode::NOT_FOUND {
+                not_found = true;
+                continue;
+            }
+            if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
+                return Err(StorageError::TransportUnavailable);
+            }
+        }
+        if not_found {
+            Ok(None)
+        } else {
+            Err(StorageError::TransportUnavailable)
+        }
+    }
+
     async fn pin_and_wait(
         &self,
         cid: StorageCid,
@@ -222,24 +332,7 @@ impl IpfsClusterStore {
             return Err(StorageError::InvalidReplicaCount);
         }
         let cid_text = storage_cid_string(&cid);
-        let url = self
-            .cluster_api_url
-            .join(&format!("pins/{cid_text}"))
-            .map_err(|_| StorageError::InvalidCid)?;
-        let response = self
-            .client
-            .post(url)
-            .query(&[
-                ("replication-min", min_replicas.to_string()),
-                ("replication-max", min_replicas.to_string()),
-            ])
-            .basic_auth(&self.credentials.username, Some(&self.credentials.password))
-            .send()
-            .await
-            .map_err(|_| StorageError::TransportUnavailable)?;
-        if !(response.status().is_success() || response.status() == StatusCode::ACCEPTED) {
-            return Err(StorageError::TransportUnavailable);
-        }
+        self.post_pin(&cid_text, min_replicas).await?;
 
         let wait_result = timeout(
             self.replication_timeout,
@@ -258,38 +351,12 @@ impl IpfsClusterStore {
         min_replicas: usize,
     ) -> Result<ReplicationReceipt, StorageError> {
         let cid_text = storage_cid_string(&cid);
-        let status_url = self
-            .cluster_api_url
-            .join(&format!("pins/{cid_text}"))
-            .map_err(|_| StorageError::InvalidCid)?;
         let deadline = Instant::now() + self.replication_timeout;
         let mut delay = Duration::from_millis(250);
 
         loop {
-            let response = self
-                .client
-                .get(status_url.clone())
-                .basic_auth(&self.credentials.username, Some(&self.credentials.password))
-                .send()
-                .await
-                .map_err(|_| StorageError::TransportUnavailable)?;
-            if response.status().is_success() {
-                let body = bounded_response_body(response, PIN_STATUS_LIMIT_BYTES).await?;
-                let status: ClusterPinStatus =
-                    serde_json::from_slice(&body).map_err(|_| StorageError::InvalidResponse)?;
-                if status.cid != cid_text {
-                    return Err(StorageError::InvalidResponse);
-                }
-                let mut pinned_peers = status
-                    .peer_map
-                    .into_iter()
-                    .filter_map(|(peer_id, peer)| {
-                        (!peer_id.is_empty() && peer.status.eq_ignore_ascii_case("pinned"))
-                            .then_some(peer_id)
-                    })
-                    .collect::<Vec<_>>();
-                pinned_peers.sort();
-                pinned_peers.dedup();
+            if let Some(status) = self.fetch_pin_status(&cid_text).await? {
+                let pinned_peers = extract_pinned_peers(status);
                 if pinned_peers.len() >= min_replicas {
                     return Ok(ReplicationReceipt {
                         cid,
@@ -297,8 +364,6 @@ impl IpfsClusterStore {
                         pinned_peers,
                     });
                 }
-            } else if response.status() != StatusCode::NOT_FOUND {
-                return Err(StorageError::TransportUnavailable);
             }
 
             if Instant::now() >= deadline {
@@ -307,6 +372,32 @@ impl IpfsClusterStore {
             sleep(delay.min(self.replication_poll_interval)).await;
             delay = delay.saturating_mul(2).min(Duration::from_secs(2));
         }
+    }
+
+    /// Checks existing Cluster pin quorum and root-block integrity without
+    /// initiating a new pin for an unvalidated caller-supplied CID.
+    async fn verify_existing_replication(
+        &self,
+        cid: StorageCid,
+        min_replicas: usize,
+    ) -> Result<ReplicationReceipt, StorageError> {
+        if min_replicas == 0 || min_replicas > MAX_REPLICA_COUNT {
+            return Err(StorageError::InvalidReplicaCount);
+        }
+        let cid_text = storage_cid_string(&cid);
+        let Some(status) = self.fetch_pin_status(&cid_text).await? else {
+            return Err(StorageError::ReplicationInsufficient);
+        };
+        let pinned_peers = extract_pinned_peers(status);
+        if pinned_peers.len() < min_replicas {
+            return Err(StorageError::ReplicationInsufficient);
+        }
+        self.verify_root_block(&cid_text).await?;
+        Ok(ReplicationReceipt {
+            cid,
+            required_replicas: min_replicas,
+            pinned_peers,
+        })
     }
 
     async fn open_reader(&self, command: &str, cid: &str) -> Result<StorageReader, StorageError> {
@@ -380,7 +471,7 @@ impl IpfsClusterStore {
                 continue;
             }
             let block = bounded_response_body(response, ROOT_BLOCK_LIMIT_BYTES).await?;
-            if verify_block_cid(&expected, &block) {
+            if verify_sha256_cid(&expected, &block) {
                 return Ok(());
             }
             invalid_block = true;
@@ -473,6 +564,9 @@ impl BlobStore for IpfsClusterStore {
             if bytes.len() as u64 != byte_length {
                 return Err(StorageError::InvalidPackage);
             }
+            // Envelope sets are single raw-leaf objects under `chunker=size-1048592`
+            // (<= 512 KiB), so Kubo must return the exact raw SHA-256 CID.
+            let expected_cid = raw_chunk_cid(&bytes)?;
 
             let mut uploaded_cid = None;
             for peer in &self.kubo_api_urls {
@@ -483,6 +577,9 @@ impl BlobStore for IpfsClusterStore {
                 let form = Form::new().part("file", part);
                 match self.add_to_peer(peer, form, false, None).await {
                     Ok(cid) => {
+                        if cid != expected_cid {
+                            return Err(StorageError::IntegrityCheckFailed);
+                        }
                         uploaded_cid = Some(cid);
                         break;
                     }
@@ -517,12 +614,25 @@ impl BlobStore for IpfsClusterStore {
         cid: StorageCid,
         min_replicas: usize,
     ) -> StorageFuture<'a, ReplicationReceipt> {
-        Box::pin(async move { self.pin_and_wait(cid, min_replicas).await })
+        Box::pin(async move { self.verify_existing_replication(cid, min_replicas).await })
     }
 
     fn verify_retrievable<'a>(&'a self, cid: StorageCid) -> StorageFuture<'a, ()> {
         Box::pin(async move { self.verify_cid_retrievable(&cid).await })
     }
+}
+
+fn extract_pinned_peers(status: ClusterPinStatus) -> Vec<String> {
+    let mut pinned_peers = status
+        .peer_map
+        .into_iter()
+        .filter_map(|(peer_id, peer)| {
+            (!peer_id.is_empty() && peer.status.eq_ignore_ascii_case("pinned")).then_some(peer_id)
+        })
+        .collect::<Vec<_>>();
+    pinned_peers.sort();
+    pinned_peers.dedup();
+    pinned_peers
 }
 
 fn parse_add_output(
@@ -626,6 +736,13 @@ fn parse_http_url(value: &str) -> Result<Url, StorageError> {
     if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
         return Err(StorageError::InvalidPackage);
     }
+    if !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(StorageError::InvalidPackage);
+    }
     if !url.path().ends_with('/') {
         let path = format!("{}/", url.path());
         url.set_path(&path);
@@ -643,18 +760,6 @@ fn raw_chunk_cid(bytes: &[u8]) -> Result<String, StorageError> {
     crypto::raw_sha256_cid(bytes)
         .map(|cid| cid.to_string())
         .map_err(|_| StorageError::IntegrityCheckFailed)
-}
-
-fn verify_block_cid(expected: &cid::Cid, block: &[u8]) -> bool {
-    if expected.version() != cid::Version::V1
-        || expected.hash().code() != 0x12
-        || expected.hash().digest().len() != 32
-    {
-        return false;
-    }
-    use sha2::{Digest, Sha256};
-
-    Sha256::digest(block)[..] == *expected.hash().digest()
 }
 
 #[derive(Deserialize)]
@@ -686,8 +791,8 @@ mod tests {
     #[test]
     fn storage_debug_redacts_credentials_and_addresses() {
         let store = IpfsClusterStore::new(IpfsConfig {
-            kubo_api_urls: vec!["http://user:secret@localhost:5001".to_owned()],
-            cluster_api_url: "http://localhost:9094".to_owned(),
+            kubo_api_urls: vec!["http://localhost:5001".to_owned()],
+            cluster_api_urls: vec!["http://localhost:9094".to_owned()],
             cluster_credentials: ClusterCredentials::new("rrfs-admin", "secret"),
             request_timeout: Duration::from_secs(1),
             replication_timeout: Duration::from_secs(1),
@@ -701,11 +806,30 @@ mod tests {
     }
 
     #[test]
-    fn rejects_non_http_endpoints_and_invalid_quorum_configuration() {
+    fn rejects_non_http_endpoints_embedded_credentials_and_invalid_quorum_configuration() {
+        for bad_url in [
+            "file:///tmp/ipfs",
+            "http://user:secret@localhost:5001",
+            "http://localhost:5001/?token=abc",
+            "http://localhost:5001/#frag",
+        ] {
+            assert!(
+                IpfsClusterStore::new(IpfsConfig {
+                    kubo_api_urls: vec![bad_url.to_owned()],
+                    cluster_api_urls: vec!["http://localhost:9094".to_owned()],
+                    cluster_credentials: ClusterCredentials::new("user", "password"),
+                    request_timeout: Duration::from_secs(1),
+                    replication_timeout: Duration::from_secs(1),
+                    replication_poll_interval: Duration::from_millis(50),
+                    max_upload_bytes: 1024,
+                })
+                .is_err()
+            );
+        }
         assert!(
             IpfsClusterStore::new(IpfsConfig {
-                kubo_api_urls: vec!["file:///tmp/ipfs".to_owned()],
-                cluster_api_url: "http://localhost:9094".to_owned(),
+                kubo_api_urls: vec!["http://localhost:5001".to_owned()],
+                cluster_api_urls: vec![],
                 cluster_credentials: ClusterCredentials::new("user", "password"),
                 request_timeout: Duration::from_secs(1),
                 replication_timeout: Duration::from_secs(1),
@@ -717,7 +841,7 @@ mod tests {
         assert!(
             IpfsClusterStore::new(IpfsConfig {
                 kubo_api_urls: vec!["http://localhost:5001".to_owned()],
-                cluster_api_url: "http://localhost:9094".to_owned(),
+                cluster_api_urls: vec!["http://localhost:9094".to_owned()],
                 cluster_credentials: ClusterCredentials::new("", "password"),
                 request_timeout: Duration::from_secs(1),
                 replication_timeout: Duration::from_secs(1),
@@ -729,7 +853,7 @@ mod tests {
         assert!(
             IpfsClusterStore::new(IpfsConfig {
                 kubo_api_urls: vec!["http://localhost:5001".to_owned()],
-                cluster_api_url: "http://localhost:9094".to_owned(),
+                cluster_api_urls: vec!["http://localhost:9094".to_owned()],
                 cluster_credentials: ClusterCredentials::new("user", "password"),
                 request_timeout: Duration::ZERO,
                 replication_timeout: Duration::from_secs(1),
@@ -793,7 +917,7 @@ mod tests {
                 format!("http://{failed_address}"),
                 format!("http://{healthy_address}"),
             ],
-            cluster_api_url: "http://127.0.0.1:9094".to_owned(),
+            cluster_api_urls: vec!["http://127.0.0.1:9094".to_owned()],
             cluster_credentials: ClusterCredentials::new("user", "password"),
             request_timeout: Duration::from_secs(2),
             replication_timeout: Duration::from_secs(1),
@@ -811,7 +935,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pin_wait_requires_distinct_authenticated_cluster_peers() {
+    async fn pin_wait_requires_distinct_authenticated_cluster_peers_and_fails_over() {
+        let bad_cluster = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let bad_cluster_addr = bad_cluster.local_addr().unwrap();
+        let bad_cluster_server = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (mut socket, _) = bad_cluster.accept().await.unwrap();
+                let _ = read_mock_http_request(&mut socket).await;
+                socket
+                    .write_all(
+                        b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    )
+                    .await
+                    .unwrap();
+            }
+        });
+
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let cid = ContentCid::parse(&raw_chunk_cid(b"pinned payload").unwrap()).unwrap();
@@ -820,9 +959,7 @@ mod tests {
         let server = tokio::spawn(async move {
             for request_index in 0..2 {
                 let (mut socket, _) = listener.accept().await.unwrap();
-                let mut request = [0; 4096];
-                let read = socket.read(&mut request).await.unwrap();
-                let request = String::from_utf8_lossy(&request[..read]);
+                let request = read_mock_http_request(&mut socket).await;
                 assert!(
                     request
                         .to_ascii_lowercase()
@@ -832,6 +969,7 @@ mod tests {
                 if request_index == 0 {
                     assert!(request.starts_with("POST /pins/"));
                     assert!(request.contains("replication-min=2"));
+                    assert!(request.contains("replication-max=2"));
                     socket
                         .write_all(
                             b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
@@ -860,7 +998,10 @@ mod tests {
         });
         let store = IpfsClusterStore::new(IpfsConfig {
             kubo_api_urls: vec!["http://127.0.0.1:5001".to_owned()],
-            cluster_api_url: format!("http://{address}"),
+            cluster_api_urls: vec![
+                format!("http://{bad_cluster_addr}"),
+                format!("http://{address}"),
+            ],
             cluster_credentials: ClusterCredentials::new("user", "password"),
             request_timeout: Duration::from_secs(2),
             replication_timeout: Duration::from_secs(1),
@@ -875,7 +1016,204 @@ mod tests {
             .unwrap();
         assert_eq!(receipt.required_replicas, 2);
         assert_eq!(receipt.pinned_peers, vec!["peer-one", "peer-two"]);
+        bad_cluster_server.await.unwrap();
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn refuses_http_redirects_on_authenticated_cluster_requests() {
+        let redirect_cluster = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = redirect_cluster.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = redirect_cluster.accept().await.unwrap();
+            let _ = read_mock_http_request(&mut socket).await;
+            socket
+                .write_all(
+                    b"HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:9/steal\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+        });
+
+        let store = IpfsClusterStore::new(IpfsConfig {
+            kubo_api_urls: vec!["http://127.0.0.1:5001".to_owned()],
+            cluster_api_urls: vec![format!("http://{addr}")],
+            cluster_credentials: ClusterCredentials::new("user", "password"),
+            request_timeout: Duration::from_secs(2),
+            replication_timeout: Duration::from_secs(1),
+            replication_poll_interval: Duration::from_millis(10),
+            max_upload_bytes: 1024,
+        })
+        .unwrap();
+        let cid = ContentCid::parse(&raw_chunk_cid(b"x").unwrap()).unwrap();
+        assert_eq!(
+            store.pin_and_wait(StorageCid::Content(cid), 2).await,
+            Err(StorageError::TransportUnavailable)
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn ensure_replication_verifies_existing_pins_and_root_block_without_blind_repin() {
+        let payload = b"verified-root-block".to_vec();
+        let cid = ContentCid::parse(&raw_chunk_cid(&payload).unwrap()).unwrap();
+        let cid_str = cid.to_string();
+
+        let cluster = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let cluster_addr = cluster.local_addr().unwrap();
+        let cluster_cid = cid_str.clone();
+        let cluster_server = tokio::spawn(async move {
+            // Request 1: 404 (not pinned) -> ensure_replication must fail with ReplicationInsufficient (NOT POST /pins).
+            let (mut s1, _) = cluster.accept().await.unwrap();
+            let req1 = read_mock_http_request(&mut s1).await;
+            assert!(req1.starts_with(&format!("GET /pins/{cluster_cid} ")));
+            s1.write_all(
+                b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .unwrap();
+
+            // Request 2: only 1 peer pinned (< 2) -> ReplicationInsufficient.
+            let (mut s2, _) = cluster.accept().await.unwrap();
+            let req2 = read_mock_http_request(&mut s2).await;
+            assert!(req2.starts_with(&format!("GET /pins/{cluster_cid} ")));
+            let body2 = serde_json::json!({
+                "cid": cluster_cid,
+                "peer_map": { "peer-1": { "status": "pinned" } }
+            })
+            .to_string();
+            s2.write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body2.len(),
+                    body2
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+
+            // Request 3: 2 peers pinned -> succeeds once Kubo root block verifies.
+            let (mut s3, _) = cluster.accept().await.unwrap();
+            let req3 = read_mock_http_request(&mut s3).await;
+            assert!(req3.starts_with(&format!("GET /pins/{cluster_cid} ")));
+            let body3 = serde_json::json!({
+                "cid": cluster_cid,
+                "peer_map": {
+                    "peer-1": { "status": "pinned" },
+                    "peer-2": { "status": "pinned" }
+                }
+            })
+            .to_string();
+            s3.write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body3.len(),
+                    body3
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        });
+
+        let kubo = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let kubo_addr = kubo.local_addr().unwrap();
+        let kubo_payload = payload.clone();
+        let kubo_server = tokio::spawn(async move {
+            let (mut s, _) = kubo.accept().await.unwrap();
+            let req = read_mock_http_request(&mut s).await;
+            assert!(req.starts_with("POST /api/v0/block/get?"));
+            s.write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    kubo_payload.len()
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+            s.write_all(&kubo_payload).await.unwrap();
+        });
+
+        let store = IpfsClusterStore::new(IpfsConfig {
+            kubo_api_urls: vec![format!("http://{kubo_addr}")],
+            cluster_api_urls: vec![format!("http://{cluster_addr}")],
+            cluster_credentials: ClusterCredentials::new("user", "password"),
+            request_timeout: Duration::from_secs(2),
+            replication_timeout: Duration::from_secs(1),
+            replication_poll_interval: Duration::from_millis(10),
+            max_upload_bytes: 1024,
+        })
+        .unwrap();
+
+        assert_eq!(
+            store
+                .ensure_replication(StorageCid::Content(cid.clone()), 2)
+                .await,
+            Err(StorageError::ReplicationInsufficient)
+        );
+        assert_eq!(
+            store
+                .ensure_replication(StorageCid::Content(cid.clone()), 2)
+                .await,
+            Err(StorageError::ReplicationInsufficient)
+        );
+        let receipt = store
+            .ensure_replication(StorageCid::Content(cid), 2)
+            .await
+            .unwrap();
+        assert_eq!(receipt.pinned_peers, vec!["peer-1", "peer-2"]);
+
+        cluster_server.await.unwrap();
+        kubo_server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn put_envelope_set_rejects_mismatched_cid_from_kubo() {
+        let envelope_bytes = b"{\"schema\":\"rrds.key-envelope-set.v1\"}".to_vec();
+        let wrong_cid = raw_chunk_cid(b"completely-different-bytes").unwrap();
+
+        let kubo = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let kubo_addr = kubo.local_addr().unwrap();
+        let kubo_server = tokio::spawn(async move {
+            let (mut s, _) = kubo.accept().await.unwrap();
+            let _ = read_mock_http_request(&mut s).await;
+            let body = format!("{{\"Name\":\"envelope-set.json\",\"Hash\":\"{wrong_cid}\"}}\n");
+            s.write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        });
+
+        let store = IpfsClusterStore::new(IpfsConfig {
+            kubo_api_urls: vec![format!("http://{kubo_addr}")],
+            cluster_api_urls: vec!["http://127.0.0.1:9094".to_owned()],
+            cluster_credentials: ClusterCredentials::new("user", "password"),
+            request_timeout: Duration::from_secs(2),
+            replication_timeout: Duration::from_secs(1),
+            replication_poll_interval: Duration::from_millis(10),
+            max_upload_bytes: 1024,
+        })
+        .unwrap();
+
+        assert_eq!(
+            store
+                .put_envelope_set(
+                    Box::pin(std::io::Cursor::new(envelope_bytes.clone())),
+                    envelope_bytes.len() as u64,
+                    2
+                )
+                .await,
+            Err(StorageError::IntegrityCheckFailed)
+        );
+        kubo_server.await.unwrap();
     }
 
     #[test]
@@ -946,17 +1284,8 @@ mod tests {
             "bafkreiewgvgk44czrxzm3u42r3ypxj76o6uebclaabcq7wsnlgaotpvcx4"
         );
         let cid = cid::Cid::try_from(cid.as_str()).unwrap();
-        assert!(verify_block_cid(&cid, &payload));
-        assert!(!verify_block_cid(&cid, b"different block"));
-    }
-
-    #[test]
-    fn refuses_unsupported_hash_functions_when_verifying_block_cids() {
-        let cid = cid::Cid::new_v1(
-            0x55,
-            cid::multihash::Multihash::<64>::wrap(0x13, &[7; 32]).unwrap(),
-        );
-        assert!(!verify_block_cid(&cid, b"block"));
+        assert!(verify_sha256_cid(&cid, &payload));
+        assert!(!verify_sha256_cid(&cid, b"different block"));
     }
 
     #[test]
@@ -967,15 +1296,10 @@ mod tests {
                 "peer-a": { "status": "pinned" },
                 "peer-b": { "status": "PINNED" },
                 "peer-c": { "status": "pin_error" }
-                }
+            }
         }))
         .unwrap();
-        let count = status
-            .peer_map
-            .values()
-            .filter(|peer| peer.status.eq_ignore_ascii_case("pinned"))
-            .count();
-        assert_eq!(count, 2);
+        assert_eq!(extract_pinned_peers(status), vec!["peer-a", "peer-b"]);
     }
 
     async fn read_mock_http_request(socket: &mut tokio::net::TcpStream) -> String {
@@ -1057,7 +1381,6 @@ mod tests {
         let bad_kubo = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let bad_addr = bad_kubo.local_addr().unwrap();
         let bad_server = tokio::spawn(async move {
-            // Fails both add and block/get.
             for _ in 0..2 {
                 let (mut socket, _) = bad_kubo.accept().await.unwrap();
                 let _ = read_mock_http_request(&mut socket).await;
@@ -1075,7 +1398,6 @@ mod tests {
         let good_cid = expected_cid.clone();
         let good_bytes = envelope_bytes.clone();
         let good_server = tokio::spawn(async move {
-            // 1. /api/v0/add
             let (mut socket, _) = good_kubo.accept().await.unwrap();
             let headers = read_mock_http_request(&mut socket).await;
             assert!(headers.starts_with("POST /api/v0/add?"));
@@ -1087,7 +1409,6 @@ mod tests {
             );
             socket.write_all(response.as_bytes()).await.unwrap();
 
-            // 2. /api/v0/block/get for root verification
             let (mut socket, _) = good_kubo.accept().await.unwrap();
             let headers = read_mock_http_request(&mut socket).await;
             assert!(headers.starts_with("POST /api/v0/block/get?"));
@@ -1103,7 +1424,7 @@ mod tests {
 
         let store = IpfsClusterStore::new(IpfsConfig {
             kubo_api_urls: vec![format!("http://{bad_addr}"), format!("http://{good_addr}")],
-            cluster_api_url: format!("http://{cluster_addr}"),
+            cluster_api_urls: vec![format!("http://{cluster_addr}")],
             cluster_credentials: ClusterCredentials::new("user", "password"),
             request_timeout: Duration::from_secs(2),
             replication_timeout: Duration::from_secs(2),
@@ -1154,7 +1475,6 @@ mod tests {
         let bad_kubo = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let bad_addr = bad_kubo.local_addr().unwrap();
         let bad_server = tokio::spawn(async move {
-            // Fails both /api/v0/id and /api/v0/block/get.
             for _ in 0..2 {
                 let (mut socket, _) = bad_kubo.accept().await.unwrap();
                 let _ = read_mock_http_request(&mut socket).await;
@@ -1174,7 +1494,6 @@ mod tests {
         let good_chunk_cid = chunk_cid.to_string();
         let good_root_block = root_block.clone();
         let good_server = tokio::spawn(async move {
-            // 1. /api/v0/id
             let (mut socket, _) = good_kubo.accept().await.unwrap();
             let headers = read_mock_http_request(&mut socket).await;
             assert!(headers.starts_with("POST /api/v0/id"));
@@ -1185,7 +1504,6 @@ mod tests {
                 .await
                 .unwrap();
 
-            // 2. /api/v0/add
             let (mut socket, _) = good_kubo.accept().await.unwrap();
             let headers = read_mock_http_request(&mut socket).await;
             assert!(headers.starts_with("POST /api/v0/add?"));
@@ -1201,7 +1519,6 @@ mod tests {
             );
             socket.write_all(response.as_bytes()).await.unwrap();
 
-            // 3. /api/v0/block/get
             let (mut socket, _) = good_kubo.accept().await.unwrap();
             let headers = read_mock_http_request(&mut socket).await;
             assert!(headers.starts_with("POST /api/v0/block/get?"));
@@ -1217,7 +1534,7 @@ mod tests {
 
         let store = IpfsClusterStore::new(IpfsConfig {
             kubo_api_urls: vec![format!("http://{bad_addr}"), format!("http://{good_addr}")],
-            cluster_api_url: format!("http://{cluster_addr}"),
+            cluster_api_urls: vec![format!("http://{cluster_addr}")],
             cluster_credentials: ClusterCredentials::new("user", "password"),
             request_timeout: Duration::from_secs(2),
             replication_timeout: Duration::from_secs(2),
@@ -1245,5 +1562,160 @@ mod tests {
         bad_server.await.unwrap();
         good_server.await.unwrap();
         cluster_server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn verify_retrievable_handles_failover_corrupted_root_block_and_empty_stream() {
+        let valid_payload = b"retrievable-root-block".to_vec();
+        let cid = ContentCid::parse(&raw_chunk_cid(&valid_payload).unwrap()).unwrap();
+
+        // 1. Failing node 1 (500 on both dag/export and block/get) + healthy node 2 -> succeeds on failover.
+        let bad_node = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let bad_addr = bad_node.local_addr().unwrap();
+        let bad_server = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (mut s, _) = bad_node.accept().await.unwrap();
+                let _ = read_mock_http_request(&mut s).await;
+                s.write_all(
+                    b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            }
+        });
+
+        let good_node = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let good_addr = good_node.local_addr().unwrap();
+        let good_payload = valid_payload.clone();
+        let good_server = tokio::spawn(async move {
+            let (mut s1, _) = good_node.accept().await.unwrap();
+            let req1 = read_mock_http_request(&mut s1).await;
+            assert!(req1.starts_with("POST /api/v0/dag/export?"));
+            s1.write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 9\r\nConnection: close\r\n\r\ncar-bytes",
+            )
+            .await
+            .unwrap();
+
+            let (mut s2, _) = good_node.accept().await.unwrap();
+            let req2 = read_mock_http_request(&mut s2).await;
+            assert!(req2.starts_with("POST /api/v0/block/get?"));
+            s2.write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    good_payload.len()
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+            s2.write_all(&good_payload).await.unwrap();
+        });
+
+        let failover_store = IpfsClusterStore::new(IpfsConfig {
+            kubo_api_urls: vec![format!("http://{bad_addr}"), format!("http://{good_addr}")],
+            cluster_api_urls: vec!["http://127.0.0.1:9094".to_owned()],
+            cluster_credentials: ClusterCredentials::new("user", "password"),
+            request_timeout: Duration::from_secs(2),
+            replication_timeout: Duration::from_secs(1),
+            replication_poll_interval: Duration::from_millis(10),
+            max_upload_bytes: 1024,
+        })
+        .unwrap();
+        failover_store
+            .verify_retrievable(StorageCid::Content(cid.clone()))
+            .await
+            .expect("verify_retrievable should fail over to healthy Kubo node");
+        bad_server.await.unwrap();
+        good_server.await.unwrap();
+
+        // 2. Non-empty stream + corrupted root block bytes -> IntegrityCheckFailed.
+        let corrupt_node = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let corrupt_addr = corrupt_node.local_addr().unwrap();
+        let corrupt_server = tokio::spawn(async move {
+            let (mut s1, _) = corrupt_node.accept().await.unwrap();
+            let req1 = read_mock_http_request(&mut s1).await;
+            assert!(req1.starts_with("POST /api/v0/dag/export?"));
+            s1.write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 9\r\nConnection: close\r\n\r\ncar-bytes",
+            )
+            .await
+            .unwrap();
+
+            let (mut s2, _) = corrupt_node.accept().await.unwrap();
+            let req2 = read_mock_http_request(&mut s2).await;
+            assert!(req2.starts_with("POST /api/v0/block/get?"));
+            let tampered = b"tampered-root-block!!!";
+            s2.write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    tampered.len()
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+            s2.write_all(tampered).await.unwrap();
+        });
+        let corrupt_store = IpfsClusterStore::new(IpfsConfig {
+            kubo_api_urls: vec![format!("http://{corrupt_addr}")],
+            cluster_api_urls: vec!["http://127.0.0.1:9094".to_owned()],
+            cluster_credentials: ClusterCredentials::new("user", "password"),
+            request_timeout: Duration::from_secs(2),
+            replication_timeout: Duration::from_secs(1),
+            replication_poll_interval: Duration::from_millis(10),
+            max_upload_bytes: 1024,
+        })
+        .unwrap();
+        assert_eq!(
+            corrupt_store
+                .verify_retrievable(StorageCid::Content(cid.clone()))
+                .await,
+            Err(StorageError::IntegrityCheckFailed)
+        );
+        corrupt_server.await.unwrap();
+
+        // 3. Empty stream on dag/export -> IntegrityCheckFailed, and HTTP 503 -> TransportUnavailable.
+        let empty_node = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let empty_addr = empty_node.local_addr().unwrap();
+        let empty_server = tokio::spawn(async move {
+            let (mut s, _) = empty_node.accept().await.unwrap();
+            let req = read_mock_http_request(&mut s).await;
+            assert!(req.starts_with("POST /api/v0/dag/export?"));
+            s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .await
+                .unwrap();
+
+            let (mut s2, _) = empty_node.accept().await.unwrap();
+            let _ = read_mock_http_request(&mut s2).await;
+            s2.write_all(
+                b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        });
+        let empty_store = IpfsClusterStore::new(IpfsConfig {
+            kubo_api_urls: vec![format!("http://{empty_addr}")],
+            cluster_api_urls: vec!["http://127.0.0.1:9094".to_owned()],
+            cluster_credentials: ClusterCredentials::new("user", "password"),
+            request_timeout: Duration::from_secs(2),
+            replication_timeout: Duration::from_secs(1),
+            replication_poll_interval: Duration::from_millis(10),
+            max_upload_bytes: 1024,
+        })
+        .unwrap();
+        assert_eq!(
+            empty_store
+                .verify_retrievable(StorageCid::Content(cid.clone()))
+                .await,
+            Err(StorageError::IntegrityCheckFailed)
+        );
+        assert_eq!(
+            empty_store
+                .verify_retrievable(StorageCid::Content(cid))
+                .await,
+            Err(StorageError::TransportUnavailable)
+        );
+        empty_server.await.unwrap();
     }
 }

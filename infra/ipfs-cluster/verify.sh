@@ -21,8 +21,12 @@ if [ "$peer_count" -ne 2 ] || [ "$unique_peer_count" -ne 2 ]; then
     exit 1
 fi
 
+# Import with the approved RRDS UnixFS profile (CIDv1, sha2-256, size-1048592,
+# raw leaves, no local pin) so Cluster manages all replication.
 cid=$(printf 'ransomware-resistant-sharing local replication verification\n' |
-    compose exec -T kubo ipfs add -Q)
+    compose exec -T kubo gosu ipfs ipfs --api /ip4/127.0.0.1/tcp/5001 add \
+        --cid-version=1 --hash=sha2-256 --chunker=size-1048592 \
+        --raw-leaves=true --pin=false -Q)
 
 compose exec -T cluster1 sh -ec '
     password=$(cat /run/secrets/cluster-api-password)
@@ -50,3 +54,13 @@ compose exec -T cluster1 sh -ec '
     echo "CID did not reach PINNED status on both Cluster peers." >&2
     exit 1
 ' sh "$cid"
+
+# Confirm the replicated block is retrievable from BOTH kubo and kubo2.
+for node in kubo kubo2; do
+    retrieved=$(compose exec -T "$node" gosu ipfs ipfs --api /ip4/127.0.0.1/tcp/5001 cat "$cid")
+    if [ "$retrieved" != "ransomware-resistant-sharing local replication verification" ]; then
+        echo "Retrieved payload mismatch on $node for CID $cid" >&2
+        exit 1
+    fi
+done
+printf 'verified CID %s retrievable from both kubo and kubo2\n' "$cid"

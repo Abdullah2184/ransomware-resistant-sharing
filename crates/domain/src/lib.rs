@@ -1,6 +1,7 @@
 //! Infrastructure-independent domain types and invariants.
 
 pub mod errors;
+pub mod hex;
 pub mod ids;
 pub mod model;
 pub mod version;

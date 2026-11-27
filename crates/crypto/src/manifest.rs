@@ -375,17 +375,7 @@ pub fn verify_sha256_cid(cid: &Cid, bytes: &[u8]) -> bool {
 }
 
 fn parse_bytes32(value: &str) -> Result<[u8; 32], CryptoError> {
-    let bytes = value
-        .strip_prefix("0x")
-        .filter(|value| value.len() == 64)
-        .ok_or(CryptoError::InvalidManifest)?;
-    let mut output = [0; 32];
-    for (index, byte) in output.iter_mut().enumerate() {
-        let start = index * 2;
-        *byte = u8::from_str_radix(&bytes[start..start + 2], 16)
-            .map_err(|_| CryptoError::InvalidManifest)?;
-    }
-    Ok(output)
+    domain::hex::parse_lowercase_fixed_hex::<32>(value).ok_or(CryptoError::InvalidManifest)
 }
 
 fn decode_fixed<const N: usize>(value: &str) -> Result<[u8; N], CryptoError> {

@@ -1,10 +1,9 @@
 use std::fmt;
 
-use crypto::{ChainId, Eip712Domain, LoginChallengeDigestInput};
+use crypto::{ChainId, Eip712Domain, LoginChallengeDigestInput, keccak256};
 use domain::{EvmAddress, MemberId, OperationNonce};
 use k256::ecdsa::{RecoveryId, Signature, VerifyingKey};
 use serde::{Deserialize, Serialize};
-use sha3::{Digest, Keccak256};
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -89,30 +88,14 @@ pub fn recover_signer(digest: &[u8; 32], signature: &str) -> Result<EvmAddress, 
         .map_err(|_| AuthInputError::Signature)?;
     let encoded = verifying_key.to_encoded_point(false);
     let public_key = encoded.as_bytes();
-    let hash = keccak(&public_key[1..]);
+    let hash = keccak256(&public_key[1..]);
     let mut address = [0; 20];
     address.copy_from_slice(&hash[12..]);
     Ok(EvmAddress::from_bytes(address))
 }
 
 pub fn parse_fixed_hex<const N: usize>(value: &str) -> Option<[u8; N]> {
-    let value = value.strip_prefix("0x")?;
-    if value.len() != N * 2 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        return None;
-    }
-    let mut output = [0; N];
-    for (index, byte) in output.iter_mut().enumerate() {
-        let offset = index * 2;
-        *byte = u8::from_str_radix(&value[offset..offset + 2], 16).ok()?;
-    }
-    Some(output)
-}
-
-fn keccak(bytes: &[u8]) -> [u8; 32] {
-    let digest = Keccak256::digest(bytes);
-    let mut output = [0; 32];
-    output.copy_from_slice(&digest);
-    output
+    domain::hex::parse_fixed_hex::<N>(value)
 }
 
 #[cfg(test)]
@@ -199,18 +182,13 @@ mod tests {
 
     fn address_from_key(key: &SigningKey) -> EvmAddress {
         let point = key.verifying_key().to_encoded_point(false);
-        let hash = keccak(&point.as_bytes()[1..]);
+        let hash = keccak256(&point.as_bytes()[1..]);
         let mut address = [0; 20];
         address.copy_from_slice(&hash[12..]);
         EvmAddress::from_bytes(address)
     }
 
     fn encode_hex(bytes: &[u8]) -> String {
-        let mut value = String::with_capacity(bytes.len() * 2);
-        for byte in bytes {
-            use std::fmt::Write as _;
-            write!(value, "{byte:02x}").unwrap();
-        }
-        value
+        domain::hex::encode_hex(bytes)
     }
 }

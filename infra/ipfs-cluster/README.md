@@ -63,18 +63,22 @@ Docker daemon, network, power source, and administrative boundary. This
 environment verifies local allocation/replication only. It does **not**
 establish two-organization independence or production fault tolerance.
 
-## Current development status (updated 26 November 2026)
+## Current development status (updated 27 November 2026)
 
-- **Live two-peer replication and Rust adapter integration verified (26 November 2026):**
+- **Live two-peer replication, dual-node CARv1 interoperability, and negative security checks verified (27 November 2026):**
   - All five Compose services (`postgres`, `kubo`, `kubo2`, `cluster1`, `cluster2`)
     are healthy with host loopback bindings (`127.0.0.1:5432`, `127.0.0.1:15001`,
     `127.0.0.1:15002`, `127.0.0.1:9094`).
-  - `sh infra/ipfs-cluster/verify.sh` passed with both `rrfs-cluster-1` and
-    `rrfs-cluster-2` reporting `PINNED` (0 attempts).
-  - `cargo test -p ipfs-adapter --locked --test cluster_integration -- --ignored`
-    passed (`1 passed; 0 failed` in 1.66s), verifying encrypted content-package
-    upload, manifest/chunk/root CID verification, two-peer authenticated Cluster
-    pin quorum, DAG export, and envelope-set upload/retrieval.
+  - `sh infra/ipfs-cluster/verify.sh` passed using the RRDS UnixFS profile flags
+    (`--cid-version=1 --hash=sha2-256 --chunker=size-1048592 --raw-leaves=true --pin=false`)
+    with both `rrfs-cluster-1` and `rrfs-cluster-2` reporting `PINNED` (0 attempts)
+    and verified retrieval from both `kubo` and `kubo2`.
+  - Live dual-node Rust integration tests passed (**2 passed; 0 failed**):
+    - `ipfs-adapter::cluster_integration` (`10.37s`): multi-chunk (> 1 MiB) encrypted upload to Kubo 1 -> 2-peer Cluster pin -> `ensure_replication` on both nodes -> real Kubo `dag/export` CARv1 verification (`crypto::extract_verified_car_package`, 2-level `manifest.json` + `chunks/00000001..N`) & decryption from **both Kubo 1 and Kubo 2**; reverse upload to Kubo 2 -> retrieve & decrypt from Kubo 1; 0-byte empty file round-trip; canonical `KeyEnvelopeSet` HPKE unwrap; and negative security checks (unauthenticated/wrong-password Cluster `401`, unpinned CID `ReplicationInsufficient`, 1-bit CAR tamper, wrong `manifest_hash`/`content_cid`, wrong HPKE key).
+    - `rrds-tests::cross_component_integration` (`live_dual_node_ipfs_application_upload_share_download_and_negative_access`, `2.72s`): full `UploadService` -> `DownloadService` -> `ShareService` -> `DownloadService` across Kubo 1 and Kubo 2 without re-encryption, plus unauthorized member denial.
+  - Hardening applied:
+    1. `start-kubo.sh` disables the Kubo HTTP Gateway (`Addresses.Gateway ""`) and supports static multi-org `KUBO_BOOTSTRAP_MULTIADDRS` (without cross-org Admin API port 5001 access); `start-cluster-peer.sh` supports static `CLUSTER_BOOTSTRAP_MULTIADDRS` and retries dev bootstrap; `infra/compose/ipfs-peer.yaml` includes a `cluster` healthcheck.
+    2. `IpfsClusterStore` disables HTTP redirects (`Policy::none()`), uses bounded connect/probe timeouts, supports multi-endpoint `IPFS_CLUSTER_API_URLS` failover, verifies `raw_sha256_cid` in `put_envelope_set`, and makes `ensure_replication` check existing pin quorum + root block without blind repinning.
   - Fixes applied during live verification:
     1. `start-kubo.sh` now normalizes `/data/ipfs` ownership (`chown -R ipfs`)
        and runs bootstrap API queries via `gosu ipfs`; `infra/compose.yaml`

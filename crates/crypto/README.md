@@ -7,18 +7,20 @@ Contains no network, database, storage, or key-custody adapter dependencies.
 ## Contents
 
 - **Authenticated chunk encryption (`encryption.rs`):** Stateful AES-256-GCM
-  1 MiB chunk encryptor/decryptor (`DEFAULT_CHUNK_SIZE = 1_048_576`, matching
+  1 MiB chunk encryptor/decryptor (`DEFAULT_CHUNK_SIZE_BYTES = 1_048_576`, matching
   [`docs/adr/content-package-unixfs-profile.md`](../../docs/adr/content-package-unixfs-profile.md)),
   reserved chunk-0 `encrypt_private_metadata` / `decrypt_private_metadata`,
-  context-bound AAD, and `Zeroizing` key/plaintext buffers.
+  context-bound AAD rejecting zero IDs, and redacting `Zeroizing` key/plaintext buffers.
 - **HPKE key wrapping (`key_wrapping.rs`):** RFC 9180 base-mode HPKE
-  (`X25519 / HKDF-SHA256 / AES-256-GCM`) binding `(fileId, versionNumber,
-  epochId, memberId, encryptionKeyVersion)` into HPKE `info` / AAD.
-- **Canonical formats (`manifest.rs`, `envelope_set.rs`):**
-  - `EncryptedFileManifest` (`rrds.encrypted-file-manifest.v1`, SHA-256
+  (`X25519 / HKDF-SHA256 / AES-256-GCM`) rejecting RFC 7748 low-order X25519
+  points and binding `(fileId, versionNumber, epochId, memberId,
+  encryptionKeyVersion)` into HPKE `info` / AAD.
+- **Canonical formats (`manifest.rs`, `envelope_set.rs`, `car.rs`):**
+  - `EncryptedFileManifest` (`rrds.encrypted-content.v1`, SHA-256
     `manifest_hash()`, and canonical `raw_sha256_cid()`).
-  - `KeyEnvelopeSet` (`rrds.key-envelope-set.v1`, sorted unique recipients,
-    max 1,024 entries).
+  - `KeyEnvelopeSet` (`rrds.key-envelope-set.v1`, non-empty sorted unique
+    non-zero recipients, 1..=1,024 entries).
+  - Shared CARv1 + 2-level UnixFS `dag-pb` package encoder/verifier (`car.rs`).
 - **EIP-712 typed-data signing digests (`signing.rs`):** Single source of truth
   for `Eip712Domain` (`FileRegistry`, `AccessGovernance`, `Gateway`),
   `VersionAppend`, `AccessLookup`, `EnvelopeSetUpdate`, `MemberKeyProof`, and

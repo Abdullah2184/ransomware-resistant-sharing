@@ -1,3 +1,5 @@
+use std::fmt;
+
 use aes_gcm::{
     Aes256Gcm, Nonce,
     aead::{Aead, KeyInit, Payload},
@@ -62,9 +64,13 @@ pub struct DataEncryptionKey(Zeroizing<[u8; 32]>);
 
 impl DataEncryptionKey {
     pub fn generate() -> Result<Self, CryptoError> {
-        let mut bytes = [0; 32];
-        getrandom::fill(&mut bytes).map_err(|_| CryptoError::RandomnessUnavailable)?;
-        Ok(Self(Zeroizing::new(bytes)))
+        loop {
+            let mut bytes = Zeroizing::new([0u8; 32]);
+            getrandom::fill(&mut bytes[..]).map_err(|_| CryptoError::RandomnessUnavailable)?;
+            if *bytes != [0u8; 32] {
+                return Ok(Self(bytes));
+            }
+        }
     }
 
     /// Takes ownership of a transient key returned by a key-custody operation.
@@ -85,6 +91,12 @@ impl DataEncryptionKey {
     }
 }
 
+impl fmt::Debug for DataEncryptionKey {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("DataEncryptionKey([REDACTED])")
+    }
+}
+
 /// Context bound to every chunk's authenticated data.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct EncryptionContext {
@@ -100,6 +112,25 @@ impl EncryptionContext {
             version_number,
             epoch_id,
         }
+    }
+
+    pub const fn file_id(&self) -> FileId {
+        self.file_id
+    }
+
+    pub const fn version_number(&self) -> VersionNumber {
+        self.version_number
+    }
+
+    pub const fn epoch_id(&self) -> EpochId {
+        self.epoch_id
+    }
+
+    fn validate(&self) -> Result<(), CryptoError> {
+        if self.file_id.as_bytes() == &[0; 32] || self.epoch_id.as_bytes() == &[0; 32] {
+            return Err(CryptoError::InvalidManifest);
+        }
+        Ok(())
     }
 
     fn associated_data(self, index: u32, total_chunks: u32) -> Vec<u8> {
@@ -157,6 +188,7 @@ impl ChunkEncryptor {
         chunk_size_bytes: usize,
         total_chunks: u32,
     ) -> Result<Self, CryptoError> {
+        context.validate()?;
         validate_chunk_size(chunk_size_bytes)?;
         let cipher = key.cipher()?;
         drop(key);
@@ -225,6 +257,7 @@ impl ChunkDecryptor {
         chunk_size_bytes: usize,
         total_chunks: u32,
     ) -> Result<Self, CryptoError> {
+        context.validate()?;
         validate_chunk_size(chunk_size_bytes)?;
         let cipher = key.cipher()?;
         drop(key);
@@ -297,6 +330,7 @@ pub fn encrypt_private_metadata(
     total_chunks: u32,
     plaintext: &[u8],
 ) -> Result<PrivateMetadataCiphertext, CryptoError> {
+    context.validate()?;
     let cipher = key.cipher()?;
     let nonce = Nonce::from(nonce_prefix.for_chunk_index(0));
     let aad = context.associated_data(0, total_chunks);
@@ -320,6 +354,7 @@ pub fn decrypt_private_metadata(
     total_chunks: u32,
     metadata: &PrivateMetadataCiphertext,
 ) -> Result<Zeroizing<Vec<u8>>, CryptoError> {
+    context.validate()?;
     let cipher = key.cipher()?;
     let nonce = Nonce::from(nonce_prefix.for_chunk_index(0));
     let aad = context.associated_data(0, total_chunks);
@@ -608,5 +643,116 @@ mod tests {
             decrypt_private_metadata(&dek, nonce_prefix, test_context(2, 1, 1), 2, &encrypted),
             Err(CryptoError::AuthenticationFailed)
         );
+        // Wrong DEK, wrong nonce prefix, and 1-bit tag/ciphertext mutation fail closed.
+        assert_eq!(
+            decrypt_private_metadata(&key(99), nonce_prefix, context, 2, &encrypted),
+            Err(CryptoError::AuthenticationFailed)
+        );
+        assert_eq!(
+            decrypt_private_metadata(
+                &dek,
+                NoncePrefix::from_bytes([99; 8]),
+                context,
+                2,
+                &encrypted
+            ),
+            Err(CryptoError::AuthenticationFailed)
+        );
+        let mut mutated = encrypted.ciphertext_and_tag().to_vec();
+        *mutated.last_mut().unwrap() ^= 0x01;
+        let mutated = PrivateMetadataCiphertext::new(mutated).unwrap();
+        assert_eq!(
+            decrypt_private_metadata(&dek, nonce_prefix, context, 2, &mutated),
+            Err(CryptoError::AuthenticationFailed)
+        );
+
+        // Empty private metadata and exact MAX_PRIVATE_METADATA_BYTES - 16 boundary succeed;
+        // 1 byte over the limit is rejected.
+        let empty_meta = encrypt_private_metadata(&dek, nonce_prefix, context, 0, b"").unwrap();
+        assert_eq!(
+            decrypt_private_metadata(&dek, nonce_prefix, context, 0, &empty_meta)
+                .unwrap()
+                .as_slice(),
+            b""
+        );
+        let max_plain = vec![0xab; crate::MAX_PRIVATE_METADATA_BYTES - GCM_TAG_BYTES];
+        let max_meta =
+            encrypt_private_metadata(&dek, nonce_prefix, context, 0, &max_plain).unwrap();
+        assert_eq!(
+            decrypt_private_metadata(&dek, nonce_prefix, context, 0, &max_meta)
+                .unwrap()
+                .as_slice(),
+            max_plain.as_slice()
+        );
+        let too_large = vec![0xab; crate::MAX_PRIVATE_METADATA_BYTES - GCM_TAG_BYTES + 1];
+        assert_eq!(
+            encrypt_private_metadata(&dek, nonce_prefix, context, 0, &too_large),
+            Err(CryptoError::InvalidManifest)
+        );
+    }
+
+    #[test]
+    fn rejects_wrong_dek_wrong_nonce_tag_flip_truncated_extra_and_zero_context() {
+        let context = test_context(1, 1, 1);
+        let (nonce_prefix, chunks) =
+            encrypt_chunks(b"sensitive payload", context, TEST_CHUNK_SIZE, 15);
+
+        // Wrong DEK fails AEAD authentication.
+        assert_eq!(
+            decrypt_chunks(&chunks, nonce_prefix, context, TEST_CHUNK_SIZE, 16),
+            Err(CryptoError::AuthenticationFailed)
+        );
+        // Wrong nonce prefix fails AEAD authentication.
+        assert_eq!(
+            decrypt_chunks(
+                &chunks,
+                NoncePrefix::from_bytes([0xfe; 8]),
+                context,
+                TEST_CHUNK_SIZE,
+                15
+            ),
+            Err(CryptoError::AuthenticationFailed)
+        );
+        // 1-bit flip in the trailing 16-byte GCM authentication tag fails.
+        let mut bad_tag = chunks.clone();
+        *bad_tag[0].ciphertext_and_tag.last_mut().unwrap() ^= 0x80;
+        assert_eq!(
+            decrypt_chunks(&bad_tag, nonce_prefix, context, TEST_CHUNK_SIZE, 15),
+            Err(CryptoError::AuthenticationFailed)
+        );
+        // Truncated chunk (< 16-byte GCM tag) fails layout validation.
+        let truncated = vec![EncryptedChunk::from_parts(1, vec![0x11; GCM_TAG_BYTES - 1])];
+        assert_eq!(
+            decrypt_chunks(&truncated, nonce_prefix, context, TEST_CHUNK_SIZE, 15),
+            Err(CryptoError::InvalidChunkLayout)
+        );
+        // Extra trailing chunk past total_chunks fails with UnexpectedChunk.
+        let mut dec =
+            ChunkDecryptor::new(key(15), nonce_prefix, context, TEST_CHUNK_SIZE, 1).unwrap();
+        dec.decrypt_next(&chunks[0]).unwrap();
+        assert_eq!(
+            dec.decrypt_next(&chunks[0]),
+            Err(CryptoError::UnexpectedChunk)
+        );
+
+        // Zero file_id or zero epoch_id rejected by encryptor, decryptor, and metadata helpers.
+        for bad_ctx in [test_context(0, 1, 1), test_context(1, 1, 0)] {
+            assert!(matches!(
+                ChunkEncryptor::new(key(15), nonce_prefix, bad_ctx, TEST_CHUNK_SIZE, 1),
+                Err(CryptoError::InvalidManifest)
+            ));
+            assert!(matches!(
+                ChunkDecryptor::new(key(15), nonce_prefix, bad_ctx, TEST_CHUNK_SIZE, 1),
+                Err(CryptoError::InvalidManifest)
+            ));
+            assert_eq!(
+                encrypt_private_metadata(&key(15), nonce_prefix, bad_ctx, 0, b"x"),
+                Err(CryptoError::InvalidManifest)
+            );
+        }
+
+        // DataEncryptionKey redacts secret bytes in Debug output.
+        let generated = DataEncryptionKey::generate().unwrap();
+        assert_eq!(format!("{generated:?}"), "DataEncryptionKey([REDACTED])");
     }
 }

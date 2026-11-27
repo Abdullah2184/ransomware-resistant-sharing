@@ -2,7 +2,7 @@
 
 use std::fmt;
 
-use crypto::{HpkeRecipientKeyPair, TypedDigest};
+use crypto::{HpkeRecipientKeyPair, TypedDigest, keccak256};
 use domain::{EvmAddress, KeyVersion, MemberId};
 use k256::ecdsa::{SigningKey, VerifyingKey};
 use ports::{
@@ -147,8 +147,16 @@ impl DevelopmentKeyCustody {
         let encryption_key = HpkeRecipientKeyPair::derive_from_seed(&encryption_seed)
             .map_err(|_| CustodyError::KeyGenerationFailed)?;
         let signing_address = evm_address(signing_key.verifying_key());
-        let signing_key_id = KeyId::from_bytes(derive_dev_key_id(b"sign", member_id.as_bytes()));
-        let encryption_key_id = KeyId::from_bytes(derive_dev_key_id(b"enc", member_id.as_bytes()));
+        let signing_key_id = KeyId::from_bytes(derive_dev_key_id(
+            b"sign",
+            member_id.as_bytes(),
+            signing_key_version,
+        ));
+        let encryption_key_id = KeyId::from_bytes(derive_dev_key_id(
+            b"enc",
+            member_id.as_bytes(),
+            encryption_key_version,
+        ));
 
         let identity = PublicIdentityKeys {
             member_id,
@@ -172,6 +180,9 @@ impl DevelopmentKeyCustody {
             .signing_key
             .sign_prehash_recoverable(digest.as_bytes())
             .map_err(|_| CustodyError::SigningFailed)?;
+        if signature.normalize_s().is_some() {
+            return Err(CustodyError::SigningFailed);
+        }
         let recovery_id = u8::from(recovery_id);
         if recovery_id > 1 {
             return Err(CustodyError::SigningFailed);
@@ -222,6 +233,11 @@ impl KeyCustodyProvider for DevelopmentKeyCustody {
             if key_id != &self.identity.encryption_key_id {
                 return Err(CustodyError::KeyNotFound);
             }
+            if context.recipient_member_id() != self.identity.member_id
+                || context.recipient_key_version() != self.identity.encryption_key_version
+            {
+                return Err(CustodyError::UnwrapFailed);
+            }
             self.encryption_key
                 .open_dek(envelope, context)
                 .map(|dek| dek.into_zeroizing_bytes())
@@ -266,17 +282,18 @@ fn generate_key_id() -> Result<KeyId, CustodyError> {
 
 fn evm_address(verifying_key: &VerifyingKey) -> EvmAddress {
     let public_key = verifying_key.to_encoded_point(false);
-    let hash = Keccak256::digest(&public_key.as_bytes()[1..]);
+    let hash = keccak256(&public_key.as_bytes()[1..]);
     let mut address = [0; 20];
     address.copy_from_slice(&hash[12..]);
     EvmAddress::from_bytes(address)
 }
 
-fn derive_dev_key_id(domain: &[u8], member_id: &[u8; 32]) -> [u8; 32] {
+fn derive_dev_key_id(domain: &[u8], member_id: &[u8; 32], key_version: KeyVersion) -> [u8; 32] {
     let mut hasher = Keccak256::new();
     hasher.update(b"rrds/dev-key-id/");
     hasher.update(domain);
     hasher.update(member_id);
+    hasher.update(key_version.get().to_be_bytes());
     let digest = hasher.finalize();
     let mut id = [0u8; 32];
     id.copy_from_slice(&digest);
@@ -369,6 +386,10 @@ mod tests {
         assert!(matches!(bytes[64], 27 | 28));
 
         let parsed_signature = Signature::try_from(&bytes[..64]).unwrap();
+        assert!(
+            parsed_signature.normalize_s().is_none(),
+            "EVM signatures must be EIP-2 low-s canonical"
+        );
         let recovery_id = RecoveryId::try_from(bytes[64] - 27).unwrap();
         let recovered =
             VerifyingKey::recover_from_prehash(digest.as_bytes(), &parsed_signature, recovery_id)
@@ -378,8 +399,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn refuses_unknown_signing_and_encryption_key_ids() {
+    async fn refuses_unknown_and_cross_role_key_ids() {
         let provider = provider();
+        let identity = provider.public_identity().await.unwrap();
         let unknown_key_id = KeyId::from_bytes([0xff; 32]);
 
         assert!(matches!(
@@ -392,6 +414,19 @@ mod tests {
                 .await,
             Err(CustodyError::KeyNotFound)
         ));
+        // Role separation: encryption key ID cannot sign, signing key ID cannot unwrap DEKs.
+        assert_eq!(
+            provider
+                .sign_typed_digest(&identity.encryption_key_id, &digest())
+                .await,
+            Err(CustodyError::KeyNotFound)
+        );
+        assert_eq!(
+            provider
+                .unwrap_dek(&identity.signing_key_id, &empty_envelope(), wrap_context())
+                .await,
+            Err(CustodyError::KeyNotFound)
+        );
     }
 
     #[tokio::test]
@@ -421,6 +456,49 @@ mod tests {
                 .await,
             Err(CustodyError::UnwrapFailed)
         ));
+
+        // Even if an attacker wraps a DEK to this provider's public key using another
+        // member_id or another key_version in WrapContext, custody itself must reject it.
+        let mismatched_member_ctx = WrapContext::new(
+            FileId::from_bytes([4; 32]),
+            VersionNumber::ONE,
+            EpochId::from_bytes([5; 32]),
+            MemberId::from_bytes([99; 32]),
+            KeyVersion::new(1).unwrap(),
+        );
+        let env_wrong_member =
+            KeyEnvelope::wrap(&dek, &identity.encryption_public_key, mismatched_member_ctx)
+                .unwrap();
+        assert_eq!(
+            provider
+                .unwrap_dek(
+                    &identity.encryption_key_id,
+                    &env_wrong_member,
+                    mismatched_member_ctx,
+                )
+                .await,
+            Err(CustodyError::UnwrapFailed)
+        );
+
+        let mismatched_ver_ctx = WrapContext::new(
+            FileId::from_bytes([4; 32]),
+            VersionNumber::ONE,
+            EpochId::from_bytes([5; 32]),
+            MemberId::from_bytes([1; 32]),
+            KeyVersion::new(2).unwrap(),
+        );
+        let env_wrong_ver =
+            KeyEnvelope::wrap(&dek, &identity.encryption_public_key, mismatched_ver_ctx).unwrap();
+        assert_eq!(
+            provider
+                .unwrap_dek(
+                    &identity.encryption_key_id,
+                    &env_wrong_ver,
+                    mismatched_ver_ctx,
+                )
+                .await,
+            Err(CustodyError::UnwrapFailed)
+        );
     }
 
     fn empty_envelope() -> KeyEnvelope {
@@ -463,6 +541,19 @@ mod tests {
             a.public_identity().await.unwrap(),
             b.public_identity().await.unwrap()
         );
+        // Rotated key versions must yield distinct key IDs.
+        let rotated = DevelopmentKeyCustody::from_dev_secrets(
+            MemberId::from_bytes([7; 32]),
+            KeyVersion::new(2).unwrap(),
+            KeyVersion::new(3).unwrap(),
+            [0x11; 32],
+            [0x22; 32],
+        )
+        .unwrap();
+        let a_id = a.public_identity().await.unwrap();
+        let rotated_id = rotated.public_identity().await.unwrap();
+        assert_ne!(a_id.signing_key_id, rotated_id.signing_key_id);
+        assert_ne!(a_id.encryption_key_id, rotated_id.encryption_key_id);
         assert_eq!(
             verify_provider_policy(&a, CustodyStartupPolicy::Production).await,
             Err(CustodyPolicyError::TestProviderRejectedInProduction)

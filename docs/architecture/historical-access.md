@@ -32,18 +32,28 @@ following must hold at a single QBFT-committed block `B`:
    - `hasHistoricalReadAccess(memberId, fileId, k)` is `true`.
 2. **Authoritative version & pointer consistency (`FileRegistry` + `AccessGovernance`):**
    - File status is `Active`, `k <= head.versionNumber`, and `getVersion(fileId, k)`
-     and `currentEnvelopeSet(fileId, k)` exist at block `B`.
+     (including non-zero `manifestHash` and `contentCid`) and
+     `currentEnvelopeSet(fileId, k)` exist at block `B`.
    - The gateway durably appends the access attempt to the hash-chained
-     PostgreSQL audit log **before** returning CIDs or streaming ciphertext.
+     PostgreSQL audit log **before** returning CIDs/manifest hash or streaming
+     ciphertext/envelope bytes (`services/gateway/src/routes/reads.rs::authorize_version_read`).
 3. **Cryptographic key envelope (`KeyEnvelopeSet` in IPFS):**
-   - The current immutable envelope set referenced by `currentEnvelopeSet(fileId, k)`
-     contains an HPKE envelope for `(memberId, encryptionKeyVersion)` wrapping
-     version `Vk`'s version-specific DEK.
-   - Because each version uses a fresh DEK, adding a reader to `Vk` requires an
-     already-authorized reader to unwrap `Vk`'s DEK, wrap it for the new
-     recipient's active X25519 key, pin a new canonical `KeyEnvelopeSet` at
-     `revision + 1` (without re-encrypting the file bytes), and submit a signed
-     `EnvelopeSetUpdate` under `ENVELOPE_UPDATE_POLICY`.
+   - `GET /v1/files/{id}/versions/{k}/envelope` verifies the fetched envelope
+     set's raw SHA-256 CID, canonical `rrds.key-envelope-set.v1` format, pointer
+     consistency, and the presence of an entry for the caller's
+     `(memberId, encryptionKeyVersion)` before committing the audit row and
+     releasing the bytes.
+   - On the client, `DownloadService` verifies the envelope set CID, canonical
+     `EncryptedFileManifest`, `manifestHash`, and every chunk CID *before*
+     invoking `KeyCustodyProvider::unwrap_dek` (which enforces `(memberId,
+     encryptionKeyVersion)` identity binding on `WrapContext`).
+   - Because each version uses a fresh DEK, adding a reader to `Vk` (or
+     re-wrapping after key rotation) requires an already-authorized reader via
+     `ShareService` to unwrap `Vk`'s DEK, wrap it for the recipient's active
+     X25519 key (rejecting duplicate same-key-version shares), pin a new
+     canonical `KeyEnvelopeSet` at `revision + 1` without re-encrypting the file
+     bytes, and submit a signed `EnvelopeSetUpdate` under
+     `ENVELOPE_UPDATE_POLICY`.
 
 ## Read-ACL Revocation Epochs (Preventing Stale Grant Resurfacing)
 

@@ -1002,24 +1002,9 @@ pub fn parse_hex_20(value: &str) -> Result<[u8; 20], DomainError> {
 }
 
 pub fn parse_hex_fixed<const N: usize>(value: &str) -> Option<[u8; N]> {
-    let hex = value.strip_prefix("0x")?;
-    if hex.len() != N * 2 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return None;
-    }
-    let mut out = [0u8; N];
-    for (index, byte) in out.iter_mut().enumerate() {
-        let offset = index * 2;
-        *byte = u8::from_str_radix(&hex[offset..offset + 2], 16).ok()?;
-    }
-    Some(out)
+    domain::hex::parse_fixed_hex::<N>(value)
 }
 
 pub fn encode_hex(bytes: &[u8]) -> String {
-    let mut out = String::with_capacity(2 + bytes.len() * 2);
-    out.push_str("0x");
-    for byte in bytes {
-        use std::fmt::Write as _;
-        let _ = write!(out, "{byte:02x}");
-    }
-    out
+    domain::hex::encode_prefixed_hex(bytes)
 }

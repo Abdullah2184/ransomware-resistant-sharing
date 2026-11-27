@@ -18,6 +18,48 @@ const RANDOM_SEED_BYTES: usize = 32;
 const ENCAPSULATED_KEY_BYTES: usize = 32;
 const DEK_CIPHERTEXT_BYTES: usize = 32 + 16;
 
+/// Canonical masked (bit 255 cleared) representations of RFC 7748 §6.1
+/// low-order Curve25519 points that produce an all-zero DH shared secret.
+const X25519_LOW_ORDER_MASKED: [[u8; 32]; 7] = [
+    [0x00; 32],
+    [
+        0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00,
+    ],
+    [
+        0xe0, 0xeb, 0x7a, 0x7c, 0x3b, 0x41, 0xb8, 0xae, 0x16, 0x56, 0xe3, 0xfa, 0xf1, 0x9f, 0xc4,
+        0x6a, 0xda, 0x09, 0x8d, 0xeb, 0x9c, 0x32, 0xb1, 0xfd, 0x86, 0x62, 0x05, 0x16, 0x5f, 0x49,
+        0xb8, 0x00,
+    ],
+    [
+        0x5f, 0x9c, 0x95, 0xbc, 0xa3, 0x50, 0x8c, 0x24, 0xb1, 0xd0, 0xb1, 0x55, 0x9c, 0x83, 0xef,
+        0x5b, 0x04, 0x44, 0x5c, 0xc4, 0x58, 0x1c, 0x8e, 0x86, 0xd8, 0x22, 0x4e, 0xdd, 0xd0, 0x9f,
+        0x11, 0x57,
+    ],
+    [
+        0xec, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0xff, 0x7f,
+    ],
+    [
+        0xed, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0xff, 0x7f,
+    ],
+    [
+        0xee, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0xff, 0x7f,
+    ],
+];
+
+fn is_low_order_x25519(bytes: &[u8; 32]) -> bool {
+    let mut masked = *bytes;
+    masked[31] &= 0x7f;
+    X25519_LOW_ORDER_MASKED.contains(&masked)
+}
+
 type RecipientKem = X25519HkdfSha256;
 type RecipientPublicKey = <RecipientKem as KemTrait>::PublicKey;
 type RecipientPrivateKey = <RecipientKem as KemTrait>::PrivateKey;
@@ -52,6 +94,36 @@ impl WrapContext {
         }
     }
 
+    pub const fn file_id(&self) -> FileId {
+        self.file_id
+    }
+
+    pub const fn version_number(&self) -> VersionNumber {
+        self.version_number
+    }
+
+    pub const fn epoch_id(&self) -> EpochId {
+        self.epoch_id
+    }
+
+    pub const fn recipient_member_id(&self) -> MemberId {
+        self.recipient_member_id
+    }
+
+    pub const fn recipient_key_version(&self) -> KeyVersion {
+        self.recipient_key_version
+    }
+
+    fn validate(&self) -> Result<(), CryptoError> {
+        if self.file_id.as_bytes() == &[0; 32]
+            || self.epoch_id.as_bytes() == &[0; 32]
+            || self.recipient_member_id.as_bytes() == &[0; 32]
+        {
+            return Err(CryptoError::InvalidEnvelope);
+        }
+        Ok(())
+    }
+
     fn associated_data(self) -> Vec<u8> {
         let mut aad = Vec::with_capacity(HPKE_CONTEXT_DOMAIN.len() + 32 + 8 + 32 + 32 + 4);
         aad.extend_from_slice(HPKE_CONTEXT_DOMAIN);
@@ -70,7 +142,13 @@ pub struct HpkeRecipientPublicKey(RecipientPublicKey);
 
 impl HpkeRecipientPublicKey {
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, CryptoError> {
-        RecipientPublicKey::from_bytes(bytes)
+        let raw: &[u8; 32] = bytes
+            .try_into()
+            .map_err(|_| CryptoError::InvalidRecipientPublicKey)?;
+        if is_low_order_x25519(raw) {
+            return Err(CryptoError::InvalidRecipientPublicKey);
+        }
+        RecipientPublicKey::from_bytes(raw)
             .map(Self)
             .map_err(|_| CryptoError::InvalidRecipientPublicKey)
     }
@@ -131,7 +209,16 @@ impl HpkeRecipientKeyPair {
         envelope: &KeyEnvelope,
         context: WrapContext,
     ) -> Result<DataEncryptionKey, CryptoError> {
-        let encapped_key = RecipientEncappedKey::from_bytes(&envelope.encapsulated_key)
+        context.validate()?;
+        let enc_bytes: &[u8; 32] = envelope
+            .encapsulated_key
+            .as_slice()
+            .try_into()
+            .map_err(|_| CryptoError::InvalidEnvelope)?;
+        if is_low_order_x25519(enc_bytes) {
+            return Err(CryptoError::InvalidEnvelope);
+        }
+        let encapped_key = RecipientEncappedKey::from_bytes(enc_bytes)
             .map_err(|_| CryptoError::InvalidEnvelope)?;
         let mut receiver_context = hpke::setup_receiver::<HpkeAead, HpkeKdf, RecipientKem>(
             &OpModeR::Base,
@@ -145,11 +232,12 @@ impl HpkeRecipientKeyPair {
                 .open(&envelope.ciphertext, &context.associated_data())
                 .map_err(|_| CryptoError::AuthenticationFailed)?,
         );
-        let dek_bytes: [u8; 32] = plaintext
-            .as_slice()
-            .try_into()
-            .map_err(|_| CryptoError::InvalidEnvelope)?;
-        Ok(DataEncryptionKey::from_secret(Zeroizing::new(dek_bytes)))
+        if plaintext.len() != 32 {
+            return Err(CryptoError::InvalidEnvelope);
+        }
+        let mut dek_bytes = Zeroizing::new([0u8; 32]);
+        dek_bytes.copy_from_slice(&plaintext);
+        Ok(DataEncryptionKey::from_secret(dek_bytes))
     }
 }
 
@@ -188,6 +276,7 @@ impl KeyEnvelope {
         recipient: &HpkeRecipientPublicKey,
         context: WrapContext,
     ) -> Result<Self, CryptoError> {
+        context.validate()?;
         let mut rng = SystemEntropyRng::new()?;
         let (encapped_key, mut sender_context) =
             hpke::setup_sender_with_rng::<HpkeAead, HpkeKdf, RecipientKem>(
@@ -367,6 +456,56 @@ mod tests {
                 vec![0; DEK_CIPHERTEXT_BYTES - 1]
             ),
             Err(CryptoError::InvalidEnvelope)
+        );
+
+        // All RFC 7748 §6.1 low-order X25519 points (both bit-255=0 and bit-255=1)
+        // must be rejected at key parsing and as encapsulated keys during unwrap.
+        let recipient = HpkeRecipientKeyPair::generate().unwrap();
+        let valid_ctx = context(1, 1, 2, 3, 1);
+        for low_order in X25519_LOW_ORDER_MASKED {
+            assert_eq!(
+                HpkeRecipientPublicKey::from_bytes(&low_order).unwrap_err(),
+                CryptoError::InvalidRecipientPublicKey
+            );
+            let mut high_bit = low_order;
+            high_bit[31] |= 0x80;
+            assert_eq!(
+                HpkeRecipientPublicKey::from_bytes(&high_bit).unwrap_err(),
+                CryptoError::InvalidRecipientPublicKey
+            );
+
+            let forged_env =
+                KeyEnvelope::from_parts(low_order.to_vec(), vec![0xaa; DEK_CIPHERTEXT_BYTES])
+                    .unwrap();
+            assert_eq!(
+                recipient.open_dek(&forged_env, valid_ctx).err(),
+                Some(CryptoError::InvalidEnvelope)
+            );
+        }
+
+        // Zero file_id, epoch_id, or recipient_member_id rejected on wrap and open.
+        let valid_env = KeyEnvelope::wrap(&dek(), recipient.public_key(), valid_ctx).unwrap();
+        for bad_ctx in [
+            context(0, 1, 2, 3, 1),
+            context(1, 1, 0, 3, 1),
+            context(1, 1, 2, 0, 1),
+        ] {
+            assert_eq!(
+                KeyEnvelope::wrap(&dek(), recipient.public_key(), bad_ctx),
+                Err(CryptoError::InvalidEnvelope)
+            );
+            assert_eq!(
+                recipient.open_dek(&valid_env, bad_ctx).err(),
+                Some(CryptoError::InvalidEnvelope)
+            );
+        }
+
+        // 1-bit flip in the trailing GCM tag byte of wrappedDek fails authentication.
+        let mut bad_tag = valid_env;
+        *bad_tag.ciphertext.last_mut().unwrap() ^= 0x01;
+        assert_eq!(
+            recipient.open_dek(&bad_tag, valid_ctx).err(),
+            Some(CryptoError::AuthenticationFailed)
         );
     }
 

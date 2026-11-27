@@ -7,6 +7,7 @@ services:
     environment:
       IPFS_PROFILE: server
       LIBP2P_TCP_MUX: "false"
+      KUBO_BOOTSTRAP_MULTIADDRS: ${KUBO_BOOTSTRAP_MULTIADDRS:-}
     ports:
       - "${KUBO_API_BIND_IP:-127.0.0.1}:5001:5001"
       - "${KUBO_SWARM_BIND_IP:-0.0.0.0}:4001:4001"
@@ -37,6 +38,7 @@ services:
       CLUSTER_IPFSHTTP_NODEMULTIADDRESS: /dns4/kubo/tcp/5001
       CLUSTER_RESTAPI_HTTPLISTENMULTIADDRESS: /ip4/0.0.0.0/tcp/9094
       CLUSTER_MONITORPINGINTERVAL: 5s
+      CLUSTER_BOOTSTRAP_MULTIADDRS: ${CLUSTER_BOOTSTRAP_MULTIADDRS:-}
     ports:
       - "${CLUSTER_API_BIND_IP:-127.0.0.1}:9094:9094"
       - "${CLUSTER_SWARM_BIND_IP:-0.0.0.0}:9096:9096"
@@ -50,6 +52,14 @@ services:
         target: cluster-secret
       - source: cluster_api_password
         target: cluster-api-password
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - password=$$(cat /run/secrets/cluster-api-password); ipfs-cluster-ctl --host /ip4/127.0.0.1/tcp/9094 --basic-auth "rrfs-admin:$$password" --force-http id >/dev/null
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
 
 volumes:
   ipfs_data:

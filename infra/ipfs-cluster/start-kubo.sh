@@ -12,9 +12,11 @@ chown -R ipfs /data/ipfs
 if [ ! -f /data/ipfs/config ]; then
     gosu ipfs ipfs init --profile server
     gosu ipfs ipfs config Addresses.API /ip4/0.0.0.0/tcp/5001
-    gosu ipfs ipfs config Addresses.Gateway /ip4/127.0.0.1/tcp/8080
 fi
 
+# Disable Kubo's HTTP Gateway listener; all client retrieval is mediated
+# through the authenticated RRDS Gateway (`TECHNICAL_SPECIFICATION.md` §10.4.3).
+gosu ipfs ipfs config Addresses.Gateway ""
 gosu ipfs install -m 0400 /run/secrets/swarm-key /data/ipfs/swarm.key
 gosu ipfs ipfs config --json Bootstrap '[]'
 gosu ipfs ipfs config --json Swarm.DisableNatPortMap true
@@ -36,7 +38,28 @@ gosu ipfs ipfs config --bool Provide.DHT.SweepEnabled false
 gosu ipfs ipfs config --bool AutoConf.Enabled false
 gosu ipfs ipfs config --bool AutoTLS.Enabled false
 
-if [ -n "${KUBO_BOOTSTRAP_FROM:-}" ]; then
+if [ -n "${KUBO_BOOTSTRAP_MULTIADDRS:-}" ]; then
+    # Multi-organization production mode: configure explicit static private
+    # swarm multiaddrs without requiring access to another org's Kubo Admin API.
+    bootstrap_json="["
+    first=1
+    old_ifs=$IFS
+    IFS=,
+    for addr in $KUBO_BOOTSTRAP_MULTIADDRS; do
+        trimmed=$(printf '%s' "$addr" | tr -d '[:space:]')
+        if [ -n "$trimmed" ]; then
+            if [ "$first" -eq 0 ]; then
+                bootstrap_json="$bootstrap_json,"
+            fi
+            bootstrap_json="$bootstrap_json\"$trimmed\""
+            first=0
+        fi
+    done
+    IFS=$old_ifs
+    bootstrap_json="$bootstrap_json]"
+    gosu ipfs ipfs config --json Bootstrap "$bootstrap_json"
+elif [ -n "${KUBO_BOOTSTRAP_FROM:-}" ]; then
+    # Local single-host Compose development convenience only.
     bootstrap_api="/dns4/$KUBO_BOOTSTRAP_FROM/tcp/5001"
     bootstrap_peer_id=""
     attempt=0

@@ -533,11 +533,17 @@ fn address_word(address: EvmAddress) -> [u8; 32] {
     word
 }
 
-fn keccak(bytes: &[u8]) -> [u8; 32] {
+/// Computes a 32-byte Keccak-256 digest.
+#[must_use]
+pub fn keccak256(bytes: &[u8]) -> [u8; 32] {
     let hash = Keccak256::digest(bytes);
     let mut output = [0; 32];
     output.copy_from_slice(&hash);
     output
+}
+
+fn keccak(bytes: &[u8]) -> [u8; 32] {
+    keccak256(bytes)
 }
 
 fn write_hex(formatter: &mut fmt::Formatter<'_>, bytes: &[u8]) -> fmt::Result {

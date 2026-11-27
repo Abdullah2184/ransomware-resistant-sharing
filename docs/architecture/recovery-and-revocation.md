@@ -42,9 +42,12 @@ When an endpoint or member key is suspected compromised:
      `MemberKeyProof` signed by the **new** signing key (preventing an authority
      from binding a key the member does not control).
    - Marks prior signing and encryption key versions `Superseded` while keeping
-     their historical records queryable.
+     their historical records queryable; key custody assigns distinct
+     version-bound `KeyId`s and rejects `WrapContext` requests whose
+     `(memberId, encryptionKeyVersion)` does not match the active custody key.
    - Re-wrapping selected historical DEKs for a replacement encryption key is an
-     explicit, audited envelope-update workflow, never automatic.
+     explicit, audited envelope-update workflow (`ShareService`, preserving
+     single-entry-per-member replacement at `revision + 1`), never automatic.
 
 ## Read and Write ACL Revocation
 
@@ -77,12 +80,19 @@ corrupted `V2` on top of clean `V1`:
    RRDS does not claim a valid signature proves content is malware-free (no
    `trustedVersion` flag in MVP); human/operational review selects `V1`.
 3. **Verify and decrypt `V1`:**
-   - Authorize retrieval of `V1` (requires explicit historical Read grant if
-     `V1 < head`).
-   - Verify the canonical `KeyEnvelopeSet`, unwrap `V1`'s DEK via hardware key
-     custody, verify the canonical `EncryptedFileManifest` and every chunk's
-     SHA-256 CID, and authenticate every AES-256-GCM tag before accepting the
-     recovered plaintext.
+   - Authorize retrieval of `V1` (`POST .../access`, requiring an explicit
+     historical Read grant if `V1 < head`, returning authoritative
+     `manifestHash` and CIDs).
+   - Fetch and verify the CARv1 / 2-level UnixFS content package
+     (`crates/crypto/src/car.rs`) and canonical `KeyEnvelopeSet` raw SHA-256 CID.
+   - **Before** calling key custody, `DownloadService` verifies the canonical
+     `EncryptedFileManifest`, `manifestHash` match, chunk layout, and every
+     chunk's `raw_sha256_cid` so tampered packages never unwrap a DEK into memory.
+   - Unwrap `V1`'s DEK via `KeyCustodyProvider::unwrap_dek` and authenticate
+     optional private metadata (chunk 0) and every AES-256-GCM content chunk into
+     a `Zeroizing<Vec<u8>>` buffer (zeroized automatically on any tag failure;
+     `apps/cli` writes restored files atomically via `0600` temp + `fsync` +
+     `rename` only after full verification).
 4. **Restore as a brand-new head version (`V3`):**
    - Run the recovered `V1` plaintext through the standard upload pipeline
      (`UploadService::restore_version`):

@@ -241,10 +241,9 @@ contract FileRegistry {
         }
         if (files[folderId].status != FileStatus.Unregistered) revert FolderAlreadyExists();
         if (folders[folderId].organizationId != bytes32(0)) revert FolderAlreadyExists();
-        if (
-            files[folderId].status != FileStatus.Unregistered
-                || accessGovernance.organizationAuthority(organizationId) != msg.sender
-        ) revert UnauthorizedMetadataAuthority();
+        if (accessGovernance.organizationAuthority(organizationId) != msg.sender) {
+            revert UnauthorizedMetadataAuthority();
+        }
         if (bytes(displayName).length == 0) revert InvalidMetadata();
         _requireFolderInOrganization(parentFolderId, organizationId);
 

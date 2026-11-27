@@ -938,44 +938,19 @@ async fn append_audit(
 }
 
 pub fn hash_session_token(token: &[u8; 32]) -> [u8; 32] {
-    let digest = Keccak256::digest(token);
-    let mut hash = [0; 32];
-    hash.copy_from_slice(&digest);
-    hash
+    crypto::keccak256(token)
 }
 
 pub fn source_identifier(source: &str) -> String {
-    let digest = Keccak256::digest(source.as_bytes());
-    let mut output = String::with_capacity(66);
-    output.push_str("0x");
-    for byte in digest {
-        use std::fmt::Write as _;
-        let _ = write!(output, "{byte:02x}");
-    }
-    output
+    domain::hex::encode_prefixed_hex(&crypto::keccak256(source.as_bytes()))
 }
 
 pub fn encode_hex(bytes: &[u8]) -> String {
-    let mut output = String::with_capacity(bytes.len() * 2 + 2);
-    output.push_str("0x");
-    for byte in bytes {
-        use std::fmt::Write as _;
-        let _ = write!(output, "{byte:02x}");
-    }
-    output
+    domain::hex::encode_prefixed_hex(bytes)
 }
 
 fn decode_nonce(value: &str) -> Option<[u8; 32]> {
-    let value = value.strip_prefix("0x")?;
-    if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        return None;
-    }
-    let mut nonce = [0; 32];
-    for (index, byte) in nonce.iter_mut().enumerate() {
-        let offset = index * 2;
-        *byte = u8::from_str_radix(&value[offset..offset + 2], 16).ok()?;
-    }
-    Some(nonce)
+    domain::hex::parse_fixed_hex::<32>(value)
 }
 
 fn unix_seconds() -> Result<u64, sqlx::Error> {
@@ -1000,12 +975,11 @@ mod tests {
     static TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     #[tokio::test]
+    #[ignore = "requires DATABASE_URL (PostgreSQL)"]
     async fn challenge_session_rate_limit_and_audit_are_transactional() {
         let _guard = TEST_LOCK.lock().await;
-        let Ok(database_url) = std::env::var("DATABASE_URL") else {
-            eprintln!("Skipping gateway PostgreSQL test: DATABASE_URL is not set");
-            return;
-        };
+        let database_url = std::env::var("DATABASE_URL")
+            .expect("DATABASE_URL must be set when running ignored gateway PostgreSQL tests");
         let metadata = PostgresStore::connect(&database_url)
             .await
             .expect("connect to PostgreSQL for gateway test");
@@ -1344,12 +1318,11 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires DATABASE_URL (PostgreSQL)"]
     async fn concurrent_challenges_nonces_rate_limits_and_audit_chain_are_race_free() {
         let _guard = TEST_LOCK.lock().await;
-        let Ok(database_url) = std::env::var("DATABASE_URL") else {
-            eprintln!("Skipping gateway concurrency PostgreSQL test: DATABASE_URL is not set");
-            return;
-        };
+        let database_url = std::env::var("DATABASE_URL")
+            .expect("DATABASE_URL must be set when running ignored gateway PostgreSQL tests");
         let pool_config = metadata_store::PostgresPoolConfig {
             max_connections: 12,
             acquire_timeout: std::time::Duration::from_secs(10),
@@ -1512,12 +1485,11 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires DATABASE_URL (PostgreSQL)"]
     async fn projection_listings_version_history_and_self_audited_queries_execute_on_postgres() {
         let _guard = TEST_LOCK.lock().await;
-        let Ok(database_url) = std::env::var("DATABASE_URL") else {
-            eprintln!("Skipping gateway projection query PostgreSQL test: DATABASE_URL is not set");
-            return;
-        };
+        let database_url = std::env::var("DATABASE_URL")
+            .expect("DATABASE_URL must be set when running ignored gateway PostgreSQL tests");
         let metadata = PostgresStore::connect(&database_url)
             .await
             .expect("connect to PostgreSQL");

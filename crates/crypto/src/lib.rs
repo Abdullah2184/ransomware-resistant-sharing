@@ -1,11 +1,14 @@
 //! Cryptographic primitives and versioned encrypted-content formats.
 
+pub mod car;
 pub mod encryption;
 pub mod envelope_set;
 pub mod key_wrapping;
 pub mod manifest;
 pub mod nonce;
 pub mod signing;
+
+pub use car::{VerifiedCarPackage, encode_unixfs_car_package, extract_verified_car_package};
 
 pub use encryption::{
     ChunkDecryptor, ChunkEncryptor, CryptoError, DEFAULT_CHUNK_SIZE_BYTES, DataEncryptionKey,
@@ -22,4 +25,5 @@ pub use nonce::NoncePrefix;
 pub use signing::{
     AccessLookup, ChainId, Eip712Domain, EnvelopeSetUpdate, LoginChallengeDigestInput,
     MemberKeyProof, SigningError, TypedDigest, UnixDeadline, VerifyingContractKind, VersionAppend,
+    keccak256,
 };

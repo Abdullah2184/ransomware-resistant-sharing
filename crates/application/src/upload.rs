@@ -193,7 +193,7 @@ where
             .await
             .map_err(|_| DomainError::KeyCustodyUnavailable)?;
         let recipients = self
-            .resolve_active_recipients(identity.member_id, reader_member_ids)
+            .resolve_active_recipients(&identity, reader_member_ids)
             .await?;
 
         let prepared = self
@@ -315,7 +315,7 @@ where
             .await
             .map_err(|_| DomainError::KeyCustodyUnavailable)?;
         let recipients = self
-            .resolve_active_recipients(identity.member_id, reader_member_ids)
+            .resolve_active_recipients(&identity, reader_member_ids)
             .await?;
 
         let prepared = self
@@ -419,11 +419,12 @@ where
 
     async fn resolve_active_recipients(
         &self,
-        author_member_id: MemberId,
+        author_custody: &ports::PublicIdentityKeys,
         reader_member_ids: &[MemberId],
     ) -> Result<Vec<PublicMemberIdentity>, DomainError> {
         let mut unique = BTreeMap::new();
-        for &member_id in std::iter::once(&author_member_id).chain(reader_member_ids.iter()) {
+        for &member_id in std::iter::once(&author_custody.member_id).chain(reader_member_ids.iter())
+        {
             if member_id.as_bytes() == &[0; 32] {
                 return Err(DomainError::InvalidIdentifier);
             }
@@ -437,6 +438,12 @@ where
                 .ok_or(DomainError::Unauthorized)?;
             if !identity.is_active() {
                 return Err(DomainError::MemberSuspended);
+            }
+            // Fail fast before pinning if local custody holds a stale signing key.
+            if member_id == author_custody.member_id
+                && identity.signing_address != author_custody.signing_address
+            {
+                return Err(DomainError::Unauthorized);
             }
             unique.insert(member_id, identity);
         }
