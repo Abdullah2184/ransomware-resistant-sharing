@@ -21,12 +21,6 @@ pub type StoreFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, sqlx::Error>
 pub trait GatewayChainPort: Send + Sync {
     fn finalized_block(&self) -> ChainFuture<'_, FinalizedBlock>;
 
-    fn active_member_signer<'a>(
-        &'a self,
-        access_governance: &'a EvmAddress,
-        member_id: &'a [u8; 32],
-    ) -> ChainFuture<'a, Option<EvmAddress>>;
-
     fn member_identity<'a>(
         &'a self,
         access_governance: &'a EvmAddress,
@@ -86,14 +80,6 @@ pub trait GatewayChainPort: Send + Sync {
 impl GatewayChainPort for BesuClient {
     fn finalized_block(&self) -> ChainFuture<'_, FinalizedBlock> {
         Box::pin(self.finalized_block())
-    }
-
-    fn active_member_signer<'a>(
-        &'a self,
-        access_governance: &'a EvmAddress,
-        member_id: &'a [u8; 32],
-    ) -> ChainFuture<'a, Option<EvmAddress>> {
-        Box::pin(self.active_member_signer(access_governance, member_id))
     }
 
     fn member_identity<'a>(
@@ -198,6 +184,9 @@ pub trait GatewayRelayerPort: Send + Sync {
         call: EnvelopeSetUpdateCall,
         signature: Vec<u8>,
     ) -> RelayFuture<'_, RelayOutcome>;
+
+    #[allow(dead_code)]
+    fn reconcile_transaction(&self, tx_hash: [u8; 32]) -> RelayFuture<'_, Option<RelayOutcome>>;
 }
 
 /// Production relayer adapter targeting deployed `FileRegistry` and `AccessGovernance`.
@@ -262,6 +251,10 @@ impl GatewayRelayerPort for BesuContractRelayer {
         let gas = Some(self.gas_limit);
         Box::pin(async move { self.relayer.submit_and_confirm(to, calldata, gas).await })
     }
+
+    fn reconcile_transaction(&self, tx_hash: [u8; 32]) -> RelayFuture<'_, Option<RelayOutcome>> {
+        Box::pin(async move { self.relayer.reconcile_transaction(tx_hash).await })
+    }
 }
 
 /// PostgreSQL operational state, projection read, and audit boundary for gateway routes.
@@ -305,6 +298,7 @@ pub trait GatewayStorePort: Send + Sync {
         session_expires_at: u64,
         source_id: &'a str,
         chain_id: u64,
+        block_number: u64,
     ) -> StoreFuture<'a, bool>;
 
     #[allow(clippy::too_many_arguments)]
@@ -455,6 +449,7 @@ impl GatewayStorePort for GatewayStore {
         session_expires_at: u64,
         source_id: &'a str,
         chain_id: u64,
+        block_number: u64,
     ) -> StoreFuture<'a, bool> {
         Box::pin(self.complete_login(
             challenge,
@@ -462,6 +457,7 @@ impl GatewayStorePort for GatewayStore {
             session_expires_at,
             source_id,
             chain_id,
+            block_number,
         ))
     }
 

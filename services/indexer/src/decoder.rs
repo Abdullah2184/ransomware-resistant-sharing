@@ -52,6 +52,14 @@ const EVENTS: &[&str] = &[
     "CurrentHeadAdvanced(bytes32,uint64,bytes32)",
     "FolderCreated(bytes32,bytes32,bytes32,string,address)",
     "FolderRenamed(bytes32,string,address)",
+    "RoleAdminChanged(bytes32,bytes32,bytes32)",
+    "RoleGranted(bytes32,address,address)",
+    "RoleRevoked(bytes32,address,address)",
+    "CallScheduled(bytes32,uint256,address,uint256,bytes,bytes32,uint256)",
+    "CallExecuted(bytes32,uint256,address,uint256,bytes)",
+    "CallSalt(bytes32,bytes32)",
+    "Cancelled(bytes32)",
+    "MinDelayChange(uint256,uint256)",
 ];
 
 pub fn decode(log: &ChainLog) -> Result<DecodedEvent, DecodeError> {
@@ -204,6 +212,43 @@ pub fn decode(log: &ChainLog) -> Result<DecodedEvent, DecodeError> {
             "display_name": string_word(&data, 0)?,
             "actor": indexed_address(&topics, 1)?
         }),
+        "RoleAdminChanged(bytes32,bytes32,bytes32)" => json!({
+            "role": indexed(&topics, 0)?,
+            "previous_admin_role": indexed(&topics, 1)?,
+            "new_admin_role": indexed(&topics, 2)?
+        }),
+        "RoleGranted(bytes32,address,address)" | "RoleRevoked(bytes32,address,address)" => json!({
+            "role": indexed(&topics, 0)?,
+            "account": indexed_address(&topics, 1)?,
+            "sender": indexed_address(&topics, 2)?
+        }),
+        "CallScheduled(bytes32,uint256,address,uint256,bytes,bytes32,uint256)" => json!({
+            "id": indexed(&topics, 0)?,
+            "index": number_topic(&topics, 1)?,
+            "target": address_word(&data, 0)?,
+            "value": number_word(&data, 1)?,
+            "data": bytes_word(&data, 2)?,
+            "predecessor": word_hex(&data, 3)?,
+            "delay": number_word(&data, 4)?
+        }),
+        "CallExecuted(bytes32,uint256,address,uint256,bytes)" => json!({
+            "id": indexed(&topics, 0)?,
+            "index": number_topic(&topics, 1)?,
+            "target": address_word(&data, 0)?,
+            "value": number_word(&data, 1)?,
+            "data": bytes_word(&data, 2)?
+        }),
+        "CallSalt(bytes32,bytes32)" => json!({
+            "id": indexed(&topics, 0)?,
+            "salt": word_hex(&data, 0)?
+        }),
+        "Cancelled(bytes32)" => json!({
+            "id": indexed(&topics, 0)?
+        }),
+        "MinDelayChange(uint256,uint256)" => json!({
+            "old_duration": number_word(&data, 0)?,
+            "new_duration": number_word(&data, 1)?
+        }),
         _ => return Err(DecodeError::InvalidLog),
     };
 
@@ -284,7 +329,19 @@ fn small_integer(word: &[u8]) -> Result<u64, DecodeError> {
     Ok(u64::from_be_bytes(value))
 }
 
+fn bytes_word(data: &[u8], offset_word: usize) -> Result<String, DecodeError> {
+    let slice = dynamic_bytes(data, offset_word)?;
+    Ok(format!("0x{}", encode_hex(slice)))
+}
+
 fn string_word(data: &[u8], offset_word: usize) -> Result<String, DecodeError> {
+    let text = dynamic_bytes(data, offset_word)?;
+    std::str::from_utf8(text)
+        .map(str::to_owned)
+        .map_err(|_| DecodeError::InvalidAbiData)
+}
+
+fn dynamic_bytes(data: &[u8], offset_word: usize) -> Result<&[u8], DecodeError> {
     let offset = usize::try_from(small_integer(word(data, offset_word)?)?)
         .map_err(|_| DecodeError::InvalidAbiData)?;
     let head_end = offset_word
@@ -304,10 +361,7 @@ fn string_word(data: &[u8], offset_word: usize) -> Result<String, DecodeError> {
     let end = start
         .checked_add(length)
         .ok_or(DecodeError::InvalidAbiData)?;
-    let text = data.get(start..end).ok_or(DecodeError::InvalidAbiData)?;
-    std::str::from_utf8(text)
-        .map(str::to_owned)
-        .map_err(|_| DecodeError::InvalidAbiData)
+    data.get(start..end).ok_or(DecodeError::InvalidAbiData)
 }
 
 fn map_chain_error(_error: ChainError) -> DecodeError {
@@ -478,5 +532,81 @@ mod tests {
             decoded.fields["proposal_id"],
             format!("0x{}", "44".repeat(32))
         );
+    }
+
+    #[test]
+    fn decodes_access_control_and_timelock_governance_events() {
+        let role_sig = "RoleGranted(bytes32,address,address)";
+        let role_decoded = decode(&log(
+            role_sig,
+            vec![
+                topic(&"11".repeat(32)),
+                topic(&format!("{}{}", "00".repeat(12), "22".repeat(20))),
+                topic(&format!("{}{}", "00".repeat(12), "33".repeat(20))),
+            ],
+            "0x".to_owned(),
+        ))
+        .unwrap();
+        assert_eq!(role_decoded.name, "RoleGranted");
+        assert_eq!(
+            role_decoded.fields["account"],
+            format!("0x{}", "22".repeat(20))
+        );
+        assert_eq!(
+            role_decoded.fields["sender"],
+            format!("0x{}", "33".repeat(20))
+        );
+
+        let sched_sig = "CallScheduled(bytes32,uint256,address,uint256,bytes,bytes32,uint256)";
+        let calldata_hex = "aabbccdd";
+        let mut calldata_tail = word_hex_u64(4);
+        calldata_tail.push_str(calldata_hex);
+        calldata_tail.push_str(&"00".repeat(28));
+        let sched_data = format!(
+            "0x{}{}{}{}{}{}",
+            format_args!("{}{}", "00".repeat(12), "44".repeat(20)),
+            word_hex_u64(0),
+            word_hex_u64(160), // dynamic bytes offset = 5 * 32
+            "55".repeat(32),
+            word_hex_u64(86_400),
+            calldata_tail,
+        );
+        let sched_decoded = decode(&log(
+            sched_sig,
+            vec![topic(&"aa".repeat(32)), topic(&word_hex_u64(1))],
+            sched_data,
+        ))
+        .unwrap();
+        assert_eq!(sched_decoded.name, "CallScheduled");
+        assert_eq!(sched_decoded.fields["index"], 1);
+        assert_eq!(
+            sched_decoded.fields["target"],
+            format!("0x{}", "44".repeat(20))
+        );
+        assert_eq!(sched_decoded.fields["data"], format!("0x{calldata_hex}"));
+        assert_eq!(sched_decoded.fields["delay"], 86_400);
+
+        let delay_decoded = decode(&log(
+            "MinDelayChange(uint256,uint256)",
+            vec![],
+            format!("0x{}{}", word_hex_u64(0), word_hex_u64(86_400)),
+        ))
+        .unwrap();
+        assert_eq!(delay_decoded.name, "MinDelayChange");
+        assert_eq!(delay_decoded.fields["old_duration"], 0);
+        assert_eq!(delay_decoded.fields["new_duration"], 86_400);
+
+        // Malformed dynamic bytes offset in CallExecuted must fail closed.
+        let bad_exec = log(
+            "CallExecuted(bytes32,uint256,address,uint256,bytes)",
+            vec![topic(&"aa".repeat(32)), topic(&word_hex_u64(0))],
+            format!(
+                "0x{}{}{}",
+                format_args!("{}{}", "00".repeat(12), "44".repeat(20)),
+                word_hex_u64(0),
+                word_hex_u64(999),
+            ),
+        );
+        assert_eq!(decode(&bad_exec), Err(DecodeError::InvalidAbiData));
     }
 }

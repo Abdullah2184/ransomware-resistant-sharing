@@ -12,8 +12,10 @@ for the architectural decision record.
 
 - **QBFT finality reads (`BesuClient`):** Queries `eth_getBlockByNumber("latest")`
   as the QBFT-committed head (never the PoS `finalized` tag), retrieves event
-  logs (`eth_getLogs`) strictly filtered to configured contracts, and executes
-  pinned-block `eth_call` reads for `memberIdentity`, `hasReadAccess`,
+  logs (`eth_getLogs`) strictly filtered to configured contracts, distinguishes
+  EIP-1474 execution reverts (`code == 3` with expected custom error selectors)
+  from non-revert RPC failures (such as Bonsai pruned-state `-32603`), and
+  executes pinned-block `eth_call` reads for `memberIdentity`, `hasReadAccess`,
   `hasWriteAccess`, `hasHistoricalReadAccess`, `getFile`, `getVersion`, and
   `currentEnvelopeSet`.
 - **ABI calldata encoding (`relayer.rs`):** Encodes canonical Solidity calldata
@@ -23,8 +25,12 @@ for the architectural decision record.
   - `AccessGovernance.updateEnvelopeSet`
 - **Type-2 transaction relayer (`TransactionRelayer`):**
   - Isolates relayer signing behind `RelayerSigner`; `RelayerStartupPolicy::Production`
-    rejects `DevelopmentRelayerSigner`.
-  - Serializes nonce allocation per relayer account against `eth_getTransactionCount(..., "pending")`.
+    rejects `DevelopmentRelayerSigner`, and dev secret env loading uses
+    `Zeroizing` buffers.
+  - Serializes nonce allocation per relayer account against `eth_getTransactionCount(..., "pending")`
+    (resetting cached nonce on send errors or confirmation timeouts so a dropped
+    mempool tx cannot wedge subsequent relays) and provides bounded gas
+    estimation (`estimate_bounded_gas`).
   - Constructs canonical zero-gas-price EIP-2718 Type-2 transactions (`0x02 || rlp(...)`)
     compatible with London Besu QBFT (`min-gas-price = 0`, `baseFeePerGas = 0`).
   - Distinguishes `RelayOutcome::Committed`, `RelayOutcome::Reverted`, and

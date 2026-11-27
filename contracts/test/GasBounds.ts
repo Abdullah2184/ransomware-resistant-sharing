@@ -289,11 +289,26 @@ describe("RRDS contract gas bounds (§7.9)", function () {
     });
     const envUpdateTx = await governance.write.updateEnvelopeSet(
       [envReq, envSig],
-      { account: orgSafe.account },
+      { account: relayer.account },
     );
     const envUpdateReceipt = await publicClient.waitForTransactionReceipt({
       hash: envUpdateTx,
     });
+    assert.equal(envUpdateReceipt.status, "success");
+    const [updatedCid, , updatedRevision] = await governance.read.currentEnvelopeSet([
+      FILE_ID,
+      1n,
+    ]);
+    assert.equal(updatedCid, ENV_CID_V1_R2);
+    assert.equal(updatedRevision, 2);
+
+    // Confirm relayer still cannot mutate ACLs (policy Safe remains strictly required).
+    await assert.rejects(
+      governance.write.setFilePermission(
+        [FILE_ID, BOB_ID, 1, true, ZERO_BYTES32],
+        { account: relayer.account },
+      ),
+    );
 
     const measurements: Record<string, bigint> = {
       timelockScheduleBatch: scheduleReceipt.gasUsed,

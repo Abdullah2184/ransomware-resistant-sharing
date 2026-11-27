@@ -11,7 +11,9 @@ import urllib.request
 def local_config(name: str, default: str) -> str:
     if name in os.environ:
         return os.environ[name]
-    root_env = os.path.join(os.path.dirname(__file__), "..", "..", "..", ".env")
+    root_env = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "..", "..", ".env"
+    )
     try:
         with open(root_env, encoding="utf-8") as config:
             for line in config:

@@ -166,6 +166,7 @@ impl GatewayStore {
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn complete_login_in_transaction(
         &self,
         transaction: &mut Transaction<'_, Postgres>,
@@ -174,6 +175,7 @@ impl GatewayStore {
         session_expires_at: u64,
         source_id: &str,
         chain_id: u64,
+        block_number: u64,
     ) -> Result<bool, sqlx::Error> {
         let nonce = decode_nonce(&challenge.nonce).ok_or(sqlx::Error::Protocol(
             "invalid canonical challenge nonce".into(),
@@ -226,7 +228,7 @@ impl GatewayStore {
                 resource_id: None,
                 resource_version: None,
                 chain_id,
-                block_number: None,
+                block_number: Some(block_number),
             },
         )
         .await?;
@@ -312,6 +314,7 @@ impl GatewayStore {
         session_expires_at: u64,
         source_id: &str,
         chain_id: u64,
+        block_number: u64,
     ) -> Result<bool, sqlx::Error> {
         let mut transaction = self.pool.begin().await?;
         let completed = self
@@ -322,6 +325,7 @@ impl GatewayStore {
                 session_expires_at,
                 source_id,
                 chain_id,
+                block_number,
             )
             .await?;
         if completed {
@@ -1015,6 +1019,7 @@ mod tests {
                     challenge.expires_at + 900,
                     "test-source",
                     1337,
+                    100,
                 )
                 .await
                 .expect("consume challenge once")
@@ -1028,6 +1033,7 @@ mod tests {
                     challenge.expires_at + 900,
                     "test-source",
                     1337,
+                    100,
                 )
                 .await
                 .expect("reject challenge replay")
@@ -1239,6 +1245,7 @@ mod tests {
                     fresh_challenge.expires_at + 900,
                     "test-source",
                     1337,
+                    100,
                 )
                 .await
                 .expect("complete fresh login triggers expired session pruning")
@@ -1366,7 +1373,7 @@ mod tests {
                 let mut raw_token = [idx.wrapping_add(1); 32];
                 raw_token[24..32].copy_from_slice(&run_tag.to_be_bytes());
                 let token_hash = hash_session_token(&raw_token);
-                s.complete_login(&c, &token_hash, now + 900, "concurrency-src", 1337)
+                s.complete_login(&c, &token_hash, now + 900, "concurrency-src", 1337, 100)
                     .await
                     .expect("complete_login must not error under concurrency")
             }));

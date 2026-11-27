@@ -4,7 +4,7 @@ mod ports;
 mod routes;
 mod store;
 
-use std::{env, error::Error, net::TcpListener, sync::Arc};
+use std::{env, error::Error, net::TcpListener, sync::Arc, time::Duration};
 
 use chain_adapter::{
     BesuClient, DevelopmentRelayerSigner, RelayerConfig, RelayerStartupPolicy, TransactionRelayer,
@@ -61,14 +61,8 @@ fn build_optional_relayer(
     let allow_unsafe_dev = env::var("GATEWAY_ALLOW_UNSAFE_DEV_RELAYER")
         .map(|value| value == "true")
         .unwrap_or(false);
-    let dev_key = match env::var("GATEWAY_RELAYER_UNSAFE_DEV_KEY") {
-        Ok(value) if !value.is_empty() => Some(value),
-        Ok(_) | Err(env::VarError::NotPresent) => None,
-        Err(env::VarError::NotUnicode(_)) => {
-            return Err(std::io::Error::other("GATEWAY_RELAYER_UNSAFE_DEV_KEY is invalid").into());
-        }
-    };
-    let Some(dev_key) = dev_key else {
+    let Some(signer) = DevelopmentRelayerSigner::from_env_var("GATEWAY_RELAYER_UNSAFE_DEV_KEY")?
+    else {
         return Ok(None);
     };
     let policy = if allow_unsafe_dev {
@@ -76,12 +70,14 @@ fn build_optional_relayer(
     } else {
         RelayerStartupPolicy::Production
     };
-    let signer = Arc::new(DevelopmentRelayerSigner::from_hex_secret(&dev_key)?);
+    let signer = Arc::new(signer);
     let mut relayer_config = RelayerConfig::local_default(config.chain_id);
     relayer_config.default_gas_limit = config.default_tx_gas_limit;
     relayer_config.max_gas_limit = relayer_config
         .max_gas_limit
         .max(config.default_tx_gas_limit);
+    relayer_config.confirmation_timeout =
+        Duration::from_secs(config.transaction_confirmation_timeout_seconds);
     let relayer_client = BesuClient::new(&config.besu_rpc_url)?;
     let tx_relayer = TransactionRelayer::new(relayer_client, signer, policy, relayer_config)?;
     Ok(Some(BesuContractRelayer::new(

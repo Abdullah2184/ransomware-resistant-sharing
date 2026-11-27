@@ -9,7 +9,8 @@ use serde_json::Value;
 use sqlx::{AssertSqlSafe, PgPool, Row};
 use tokio::{signal, sync::Mutex, time};
 
-const POLL_INTERVAL: Duration = Duration::from_secs(5);
+const DEFAULT_FINALITY_CHECK_INTERVAL_SECONDS: u64 = 5;
+const MAX_FINALITY_CHECK_INTERVAL_SECONDS: u64 = 300;
 const MAX_BATCH_BLOCKS: u64 = 1_000;
 
 #[derive(Clone, Debug)]
@@ -17,9 +18,11 @@ struct Config {
     expected_chain_id: u64,
     start_block: u64,
     batch_size: u64,
+    poll_interval: Duration,
     reconciliation_interval: Duration,
     file_registry: EvmAddress,
     access_governance: EvmAddress,
+    timelock: Option<EvmAddress>,
 }
 
 impl Config {
@@ -28,6 +31,14 @@ impl Config {
         let start_block = parse_env_u64("INDEXER_START_BLOCK", "0")?;
         let batch_size = parse_env_u64("INDEXER_BATCH_SIZE", "100")?;
         if batch_size == 0 || batch_size > MAX_BATCH_BLOCKS {
+            return Err(IndexerError::InvalidConfiguration);
+        }
+        let poll_interval_seconds = parse_env_u64(
+            "FINALITY_CHECK_INTERVAL",
+            &DEFAULT_FINALITY_CHECK_INTERVAL_SECONDS.to_string(),
+        )?;
+        if poll_interval_seconds == 0 || poll_interval_seconds > MAX_FINALITY_CHECK_INTERVAL_SECONDS
+        {
             return Err(IndexerError::InvalidConfiguration);
         }
         let confirmation_policy =
@@ -40,17 +51,23 @@ impl Config {
             expected_chain_id,
             start_block,
             batch_size,
+            poll_interval: Duration::from_secs(poll_interval_seconds),
             reconciliation_interval: Duration::from_secs(parse_env_u64(
                 "INDEXER_RECONCILIATION_INTERVAL_SECONDS",
                 "60",
             )?),
             file_registry: parse_address_env("CONTRACT_FILE_REGISTRY_ADDRESS")?,
             access_governance: parse_address_env("CONTRACT_ACCESS_GOVERNANCE_ADDRESS")?,
+            timelock: parse_optional_address_env("CONTRACT_TIMELOCK_ADDRESS")?,
         })
     }
 
-    fn contracts(&self) -> [EvmAddress; 2] {
-        [self.file_registry, self.access_governance]
+    fn contracts(&self) -> Vec<EvmAddress> {
+        let mut contracts = vec![self.file_registry, self.access_governance];
+        if let Some(timelock) = self.timelock {
+            contracts.push(timelock);
+        }
+        contracts
     }
 }
 
@@ -105,7 +122,7 @@ struct Indexer {
     config: Config,
     client: BesuClient,
     database: PostgresStore,
-    last_reconciliation: Mutex<time::Instant>,
+    last_reconciliation: Mutex<Option<time::Instant>>,
 }
 
 impl Indexer {
@@ -181,7 +198,9 @@ impl Indexer {
 
     async fn reconcile_if_due(&self, finalized: &FinalizedBlock) -> Result<(), IndexerError> {
         let mut last_reconciliation = self.last_reconciliation.lock().await;
-        if last_reconciliation.elapsed() < self.config.reconciliation_interval {
+        if last_reconciliation
+            .is_some_and(|last| last.elapsed() < self.config.reconciliation_interval)
+        {
             return Ok(());
         }
 
@@ -201,12 +220,12 @@ impl Indexer {
             let file_id = parse_bytes32(file_id.trim())?;
             let state = self
                 .client
-                .file_head(&self.config.file_registry, &file_id)
+                .file_head_at(&self.config.file_registry, &file_id, finalized.number)
                 .await
                 .map_err(IndexerError::Chain)?;
             reconcile_head(self.database.pool(), &file_id, state, finalized.number).await?;
         }
-        *last_reconciliation = time::Instant::now();
+        *last_reconciliation = Some(time::Instant::now());
         Ok(())
     }
 
@@ -284,11 +303,12 @@ async fn run() -> Result<(), IndexerError> {
         .await
         .map_err(|error| IndexerError::DatabaseCause(error.to_string()))?;
 
+    let poll_interval = config.poll_interval;
     let indexer = Indexer {
         config,
         client,
         database,
-        last_reconciliation: Mutex::new(time::Instant::now() - Duration::from_secs(60)),
+        last_reconciliation: Mutex::new(None),
     };
     let chain_id = indexer
         .client
@@ -312,7 +332,7 @@ async fn run() -> Result<(), IndexerError> {
             );
         }
     }
-    let mut interval = time::interval(POLL_INTERVAL);
+    let mut interval = time::interval(poll_interval);
     loop {
         tokio::select! {
             _ = signal::ctrl_c() => return Ok(()),
@@ -377,8 +397,20 @@ fn parse_env_u64(name: &str, default: &str) -> Result<u64, IndexerError> {
 
 fn parse_address_env(name: &str) -> Result<EvmAddress, IndexerError> {
     let value = env::var(name).map_err(|_| IndexerError::InvalidConfiguration)?;
+    parse_nonzero_address(&value)
+}
+
+fn parse_optional_address_env(name: &str) -> Result<Option<EvmAddress>, IndexerError> {
+    match env::var(name) {
+        Ok(value) if !value.trim().is_empty() => parse_nonzero_address(value.trim()).map(Some),
+        Ok(_) | Err(env::VarError::NotPresent) => Ok(None),
+        Err(env::VarError::NotUnicode(_)) => Err(IndexerError::InvalidConfiguration),
+    }
+}
+
+fn parse_nonzero_address(value: &str) -> Result<EvmAddress, IndexerError> {
     let bytes =
-        domain::hex::parse_fixed_hex::<20>(&value).ok_or(IndexerError::InvalidConfiguration)?;
+        domain::hex::parse_fixed_hex::<20>(value).ok_or(IndexerError::InvalidConfiguration)?;
     if bytes == [0; 20] {
         return Err(IndexerError::InvalidConfiguration);
     }
@@ -882,7 +914,10 @@ async fn project_event_inner(
                 .await
                 .map_err(|_| IndexerError::Database)?;
             } else {
-                let signing_address = format!("0x{}", &public_key[26..]);
+                let raw = domain::hex::parse_fixed_hex::<32>(public_key)
+                    .filter(|bytes| bytes[..12].iter().all(|b| *b == 0))
+                    .ok_or(IndexerError::Decode(decoder::DecodeError::InvalidAbiData))?;
+                let signing_address = format!("0x{}", encode_hex(&raw[12..]));
                 sqlx::query(
                     "UPDATE members_projection SET signing_key_version = $2, signing_address = $3, \
                      updated_block_number = $4 WHERE member_id = $1",
@@ -1714,5 +1749,135 @@ mod tests {
             .rollback()
             .await
             .expect("rollback revocation/reset test");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires BESU_RPC_URL and DATABASE_URL"]
+    async fn indexes_live_besu_governance_and_timelock_events_idempotently() {
+        let _guard = TEST_LOCK.lock().await;
+        let rpc_url =
+            env::var("BESU_RPC_URL").unwrap_or_else(|_| "http://127.0.0.1:8545".to_owned());
+        let expected_chain_id = parse_env_u64("BESU_CHAIN_ID", "1337").expect("valid chain ID");
+        let access_governance = parse_nonzero_address(
+            &env::var("CONTRACT_ACCESS_GOVERNANCE_ADDRESS")
+                .unwrap_or_else(|_| "0xe1304f22747114aafdd0c0c3f8e64b83c5326663".to_owned()),
+        )
+        .expect("valid AccessGovernance address");
+        let timelock = parse_nonzero_address(
+            &env::var("CONTRACT_TIMELOCK_ADDRESS")
+                .unwrap_or_else(|_| "0x18cd48bbff72acf29bd50f8e98397b1a07eba80f".to_owned()),
+        )
+        .expect("valid RrdsTimelockController address");
+
+        let client = BesuClient::new(&rpc_url).expect("BesuClient");
+        assert_eq!(
+            client.chain_id().await.expect("chain_id"),
+            expected_chain_id
+        );
+
+        let mut logs = client
+            .logs(48_145, 48_185, &[access_governance, timelock])
+            .await
+            .expect("fetch live Besu governance and timelock logs");
+        assert!(
+            logs.len() >= 10,
+            "expected at least 10 real bootstrap logs, got {}",
+            logs.len()
+        );
+        logs.sort_by_key(|log| {
+            (
+                log.block_number().unwrap_or_default(),
+                log.transaction_index().unwrap_or_default(),
+                log.log_index().unwrap_or_default(),
+            )
+        });
+
+        let mut canonical_hashes = BTreeMap::new();
+        for log in &logs {
+            let block_number = log.block_number().unwrap();
+            if let std::collections::btree_map::Entry::Vacant(entry) =
+                canonical_hashes.entry(block_number)
+            {
+                let hash = client
+                    .block_hash(block_number)
+                    .await
+                    .expect("canonical block hash for log");
+                assert_eq!(hash, log.block_hash.to_ascii_lowercase());
+                entry.insert(hash);
+            }
+        }
+        let end_hash = client
+            .block_hash(48_185)
+            .await
+            .expect("canonical block hash for range end");
+        canonical_hashes.insert(48_185, end_hash.clone());
+
+        let (_, mut transaction) = integration_transaction().await;
+        apply_range_in_transaction(
+            &mut transaction,
+            TEST_CHAIN_ID,
+            48_185,
+            &canonical_hashes,
+            &logs,
+        )
+        .await
+        .expect("index live Besu logs into PostgreSQL");
+
+        // Idempotent replay of the exact same live Besu logs.
+        apply_range_in_transaction(
+            &mut transaction,
+            TEST_CHAIN_ID,
+            48_185,
+            &canonical_hashes,
+            &logs,
+        )
+        .await
+        .expect("replay live Besu logs idempotently");
+
+        let total_indexed = event_count_in_transaction(&mut transaction).await;
+        assert_eq!(total_indexed, logs.len() as i64);
+
+        let unknown_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM indexed_contract_events \
+             WHERE chain_id = $1 AND event_name = 'Unknown'",
+        )
+        .bind(TEST_CHAIN_ID as i64)
+        .fetch_one(&mut *transaction)
+        .await
+        .expect("count unknown events");
+        assert_eq!(
+            unknown_count, 0,
+            "all live AccessGovernance and RrdsTimelockController bootstrap events must decode cleanly"
+        );
+
+        let scheduled_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM indexed_contract_events \
+             WHERE chain_id = $1 AND event_name = 'CallScheduled'",
+        )
+        .bind(TEST_CHAIN_ID as i64)
+        .fetch_one(&mut *transaction)
+        .await
+        .expect("count CallScheduled events");
+        assert_eq!(
+            scheduled_count, 2,
+            "expected 2 batched CallScheduled events"
+        );
+
+        rebuild_projections_in_transaction(&mut transaction, TEST_CHAIN_ID)
+            .await
+            .expect("rebuild projections from live Besu events");
+
+        let checkpoint_hash: String =
+            sqlx::query_scalar("SELECT block_hash FROM indexer_checkpoints WHERE chain_id = $1")
+                .bind(TEST_CHAIN_ID as i64)
+                .fetch_one(&mut *transaction)
+                .await
+                .expect("read live checkpoint");
+        assert_eq!(checkpoint_hash.trim(), end_hash);
+
+        transaction
+            .rollback()
+            .await
+            .expect("rollback live Besu indexer integration test");
     }
 }

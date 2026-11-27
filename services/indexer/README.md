@@ -20,9 +20,13 @@ Required configuration:
 
 - `BESU_RPC_URL`, `BESU_CHAIN_ID`, and `DATABASE_URL`
 - `CONTRACT_FILE_REGISTRY_ADDRESS` and `CONTRACT_ACCESS_GOVERNANCE_ADDRESS`
-- Optional `INDEXER_START_BLOCK`, `INDEXER_BATCH_SIZE`,
+- Optional `CONTRACT_TIMELOCK_ADDRESS` (indexes `RrdsTimelockController`
+  `CallScheduled`/`CallExecuted`/`CallSalt`/`Cancelled`/`MinDelayChange` and
+  `AccessControl` role events alongside domain events), `INDEXER_START_BLOCK`,
+  `INDEXER_BATCH_SIZE`, `FINALITY_CHECK_INTERVAL` (default `5`s),
   `INDEXER_CONFIRMATION_POLICY=finalized`, and
-  `INDEXER_RECONCILIATION_INTERVAL_SECONDS`
+  `INDEXER_RECONCILIATION_INTERVAL_SECONDS` (pins `file_head_at` to the
+  explicit QBFT committed block)
 
 Recovery commands:
 

@@ -29,6 +29,7 @@ pub enum ChainError {
     InvalidEndpoint,
     TransportUnavailable,
     InvalidResponse,
+    ExecutionReverted(Option<[u8; 4]>),
     RpcRejected(i64),
     InvalidQuantity,
     RemovedLog,
@@ -40,6 +41,7 @@ impl fmt::Display for ChainError {
             Self::InvalidEndpoint => formatter.write_str("invalid Besu RPC endpoint"),
             Self::TransportUnavailable => formatter.write_str("Besu RPC unavailable"),
             Self::InvalidResponse => formatter.write_str("invalid Besu RPC response"),
+            Self::ExecutionReverted(_) => formatter.write_str("Besu contract call reverted"),
             Self::RpcRejected(code) => write!(formatter, "Besu RPC rejected request ({code})"),
             Self::InvalidQuantity => formatter.write_str("invalid RPC quantity"),
             Self::RemovedLog => formatter.write_str("RPC returned a removed log"),
@@ -550,7 +552,13 @@ impl BesuClient {
             .await
         {
             Ok(encoded) => decode_hex(&encoded)?,
-            Err(ChainError::RpcRejected(_)) => return Ok(None),
+            Err(ChainError::ExecutionReverted(selector))
+                if selector.is_none()
+                    || selector == Some(selector4("FileNotFound()"))
+                    || selector == Some(selector4("InvalidVersionNumber()")) =>
+            {
+                return Ok(None);
+            }
             Err(error) => return Err(error),
         };
         let tuple_offset = usize::try_from(read_word_u64(&encoded, 0)?)
@@ -606,7 +614,12 @@ impl BesuClient {
             .await
         {
             Ok(encoded) => decode_hex(&encoded)?,
-            Err(ChainError::RpcRejected(_)) => return Ok(None),
+            Err(ChainError::ExecutionReverted(selector))
+                if selector.is_none()
+                    || selector == Some(selector4("InvalidEnvelopeReference()")) =>
+            {
+                return Ok(None);
+            }
             Err(error) => return Err(error),
         };
         let offset = usize::try_from(read_word_u64(&encoded, 0)?)
@@ -775,6 +788,15 @@ impl BesuClient {
             return Err(ChainError::InvalidResponse);
         }
         if let Some(error) = body.error {
+            if error.code == 3 {
+                let selector = error
+                    .data
+                    .as_deref()
+                    .and_then(|value| decode_hex(value).ok())
+                    .filter(|bytes| bytes.len() >= 4)
+                    .map(|bytes| [bytes[0], bytes[1], bytes[2], bytes[3]]);
+                return Err(ChainError::ExecutionReverted(selector));
+            }
             return Err(ChainError::RpcRejected(error.code));
         }
         body.result.ok_or(ChainError::InvalidResponse)
@@ -808,6 +830,13 @@ where
 #[derive(Deserialize)]
 struct RpcErrorObject {
     code: i64,
+    #[serde(default)]
+    data: Option<String>,
+}
+
+fn selector4(signature: &str) -> [u8; 4] {
+    let digest = Keccak256::digest(signature.as_bytes());
+    [digest[0], digest[1], digest[2], digest[3]]
 }
 
 fn parse_abi_u64(word: &[u8]) -> Result<u64, ChainError> {
@@ -1462,10 +1491,16 @@ mod tests {
             out
         };
 
+        let file_not_found_selector = format!("0x{}", encode_hex(&selector4("FileNotFound()")));
+        let invalid_version_selector =
+            format!("0x{}", encode_hex(&selector4("InvalidVersionNumber()")));
         let (addr, server) = spawn_rpc_sequence(vec![
             json!({ "jsonrpc": "2.0", "id": 1, "result": format!("0x{}", encode_hex(&build_version_tuple(3))) }),
-            json!({ "jsonrpc": "2.0", "id": 2, "error": { "code": -32000, "message": "execution reverted" } }),
-            json!({ "jsonrpc": "2.0", "id": 3, "result": format!("0x{}", encode_hex(&build_version_tuple(99))) }),
+            json!({ "jsonrpc": "2.0", "id": 2, "error": { "code": 3, "message": "Execution reverted", "data": file_not_found_selector } }),
+            json!({ "jsonrpc": "2.0", "id": 3, "error": { "code": 3, "message": "Execution reverted", "data": invalid_version_selector } }),
+            json!({ "jsonrpc": "2.0", "id": 4, "error": { "code": -32603, "message": "Internal error" } }),
+            json!({ "jsonrpc": "2.0", "id": 5, "error": { "code": 3, "message": "Execution reverted", "data": "0xdeadbeef" } }),
+            json!({ "jsonrpc": "2.0", "id": 6, "result": format!("0x{}", encode_hex(&build_version_tuple(99))) }),
         ])
         .await;
 
@@ -1486,6 +1521,23 @@ mod tests {
             None
         );
         assert_eq!(
+            client
+                .file_version(&registry, &[0x77; 32], 5, 20)
+                .await
+                .unwrap(),
+            None
+        );
+        // Non-revert RPC errors (e.g. pruned historical state -32603) must surface as Err, never Ok(None).
+        assert_eq!(
+            client.file_version(&registry, &[0x77; 32], 3, 20).await,
+            Err(ChainError::RpcRejected(-32603))
+        );
+        // Unexpected revert selectors must fail closed rather than looking like a missing version.
+        assert_eq!(
+            client.file_version(&registry, &[0x77; 32], 3, 20).await,
+            Err(ChainError::ExecutionReverted(Some([0xde, 0xad, 0xbe, 0xef])))
+        );
+        assert_eq!(
             client.file_version(&registry, &[0x77; 32], 3, 20).await,
             Err(ChainError::InvalidResponse)
         );
@@ -1504,10 +1556,14 @@ mod tests {
             out
         };
 
+        let invalid_env_selector =
+            format!("0x{}", encode_hex(&selector4("InvalidEnvelopeReference()")));
         let (addr, server) = spawn_rpc_sequence(vec![
             json!({ "jsonrpc": "2.0", "id": 1, "result": format!("0x{}", encode_hex(&build_envelope_return(2))) }),
-            json!({ "jsonrpc": "2.0", "id": 2, "error": { "code": -32000, "message": "execution reverted" } }),
-            json!({ "jsonrpc": "2.0", "id": 3, "result": format!("0x{}", encode_hex(&build_envelope_return(0))) }),
+            json!({ "jsonrpc": "2.0", "id": 2, "error": { "code": 3, "message": "Execution reverted", "data": invalid_env_selector } }),
+            json!({ "jsonrpc": "2.0", "id": 3, "error": { "code": -32603, "message": "Internal error" } }),
+            json!({ "jsonrpc": "2.0", "id": 4, "error": { "code": 3, "message": "Execution reverted", "data": "0xbadc0ffe" } }),
+            json!({ "jsonrpc": "2.0", "id": 5, "result": format!("0x{}", encode_hex(&build_envelope_return(0))) }),
         ])
         .await;
 
@@ -1528,6 +1584,14 @@ mod tests {
                 .await
                 .unwrap(),
             None
+        );
+        assert_eq!(
+            client.current_envelope_set(&gov, &[0x77; 32], 1, 25).await,
+            Err(ChainError::RpcRejected(-32603))
+        );
+        assert_eq!(
+            client.current_envelope_set(&gov, &[0x77; 32], 1, 25).await,
+            Err(ChainError::ExecutionReverted(Some([0xba, 0xdc, 0x0f, 0xfe])))
         );
         assert_eq!(
             client.current_envelope_set(&gov, &[0x77; 32], 1, 25).await,

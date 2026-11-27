@@ -182,13 +182,27 @@ impl DevelopmentRelayerSigner {
     /// Parses a `0x`-prefixed 32-byte hex private key for unsafe local
     /// development only. Never use in production deployments.
     pub fn from_hex_secret(hex_key: &str) -> Result<Self, RelayError> {
-        let raw = crate::decode_hex(hex_key).map_err(|_| RelayError::SigningFailed)?;
+        let raw =
+            Zeroizing::new(crate::decode_hex(hex_key).map_err(|_| RelayError::SigningFailed)?);
         let mut secret = Zeroizing::new([0u8; 32]);
         if raw.len() != 32 {
             return Err(RelayError::SigningFailed);
         }
         secret.copy_from_slice(&raw);
         Self::from_secret_bytes(*secret)
+    }
+
+    /// Reads and immediately zeroizes an optional `0x`-prefixed 32-byte hex
+    /// private key from an environment variable (unsafe local development only).
+    pub fn from_env_var(var_name: &str) -> Result<Option<Self>, RelayError> {
+        match std::env::var(var_name) {
+            Ok(value) if !value.is_empty() => {
+                let key = Zeroizing::new(value);
+                Self::from_hex_secret(&key).map(Some)
+            }
+            Ok(_) | Err(std::env::VarError::NotPresent) => Ok(None),
+            Err(std::env::VarError::NotUnicode(_)) => Err(RelayError::SigningFailed),
+        }
     }
 }
 
@@ -271,11 +285,31 @@ impl TransactionRelayer {
         self.signer.address()
     }
 
+    /// Estimates gas via `eth_estimateGas`, applies 20% headroom, and enforces
+    /// the configured `max_gas_limit` ceiling (`TECHNICAL_SPECIFICATION.md` §7.9).
+    pub async fn estimate_bounded_gas(
+        &self,
+        to: EvmAddress,
+        calldata: &[u8],
+    ) -> Result<u64, RelayError> {
+        let estimated = self
+            .client
+            .estimate_gas(&self.signer.address(), &to, calldata)
+            .await?;
+        let padded = estimated.saturating_add(estimated / 5).max(estimated);
+        if padded == 0 || padded > self.config.max_gas_limit {
+            return Err(RelayError::GasLimitExceeded);
+        }
+        Ok(padded)
+    }
+
     /// Submits one signed Type-2 contract call and polls until the receipt is
     /// included in a QBFT-committed block or the confirmation deadline elapses.
     ///
-    /// On timeout this returns [`RelayError::ConfirmationTimedOut`] with the
-    /// submitted transaction hash and never automatically resubmits.
+    /// On timeout this clears the cached local nonce so subsequent submissions
+    /// resynchronize against Besu's pending nonce, returns
+    /// [`RelayError::ConfirmationTimedOut`] with the submitted transaction hash,
+    /// and never automatically resubmits.
     pub async fn submit_and_confirm(
         &self,
         to: EvmAddress,
@@ -328,6 +362,9 @@ impl TransactionRelayer {
                 return Ok(outcome);
             }
             if Instant::now() >= deadline {
+                // Force the next submission to reconcile against Besu's pending nonce
+                // so a dropped mempool transaction cannot wedge subsequent relays.
+                *self.next_nonce.lock().await = None;
                 return Err(RelayError::ConfirmationTimedOut { tx_hash });
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
@@ -1028,6 +1065,119 @@ mod tests {
             other => panic!("expected Committed on reconcile, got {other:?}"),
         }
 
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn estimates_bounded_gas_and_resyncs_nonce_after_timeout() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let pending_queries = Arc::new(AtomicUsize::new(0));
+        let pending_queries_clone = pending_queries.clone();
+
+        let server = tokio::spawn(async move {
+            let mut estimate_calls = 0usize;
+            for _ in 0..32 {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let body = read_rpc_request(&mut stream).await;
+                let method = body["method"].as_str().unwrap();
+                match method {
+                    "eth_estimateGas" => {
+                        estimate_calls += 1;
+                        if estimate_calls == 1 {
+                            write_rpc_response(&mut stream, &body["id"], json!("0x30d40")).await;
+                        } else {
+                            // 950_000 + 20% = 1_140_000 > max_gas_limit (1_000_000)
+                            write_rpc_response(&mut stream, &body["id"], json!("0xe7ef0")).await;
+                        }
+                    }
+                    "eth_getTransactionCount" => {
+                        let count = pending_queries_clone.fetch_add(1, Ordering::SeqCst);
+                        let nonce = if count == 0 { "0xa" } else { "0xb" };
+                        write_rpc_response(&mut stream, &body["id"], json!(nonce)).await;
+                    }
+                    "eth_sendRawTransaction" => {
+                        let raw = decode_hex(body["params"][0].as_str().unwrap()).unwrap();
+                        let tx_hash = format!("0x{}", encode_hex(&keccak256(&raw)));
+                        write_rpc_response(&mut stream, &body["id"], json!(tx_hash)).await;
+                    }
+                    "eth_getTransactionReceipt" => {
+                        let tx_hash = body["params"][0].as_str().unwrap().to_owned();
+                        if pending_queries_clone.load(Ordering::SeqCst) == 1 {
+                            write_rpc_response(&mut stream, &body["id"], Value::Null).await;
+                        } else {
+                            write_rpc_response(
+                                &mut stream,
+                                &body["id"],
+                                json!({
+                                    "transactionHash": tx_hash,
+                                    "blockNumber": "0x20",
+                                    "blockHash": format!("0x{}", "44".repeat(32)),
+                                    "status": "0x1",
+                                    "gasUsed": "0x5208"
+                                }),
+                            )
+                            .await;
+                        }
+                    }
+                    "eth_getBlockByNumber" => {
+                        write_rpc_response(
+                            &mut stream,
+                            &body["id"],
+                            json!({
+                                "number": "0x20",
+                                "hash": format!("0x{}", "44".repeat(32))
+                            }),
+                        )
+                        .await;
+                    }
+                    other => panic!("unexpected RPC method: {other}"),
+                }
+            }
+        });
+
+        let client = BesuClient::new(&format!("http://{address}")).unwrap();
+        let signer = Arc::new(DevelopmentRelayerSigner::from_secret_bytes([0x66; 32]).unwrap());
+        let relayer = TransactionRelayer::new(
+            client,
+            signer,
+            RelayerStartupPolicy::UnsafeDevelopment,
+            RelayerConfig {
+                chain_id: 1337,
+                default_gas_limit: 500_000,
+                max_gas_limit: 1_000_000,
+                confirmation_timeout: Duration::from_millis(45),
+                poll_interval: Duration::from_millis(15),
+            },
+        )
+        .unwrap();
+
+        let target = EvmAddress::from_bytes([0xbb; 20]);
+        assert_eq!(
+            relayer.estimate_bounded_gas(target, b"call").await.unwrap(),
+            240_000
+        );
+        assert_eq!(
+            relayer.estimate_bounded_gas(target, b"call").await,
+            Err(RelayError::GasLimitExceeded)
+        );
+
+        // First submission times out and clears cached nonce.
+        assert!(matches!(
+            relayer.submit_and_confirm(target, vec![1, 2], None).await,
+            Err(RelayError::ConfirmationTimedOut { .. })
+        ));
+        assert_eq!(pending_queries.load(Ordering::SeqCst), 1);
+
+        // Next submission must re-query pending nonce from Besu instead of reusing stale local state.
+        let outcome = relayer
+            .submit_and_confirm(target, vec![3, 4], None)
+            .await
+            .unwrap();
+        assert!(matches!(outcome, RelayOutcome::Committed(_)));
+        assert_eq!(pending_queries.load(Ordering::SeqCst), 2);
         server.abort();
     }
 }

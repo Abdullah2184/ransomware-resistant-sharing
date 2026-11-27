@@ -180,22 +180,6 @@ mod http_tests {
             Box::pin(async move { Ok(block) })
         }
 
-        fn active_member_signer<'a>(
-            &'a self,
-            _access_governance: &'a EvmAddress,
-            member_id: &'a [u8; 32],
-        ) -> ChainFuture<'a, Option<EvmAddress>> {
-            let signer = self
-                .state
-                .lock()
-                .unwrap()
-                .members
-                .get(member_id)
-                .filter(|member| member.active())
-                .map(|member| member.signing_address);
-            Box::pin(async move { Ok(signer) })
-        }
-
         fn member_identity<'a>(
             &'a self,
             _access_governance: &'a EvmAddress,
@@ -422,6 +406,7 @@ mod http_tests {
             _session_expires_at: u64,
             _source_id: &'a str,
             _chain_id: u64,
+            _block_number: u64,
         ) -> StoreFuture<'a, bool> {
             let mut state = self.state.lock().unwrap();
             if state.fail_audit {
@@ -916,6 +901,14 @@ mod http_tests {
             let result = self.execute("updateEnvelopeSet");
             Box::pin(async move { result })
         }
+
+        fn reconcile_transaction(
+            &self,
+            _tx_hash: [u8; 32],
+        ) -> RelayFuture<'_, Option<RelayOutcome>> {
+            let result = self.execute("reconcileTransaction").map(Some);
+            Box::pin(async move { result })
+        }
     }
 
     struct TestServer {
@@ -955,6 +948,7 @@ mod http_tests {
             invalid_sig_limit_refill_per_second: 0.1,
             min_pin_replicas: 2,
             default_tx_gas_limit: 2_000_000,
+            transaction_confirmation_timeout_seconds: 30,
             max_blob_upload_bytes: 8 * 1024 * 1024,
         };
         let mut state = AppState::new(store.clone(), chain.clone(), blobs.clone(), config);
@@ -2779,6 +2773,7 @@ mod http_tests {
             invalid_sig_limit_refill_per_second: 5.0,
             min_pin_replicas: 2,
             default_tx_gas_limit: 500_000,
+            transaction_confirmation_timeout_seconds: 30,
             max_blob_upload_bytes: 64 * 1024 * 1024,
         };
         let state = AppState::new(store, chain, MockBlobStore::default(), config);
@@ -2890,7 +2885,8 @@ mod http_tests {
             .unwrap();
         assert_eq!(replayed_lookup.status(), reqwest::StatusCode::UNAUTHORIZED);
 
-        // 3. Self-audited GET /v1/audit returns the member's real PostgreSQL audit events.
+        // 3. Self-audited GET /v1/audit returns the member's real PostgreSQL audit events,
+        //    including the pinned QBFT finalized block on the auth.session login event.
         let audit_resp = client
             .get(format!("{base_url}/v1/audit?limit=10"))
             .bearer_auth(&token)
@@ -2900,7 +2896,16 @@ mod http_tests {
         assert_eq!(audit_resp.status(), reqwest::StatusCode::OK);
         let audit_json: serde_json::Value = audit_resp.json().await.unwrap();
         assert_eq!(audit_json["memberId"], member_id.to_string());
-        assert!(!audit_json["events"].as_array().unwrap().is_empty());
+        let events = audit_json["events"].as_array().unwrap();
+        assert!(!events.is_empty());
+        assert!(
+            events.iter().any(|e| {
+                e["record"]["action"] == "auth.session"
+                    && e["record"]["outcome"] == "issued"
+                    && e["record"]["block_number"] == 500
+            }),
+            "auth.session audit row must record the pinned QBFT finalized block number"
+        );
 
         // 4. DELETE /v1/auth/session revokes the token in PostgreSQL; subsequent GET returns 401.
         let revoke_resp = client
@@ -2934,5 +2939,444 @@ mod http_tests {
             .bind(format!("member:%:{member_str}"))
             .execute(&pool)
             .await;
+    }
+
+    #[tokio::test]
+    async fn option_b_envelope_update_rejects_unauthorized_actors_and_forwards_signed_call() {
+        let server = spawn_server_with_relayer(true).await;
+        let relayer = server.relayer.as_ref().unwrap();
+        let member_id = MemberId::from_bytes([0x61; 32]);
+        let custody = DevelopmentKeyCustody::generate(
+            member_id,
+            KeyVersion::new(1).unwrap(),
+            KeyVersion::new(1).unwrap(),
+        )
+        .unwrap();
+        let pub_identity = custody.public_identity().await.unwrap();
+        let wrong_custody = DevelopmentKeyCustody::generate(
+            member_id,
+            KeyVersion::new(1).unwrap(),
+            KeyVersion::new(1).unwrap(),
+        )
+        .unwrap();
+        let wrong_identity = wrong_custody.public_identity().await.unwrap();
+
+        let file_id = FileId::from_bytes([0x62; 32]);
+        let epoch_v1 = EpochId::from_bytes([0x63; 32]);
+        let old_env_cid =
+            EnvelopeSetCid::parse("bafkreihdwdcefgh4dqkjv67uzcmw7ojee6xedzdetojuzjevtenxquvyku")
+                .unwrap();
+        let dek = DataEncryptionKey::generate().unwrap();
+        let wrapped = KeyEnvelope::wrap(
+            &dek,
+            &pub_identity.encryption_public_key,
+            WrapContext::new(
+                file_id,
+                VersionNumber::ONE,
+                epoch_v1,
+                member_id,
+                KeyVersion::new(1).unwrap(),
+            ),
+        )
+        .unwrap();
+        let rev2_bytes = KeyEnvelopeSet::new(
+            file_id,
+            VersionNumber::ONE,
+            epoch_v1,
+            2,
+            vec![KeyEnvelopeEntry::new(
+                member_id,
+                KeyVersion::new(1).unwrap(),
+                wrapped,
+            )],
+        )
+        .unwrap()
+        .canonical_bytes()
+        .unwrap();
+        let new_env_cid =
+            EnvelopeSetCid::parse(&crypto::raw_sha256_cid(&rev2_bytes).unwrap().to_string())
+                .unwrap();
+
+        {
+            let mut chain = server.chain.state.lock().unwrap();
+            chain.members.insert(
+                *member_id.as_bytes(),
+                MemberIdentityState {
+                    organization_id: [0x10; 32],
+                    signing_address: pub_identity.signing_address,
+                    signing_key_version: 1,
+                    encryption_key_version: 1,
+                    encryption_public_key: pub_identity
+                        .encryption_public_key
+                        .to_bytes()
+                        .try_into()
+                        .unwrap(),
+                    status: 1,
+                },
+            );
+            chain.envelopes.insert(
+                (*file_id.as_bytes(), 1),
+                EnvelopeSetState {
+                    cid: old_env_cid.to_string(),
+                    epoch_id: *epoch_v1.as_bytes(),
+                    revision: 1,
+                },
+            );
+        }
+        {
+            server.blobs.replicas.lock().unwrap().insert(
+                new_env_cid.to_string(),
+                vec!["peer-1".to_owned(), "peer-2".to_owned()],
+            );
+            server
+                .blobs
+                .envelopes
+                .lock()
+                .unwrap()
+                .insert(new_env_cid.to_string(), rev2_bytes);
+        }
+
+        let client = reqwest::Client::new();
+        let (_, _, token) = login_member(&client, &server, &custody).await;
+
+        #[allow(clippy::too_many_arguments)]
+        async fn build_payload(
+            config: &GatewayConfig,
+            file_id: FileId,
+            epoch_v1: EpochId,
+            member_id: MemberId,
+            signer_custody: &DevelopmentKeyCustody,
+            key_id: &ports::KeyId,
+            old_cid: &EnvelopeSetCid,
+            new_cid: &EnvelopeSetCid,
+            nonce_byte: u8,
+            deadline: u64,
+        ) -> serde_json::Value {
+            let nonce = OperationNonce::from_bytes([nonce_byte; 32]);
+            let typed = EnvelopeSetUpdate::new(
+                file_id,
+                VersionNumber::ONE,
+                epoch_v1,
+                old_cid.clone(),
+                new_cid.clone(),
+                member_id,
+                ProposalId::from_bytes([0x55; 32]),
+                nonce,
+                UnixDeadline::from_unix_seconds(deadline).unwrap(),
+            )
+            .unwrap();
+            let domain = Eip712Domain::access_governance(
+                ChainId::from_u64(config.chain_id),
+                config.access_governance,
+            );
+            let digest = typed.digest(&domain).unwrap();
+            let sig = signer_custody
+                .sign_typed_digest(key_id, &digest)
+                .await
+                .unwrap();
+            json!({
+                "epochId": epoch_v1.to_string(),
+                "oldEnvelopeSetCid": old_cid.to_string(),
+                "newEnvelopeSetCid": new_cid.to_string(),
+                "proposalId": encode_hex(&[0x55; 32]),
+                "operationNonce": nonce.to_string(),
+                "deadline": deadline,
+                "signature": encode_hex(sig.as_bytes()),
+            })
+        }
+
+        let url = format!(
+            "{}/v1/files/{file_id}/versions/1/envelopes",
+            server.base_url
+        );
+        let future_deadline = unix_seconds().unwrap() + 120;
+
+        // 1. Missing Read ACL -> 401 before touching relayer.
+        let no_acl_resp = client
+            .post(&url)
+            .bearer_auth(&token)
+            .json(
+                &build_payload(
+                    &server.config,
+                    file_id,
+                    epoch_v1,
+                    member_id,
+                    &custody,
+                    &pub_identity.signing_key_id,
+                    &old_env_cid,
+                    &new_env_cid,
+                    0x11,
+                    future_deadline,
+                )
+                .await,
+            )
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(no_acl_resp.status(), reqwest::StatusCode::UNAUTHORIZED);
+        assert!(relayer.calls.lock().unwrap().is_empty());
+
+        // Grant Read ACL, then test wrong signer, expired deadline, unchanged CID, and suspended member.
+        server
+            .chain
+            .state
+            .lock()
+            .unwrap()
+            .read_acl
+            .insert((*member_id.as_bytes(), *file_id.as_bytes()));
+
+        // 2. Wrong EIP-712 signer -> 401 before relay.
+        let wrong_sig_resp = client
+            .post(&url)
+            .bearer_auth(&token)
+            .json(
+                &build_payload(
+                    &server.config,
+                    file_id,
+                    epoch_v1,
+                    member_id,
+                    &wrong_custody,
+                    &wrong_identity.signing_key_id,
+                    &old_env_cid,
+                    &new_env_cid,
+                    0x12,
+                    future_deadline,
+                )
+                .await,
+            )
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(wrong_sig_resp.status(), reqwest::StatusCode::UNAUTHORIZED);
+        assert!(relayer.calls.lock().unwrap().is_empty());
+
+        // 3. Unchanged CID -> 400 before relay.
+        let unchanged_resp = client
+            .post(&url)
+            .bearer_auth(&token)
+            .json(&json!({
+                "epochId": epoch_v1.to_string(),
+                "oldEnvelopeSetCid": old_env_cid.to_string(),
+                "newEnvelopeSetCid": old_env_cid.to_string(),
+                "proposalId": encode_hex(&[0x55; 32]),
+                "operationNonce": encode_hex(&[0x13; 32]),
+                "deadline": future_deadline,
+                "signature": encode_hex(&[0xab; 65]),
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(unchanged_resp.status(), reqwest::StatusCode::BAD_REQUEST);
+        assert!(relayer.calls.lock().unwrap().is_empty());
+
+        // 4. Suspended member (even with valid bearer token + Read ACL) -> 401 before relay.
+        server
+            .chain
+            .state
+            .lock()
+            .unwrap()
+            .members
+            .get_mut(member_id.as_bytes())
+            .unwrap()
+            .status = 2;
+        let suspended_resp = client
+            .post(&url)
+            .bearer_auth(&token)
+            .json(
+                &build_payload(
+                    &server.config,
+                    file_id,
+                    epoch_v1,
+                    member_id,
+                    &custody,
+                    &pub_identity.signing_key_id,
+                    &old_env_cid,
+                    &new_env_cid,
+                    0x14,
+                    future_deadline,
+                )
+                .await,
+            )
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(suspended_resp.status(), reqwest::StatusCode::UNAUTHORIZED);
+        assert!(relayer.calls.lock().unwrap().is_empty());
+
+        // 5. Reinstated active Read-authorized member succeeds via Option B relayer -> 200 OK.
+        server
+            .chain
+            .state
+            .lock()
+            .unwrap()
+            .members
+            .get_mut(member_id.as_bytes())
+            .unwrap()
+            .status = 1;
+        *relayer.behavior.lock().unwrap() = MockRelayBehavior::Commit(77);
+        let ok_resp = client
+            .post(&url)
+            .bearer_auth(&token)
+            .json(
+                &build_payload(
+                    &server.config,
+                    file_id,
+                    epoch_v1,
+                    member_id,
+                    &custody,
+                    &pub_identity.signing_key_id,
+                    &old_env_cid,
+                    &new_env_cid,
+                    0x15,
+                    future_deadline,
+                )
+                .await,
+            )
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(ok_resp.status(), reqwest::StatusCode::OK);
+        assert_eq!(
+            relayer.calls.lock().unwrap().as_slice(),
+            &["updateEnvelopeSet"]
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires live Besu QBFT RPC (BESU_RPC_URL)"]
+    async fn gateway_http_router_queries_live_besu_qbft_identities_and_fails_closed() {
+        let rpc_url =
+            std::env::var("BESU_RPC_URL").unwrap_or_else(|_| "http://127.0.0.1:8545".to_owned());
+        let access_governance = EvmAddress::from_bytes(
+            domain::hex::parse_fixed_hex::<20>(
+                &std::env::var("CONTRACT_ACCESS_GOVERNANCE_ADDRESS")
+                    .unwrap_or_else(|_| "0xe1304f22747114aafdd0c0c3f8e64b83c5326663".to_owned()),
+            )
+            .expect("valid AccessGovernance address"),
+        );
+        let file_registry = EvmAddress::from_bytes(
+            domain::hex::parse_fixed_hex::<20>(
+                &std::env::var("CONTRACT_FILE_REGISTRY_ADDRESS")
+                    .unwrap_or_else(|_| "0xf27d55447405f702299ed948325cfd9025fbe5cb".to_owned()),
+            )
+            .expect("valid FileRegistry address"),
+        );
+
+        let chain = chain_adapter::BesuClient::new(&rpc_url).expect("BesuClient");
+        let store = MockStore::default();
+        let config = GatewayConfig {
+            database_url: "postgres://unused".to_owned(),
+            besu_rpc_url: rpc_url,
+            chain_id: 1337,
+            access_governance,
+            file_registry,
+            audience: "rrds-live-besu-test".to_owned(),
+            bind: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+            challenge_ttl_seconds: 120,
+            session_ttl_seconds: 900,
+            rate_limit_capacity: 100,
+            rate_limit_refill_per_second: 10.0,
+            member_rate_limit_capacity: 100,
+            member_rate_limit_refill_per_second: 10.0,
+            invalid_sig_limit_capacity: 10,
+            invalid_sig_limit_refill_per_second: 1.0,
+            min_pin_replicas: 2,
+            default_tx_gas_limit: 2_000_000,
+            transaction_confirmation_timeout_seconds: 30,
+            max_blob_upload_bytes: 8 * 1024 * 1024,
+        };
+        let config_arc = Arc::new(GatewayConfig {
+            database_url: config.database_url.clone(),
+            besu_rpc_url: config.besu_rpc_url.clone(),
+            chain_id: config.chain_id,
+            access_governance: config.access_governance,
+            file_registry: config.file_registry,
+            audience: config.audience.clone(),
+            bind: config.bind,
+            challenge_ttl_seconds: config.challenge_ttl_seconds,
+            session_ttl_seconds: config.session_ttl_seconds,
+            rate_limit_capacity: config.rate_limit_capacity,
+            rate_limit_refill_per_second: config.rate_limit_refill_per_second,
+            member_rate_limit_capacity: config.member_rate_limit_capacity,
+            member_rate_limit_refill_per_second: config.member_rate_limit_refill_per_second,
+            invalid_sig_limit_capacity: config.invalid_sig_limit_capacity,
+            invalid_sig_limit_refill_per_second: config.invalid_sig_limit_refill_per_second,
+            min_pin_replicas: config.min_pin_replicas,
+            default_tx_gas_limit: config.default_tx_gas_limit,
+            transaction_confirmation_timeout_seconds: config
+                .transaction_confirmation_timeout_seconds,
+            max_blob_upload_bytes: config.max_blob_upload_bytes,
+        });
+        let state = AppState::new(store, chain, MockBlobStore::default(), config);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_task = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                router(state).into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .unwrap();
+        });
+
+        let base_url = format!("http://{addr}");
+        let client = reqwest::Client::new();
+        let unregistered = MemberId::from_bytes([0xde; 32]);
+
+        // 1. Live Besu GET /v1/identities/{unregistered} -> 404 not_found (proving real eth_call + block pin).
+        let id_resp = client
+            .get(format!("{base_url}/v1/identities/{unregistered}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(id_resp.status(), reqwest::StatusCode::NOT_FOUND);
+
+        // 2. Live Besu POST /v1/auth/session with valid challenge signature from unregistered member -> 401 unauthorized.
+        let custody = DevelopmentKeyCustody::generate(
+            unregistered,
+            KeyVersion::new(1).unwrap(),
+            KeyVersion::new(1).unwrap(),
+        )
+        .unwrap();
+        let challenge_resp = client
+            .post(format!("{base_url}/v1/auth/challenge"))
+            .json(&json!({ "memberId": unregistered.to_string() }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(challenge_resp.status(), reqwest::StatusCode::OK);
+        let challenge: LoginChallenge = challenge_resp.json().await.unwrap();
+        let nonce_bytes = domain::hex::parse_fixed_hex::<32>(&challenge.nonce).unwrap();
+        let digest = crypto::LoginChallengeDigestInput::new(
+            unregistered,
+            OperationNonce::from_bytes(nonce_bytes),
+            challenge.issued_at,
+            challenge.expires_at,
+            challenge.audience.clone(),
+            challenge.protocol_version,
+        )
+        .unwrap()
+        .digest(&Eip712Domain::gateway(
+            ChainId::from_u64(config_arc.chain_id),
+            config_arc.access_governance,
+        ))
+        .unwrap();
+        let pub_id = custody.public_identity().await.unwrap();
+        let sig = custody
+            .sign_typed_digest(&pub_id.signing_key_id, &digest)
+            .await
+            .unwrap();
+        let login_resp = client
+            .post(format!("{base_url}/v1/auth/session"))
+            .json(&json!({
+                "challenge": challenge,
+                "signature": encode_hex(sig.as_bytes()),
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(login_resp.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+        server_task.abort();
     }
 }

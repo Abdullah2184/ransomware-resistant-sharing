@@ -52,8 +52,10 @@ following must hold at a single QBFT-committed block `B`:
      `ShareService` to unwrap `Vk`'s DEK, wrap it for the recipient's active
      X25519 key (rejecting duplicate same-key-version shares), pin a new
      canonical `KeyEnvelopeSet` at `revision + 1` without re-encrypting the file
-     bytes, and submit a signed `EnvelopeSetUpdate` under
-     `ENVELOPE_UPDATE_POLICY`.
+     bytes, and submit a signed `EnvelopeSetUpdate` relayed by the gateway
+     without altering ACL membership (which remains strictly governed by
+     `READ_ACL_POLICY` Safe; see
+     [`docs/adr/governance-authority-and-timelock.md`](../adr/governance-authority-and-timelock.md)).
 
 ## Read-ACL Revocation Epochs (Preventing Stale Grant Resurfacing)
 

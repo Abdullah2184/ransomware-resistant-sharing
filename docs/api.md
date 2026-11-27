@@ -305,8 +305,10 @@ envelope pointer continuity (`409 stale_head` if `oldEnvelopeSetCid` or
 `epochId` mismatches), EIP-712 signature, Cluster pin quorum for
 `newEnvelopeSetCid`, and canonical `rrds.key-envelope-set.v1` structure at
 `revision + 1` (`400 invalid_envelope_set` if malformed) before relaying
-`AccessGovernance.updateEnvelopeSet`. Returns `200 OK` only on committed
-receipt.
+`AccessGovernance.updateEnvelopeSet` as a non-authority relayer (no elevated
+contract role). Returns `200 OK` only on committed receipt. Envelope updates
+only advance the encrypted key-envelope pointer and never grant or modify ACL
+permissions (which remain strictly governed by the file's policy Safe).
 
 All errors use a bounded JSON error code. Unauthorized session responses do
 not distinguish unknown, inactive, or mismatched identities.

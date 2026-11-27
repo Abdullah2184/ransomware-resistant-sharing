@@ -20,6 +20,7 @@ pub struct GatewayConfig {
     pub invalid_sig_limit_refill_per_second: f64,
     pub min_pin_replicas: usize,
     pub default_tx_gas_limit: u64,
+    pub transaction_confirmation_timeout_seconds: u64,
     pub max_blob_upload_bytes: usize,
 }
 
@@ -106,6 +107,13 @@ impl GatewayConfig {
         if !(100_000..=30_000_000).contains(&default_tx_gas_limit) {
             return Err("DEFAULT_TX_GAS_LIMIT must be between 100000 and 30000000".to_owned());
         }
+        let transaction_confirmation_timeout_seconds =
+            parse_or_default("TRANSACTION_CONFIRMATION_TIMEOUT", 30_u64)?;
+        if !(1..=300).contains(&transaction_confirmation_timeout_seconds) {
+            return Err(
+                "TRANSACTION_CONFIRMATION_TIMEOUT must be between 1 and 300 seconds".to_owned(),
+            );
+        }
         let max_blob_upload_bytes =
             parse_or_default("GATEWAY_MAX_BLOB_UPLOAD_BYTES", 64 * 1024 * 1024_usize)?;
         if !(1024..=512 * 1024 * 1024).contains(&max_blob_upload_bytes) {
@@ -132,6 +140,7 @@ impl GatewayConfig {
             invalid_sig_limit_refill_per_second,
             min_pin_replicas,
             default_tx_gas_limit,
+            transaction_confirmation_timeout_seconds,
             max_blob_upload_bytes,
         })
     }

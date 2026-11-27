@@ -42,20 +42,31 @@ transactions to the local London-EVM Besu QBFT network (`chainId = 1337`,
    explicitly labelled `DevelopmentRelayerSigner` for tests and local
    development; non-development startup must reject software relayer keys
    unless explicitly configured in unsafe development mode.
-4. **Sequential nonce management and finality/timeout reconciliation:**
+4. **Sequential nonce management, gas bounds, and finality/timeout reconciliation:**
    Serialize relayer nonce assignment per relayer account, reconcile with
-   `eth_getTransactionCount(address, "pending")`, submit via
-   `eth_sendRawTransaction`, and poll `eth_getTransactionReceipt` until the
-   receipt is included in a QBFT-committed block (`blockNumber <= latest`).
+   `eth_getTransactionCount(address, "pending")` (and reset cached nonce on
+   send errors or confirmation timeouts so a dropped mempool transaction cannot
+   wedge subsequent relays), submit via `eth_sendRawTransaction`, and poll
+   `eth_getTransactionReceipt` until the receipt is included in a
+   QBFT-committed block (`blockNumber <= latest`).
    - Distinguish `Committed` (`status == 1`), `Reverted` (`status == 0`), and
-     `ConfirmationTimedOut { tx_hash }`.
+     `ConfirmationTimedOut { tx_hash }` (configured via
+     `TRANSACTION_CONFIRMATION_TIMEOUT`).
    - Never report a reverted or pending transaction as committed.
    - Never automatically resubmit after a timeout without first querying
      `reconcile_transaction(tx_hash)`.
-5. **Cross-check ABI encodings:**
-   Verify every function selector and calldata encoding in `crates/chain_adapter`
-   against the compiled `solc 0.8.34` contract ABIs (`FileRegistry.json` and
-   `AccessGovernance.json`).
+   - Provide `estimate_bounded_gas` (+20% headroom enforced against
+     `max_gas_limit`) and zeroize development relayer secret buffers on load
+     (`DevelopmentRelayerSigner::from_env_var` / `from_hex_secret`).
+5. **Strict EIP-1474 revert vs. RPC error classification & ABI parity:**
+   In `BesuClient`, distinguish EIP-1474 execution reverts (`code == 3` with
+   expected custom error selectors `FileNotFound()`, `InvalidVersionNumber()`,
+   `InvalidEnvelopeReference()`) from non-revert JSON-RPC failures (such as
+   Besu Bonsai pruned-state `-32603` or log-range `-32005`) so node/RPC faults
+   always fail closed (`503 service_unavailable`) rather than masquerading as
+   missing records. Verify every function selector and calldata encoding in
+   `crates/chain_adapter` against the compiled `solc 0.8.34` contract ABIs
+   (`FileRegistry.json` and `AccessGovernance.json`).
 
 ## Consequences
 

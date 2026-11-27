@@ -79,6 +79,22 @@ References:
     and readiness for delayed consortium actions. An application `proposalId`
     is only a correlation reference carried in contract events, not a second
     approval credential or an on-chain proposal registry.
+13. **Relayed envelope-set pointer updates (Option B amendment):**
+    `AccessGovernance.updateEnvelopeSet` is authorized by an active,
+    Read-authorized member's EIP-712 `EnvelopeSetUpdate` signature (with
+    contract-side deadline, nonce replay protection, CIDv1 validation, and
+    optimistic `oldEnvelopeSetCid` continuity) and may be relayed by any
+    `msg.sender` (including the gateway relayer EOA) without granting the
+    relayer any elevated contract role or policy authority. All ACL mutations
+    (`setFilePermission`, `setHistoricalReadAccess`, `setFilePolicyAuthority`)
+    remain strictly gated by `_requireFilePolicyAuthority` (Organization Safe /
+    configured file-policy Safe).
+    - **Operational caveat:** `updateEnvelopeSet` only advances the off-chain
+      IPFS pointer for encrypted key envelopes; it **never** grants, revokes,
+      or modifies file Read/Write or historical-Read ACL membership. A
+      recipient still cannot authorize gateway lookups or ciphertext retrieval
+      unless the configured policy Safe independently grants the corresponding
+      ACL on-chain.
 
 ## Consequences
 

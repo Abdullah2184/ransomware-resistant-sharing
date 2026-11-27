@@ -51,9 +51,11 @@ and [`docs/adr/eip712-operation-schemas.md`](../adr/eip712-operation-schemas.md)
    - Gateway validates challenge fields, recomputes the EIP-712 digest using the
      same shared `crates/crypto` definition, and recovers the signer address
      (rejecting non-27/28 `v` and high-`s` malleable signatures).
-   - Gateway queries `AccessGovernance.memberIdentity(memberId)` at Besu's
-     latest QBFT-committed state and checks that the member is `Active` and
-     their registered signing address equals the recovered address.
+   - Gateway fetches Besu's latest QBFT-committed head (`finalized_block`),
+     queries `AccessGovernance.memberIdentity(memberId)` at that explicit block
+     number, checks that the member is `Active` and their registered signing
+     address equals the recovered address, and records that `block_number` in
+     the `auth.session` audit record.
    - In a **single atomic PostgreSQL transaction**, the gateway:
      1. Prunes expired sessions and atomically marks the matching unconsumed,
         unexpired challenge row `consumed_at = clock_timestamp()` (preventing

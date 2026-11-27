@@ -17,6 +17,7 @@ contract AccessGovernanceTest is Test {
     address private constant ORGANIZATION_SAFE = address(0x300);
     address private constant FILE_REGISTRY = address(0x400);
     address private constant FILE_POLICY_SAFE = address(0x500);
+    address private constant RELAYER = address(0x900);
     bytes32 private constant ORGANIZATION_ID = bytes32(uint256(1));
     bytes32 private constant FILE_ID = bytes32(uint256(2));
     bytes32 private constant MEMBER_ID = bytes32(uint256(3));
@@ -551,7 +552,9 @@ contract AccessGovernanceTest is Test {
         governance.initializeEnvelopeSet(FILE_ID, 1, bytes32(uint256(6)), validCid);
     }
 
-    function test_EnvelopeUpdateRequiresMemberSignatureAndPolicySafeAndConsumesNonce() public {
+    function test_EnvelopeUpdateRelayedByNonAuthorityRequiresActiveReaderSignatureAndConsumesNonce()
+        public
+    {
         string memory oldCid = "bafkreiaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaq";
         string memory newCid = "bafkreiafaucqkbifaucqkbifaucqkbifaucqkbifaucqkbifaucqkbifau";
         bytes32 epochId = bytes32(uint256(6));
@@ -577,6 +580,24 @@ contract AccessGovernanceTest is Test {
         (uint8 v, bytes32 r, bytes32 s) = vm.sign(MEMBER_PRIVATE_KEY, digest);
         bytes memory signature = abi.encodePacked(r, s, v);
 
+        // Relayer cannot grant ACLs; policy authority remains strictly enforced.
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                AccessGovernance.UnauthorizedPolicyAuthority.selector,
+                RELAYER,
+                governance.READ_ACL_POLICY()
+            )
+        );
+        vm.prank(RELAYER);
+        governance.setFilePermission(
+            FILE_ID,
+            OTHER_MEMBER_ID,
+            AccessGovernance.Permission.Read,
+            true,
+            bytes32(0)
+        );
+
+        // Missing Read ACL must revert even with a valid signature.
         vm.prank(ORGANIZATION_SAFE);
         governance.setFilePermission(
             FILE_ID,
@@ -586,9 +607,10 @@ contract AccessGovernanceTest is Test {
             bytes32(0)
         );
         vm.expectRevert(AccessGovernance.UnauthorizedEnvelopeActor.selector);
-        vm.prank(ORGANIZATION_SAFE);
+        vm.prank(RELAYER);
         governance.updateEnvelopeSet(request, signature);
 
+        // Once Read ACL is held, a non-authority relayer may submit the signed update.
         vm.prank(ORGANIZATION_SAFE);
         governance.setFilePermission(
             FILE_ID,
@@ -597,16 +619,91 @@ contract AccessGovernanceTest is Test {
             true,
             bytes32(0)
         );
-        vm.prank(ORGANIZATION_SAFE);
+        vm.prank(RELAYER);
         governance.updateEnvelopeSet(request, signature);
         (string memory currentCid,, uint32 revision) = governance.currentEnvelopeSet(FILE_ID, 1);
         assertEq(currentCid, newCid);
         assertEq(revision, 2);
         assertTrue(governance.consumedOperationNonces(MEMBER_ID, operationNonce));
+        // Updating envelope set must never alter Read/Write ACLs.
+        assertFalse(governance.hasReadAccess(OTHER_MEMBER_ID, FILE_ID));
 
         vm.expectRevert(AccessGovernance.OperationNonceAlreadyConsumed.selector);
-        vm.prank(ORGANIZATION_SAFE);
+        vm.prank(RELAYER);
         governance.updateEnvelopeSet(request, signature);
+    }
+
+    function test_EnvelopeUpdateRejectsNonMemberSuspendedMemberAndUnauthorizedReader() public {
+        string memory oldCid = "bafkreiaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaq";
+        string memory newCid = "bafkreiafaucqkbifaucqkbifaucqkbifaucqkbifaucqkbifaucqkbifau";
+        bytes32 epochId = bytes32(uint256(6));
+        vm.prank(FILE_REGISTRY);
+        governance.initializeEnvelopeSet(FILE_ID, 1, epochId, oldCid);
+
+        // 1. Non-member / unregistered actor
+        RrdsEip712.EnvelopeSetUpdate memory nonMemberReq = RrdsEip712.EnvelopeSetUpdate({
+            fileId: FILE_ID,
+            versionNumber: 1,
+            epochId: epochId,
+            oldEnvelopeSetCid: oldCid,
+            newEnvelopeSetCid: newCid,
+            actorMemberId: bytes32(uint256(9999)),
+            proposalId: bytes32(0),
+            operationNonce: bytes32(uint256(200)),
+            deadline: block.timestamp + 1 days
+        });
+        bytes32 nonMemberDigest = RrdsEip712.digest(
+            RrdsEip712.accessGovernanceDomainSeparator(block.chainid, address(governance)),
+            RrdsEip712.hashEnvelopeSetUpdate(nonMemberReq)
+        );
+        (uint8 v, bytes32 r, bytes32 s) = vm.sign(MEMBER_PRIVATE_KEY, nonMemberDigest);
+        vm.expectRevert(AccessGovernance.MemberNotActive.selector);
+        vm.prank(RELAYER);
+        governance.updateEnvelopeSet(nonMemberReq, abi.encodePacked(r, s, v));
+
+        // 2. Active member without Read ACL on this file
+        RrdsEip712.EnvelopeSetUpdate memory noAclReq = RrdsEip712.EnvelopeSetUpdate({
+            fileId: FILE_ID,
+            versionNumber: 1,
+            epochId: epochId,
+            oldEnvelopeSetCid: oldCid,
+            newEnvelopeSetCid: newCid,
+            actorMemberId: OTHER_MEMBER_ID,
+            proposalId: bytes32(0),
+            operationNonce: bytes32(uint256(201)),
+            deadline: block.timestamp + 1 days
+        });
+        bytes32 noAclDigest = RrdsEip712.digest(
+            RrdsEip712.accessGovernanceDomainSeparator(block.chainid, address(governance)),
+            RrdsEip712.hashEnvelopeSetUpdate(noAclReq)
+        );
+        (v, r, s) = vm.sign(OTHER_MEMBER_PRIVATE_KEY, noAclDigest);
+        vm.expectRevert(AccessGovernance.UnauthorizedEnvelopeActor.selector);
+        vm.prank(RELAYER);
+        governance.updateEnvelopeSet(noAclReq, abi.encodePacked(r, s, v));
+
+        // 3. Suspended Read-authorized member
+        vm.prank(EMERGENCY_SAFE);
+        governance.emergencySuspendMember(MEMBER_ID);
+        RrdsEip712.EnvelopeSetUpdate memory suspendedReq = RrdsEip712.EnvelopeSetUpdate({
+            fileId: FILE_ID,
+            versionNumber: 1,
+            epochId: epochId,
+            oldEnvelopeSetCid: oldCid,
+            newEnvelopeSetCid: newCid,
+            actorMemberId: MEMBER_ID,
+            proposalId: bytes32(0),
+            operationNonce: bytes32(uint256(202)),
+            deadline: block.timestamp + 1 days
+        });
+        bytes32 suspendedDigest = RrdsEip712.digest(
+            RrdsEip712.accessGovernanceDomainSeparator(block.chainid, address(governance)),
+            RrdsEip712.hashEnvelopeSetUpdate(suspendedReq)
+        );
+        (v, r, s) = vm.sign(MEMBER_PRIVATE_KEY, suspendedDigest);
+        vm.expectRevert(AccessGovernance.MemberNotActive.selector);
+        vm.prank(RELAYER);
+        governance.updateEnvelopeSet(suspendedReq, abi.encodePacked(r, s, v));
     }
 
     function test_EnvelopeUpdateRejectsWrongSignatureStaleCidAndExpiredRequest() public {
@@ -634,7 +731,7 @@ contract AccessGovernanceTest is Test {
         (uint8 v, bytes32 r, bytes32 s) = vm.sign(MEMBER_PRIVATE_KEY + 1, digest);
         bytes memory invalidSignature = abi.encodePacked(r, s, v);
 
-        vm.prank(ORGANIZATION_SAFE);
+        vm.prank(RELAYER);
         vm.expectRevert(AccessGovernance.InvalidOperationSignature.selector);
         governance.updateEnvelopeSet(request, invalidSignature);
 
@@ -644,7 +741,7 @@ contract AccessGovernanceTest is Test {
             RrdsEip712.hashEnvelopeSetUpdate(request)
         );
         (v, r, s) = vm.sign(MEMBER_PRIVATE_KEY, staleDigest);
-        vm.prank(ORGANIZATION_SAFE);
+        vm.prank(RELAYER);
         vm.expectRevert(AccessGovernance.StaleEnvelopePointer.selector);
         governance.updateEnvelopeSet(request, abi.encodePacked(r, s, v));
 
@@ -657,7 +754,7 @@ contract AccessGovernanceTest is Test {
         );
         (v, r, s) = vm.sign(MEMBER_PRIVATE_KEY, expiredDigest);
         vm.warp(block.timestamp + 1);
-        vm.prank(ORGANIZATION_SAFE);
+        vm.prank(RELAYER);
         vm.expectRevert(AccessGovernance.ExpiredOperation.selector);
         governance.updateEnvelopeSet(request, abi.encodePacked(r, s, v));
     }

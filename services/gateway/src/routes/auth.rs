@@ -263,9 +263,25 @@ pub(crate) async fn create_session(
     let Ok(claimed_signer) = recover_signer(&digest, &request.signature) else {
         return invalid_signature_failure(&state, "auth.session", &source_id, None).await;
     };
-    let Ok(active_signer) = state
+    let Ok(finalized) = state.chain.finalized_block().await else {
+        return failure(
+            &state,
+            "auth.session",
+            &source_id,
+            "chain_unavailable",
+            None,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "service_unavailable",
+        )
+        .await;
+    };
+    let Ok(identity) = state
         .chain
-        .active_member_signer(&state.config.access_governance, member.as_bytes())
+        .member_identity(
+            &state.config.access_governance,
+            member.as_bytes(),
+            finalized.number,
+        )
         .await
     else {
         return failure(
@@ -279,6 +295,9 @@ pub(crate) async fn create_session(
         )
         .await;
     };
+    let active_signer = identity
+        .filter(|member| member.active())
+        .map(|member| member.signing_address);
     if active_signer != Some(claimed_signer) {
         return invalid_signature_failure(&state, "auth.session", &source_id, None).await;
     }
@@ -318,6 +337,7 @@ pub(crate) async fn create_session(
             session_expires_at,
             &source_id,
             state.config.chain_id,
+            finalized.number,
         )
         .await
     {

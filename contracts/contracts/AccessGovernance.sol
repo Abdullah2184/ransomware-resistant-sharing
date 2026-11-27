@@ -14,7 +14,6 @@ contract AccessGovernance is AccessControl {
         keccak256("EMERGENCY_SUSPENDER_ROLE");
     bytes32 public constant READ_ACL_POLICY = keccak256("READ_ACL_POLICY");
     bytes32 public constant WRITE_ACL_POLICY = keccak256("WRITE_ACL_POLICY");
-    bytes32 public constant ENVELOPE_UPDATE_POLICY = keccak256("ENVELOPE_UPDATE_POLICY");
     bytes32 public constant FILE_METADATA_POLICY = keccak256("FILE_METADATA_POLICY");
 
     enum MemberStatus {
@@ -565,12 +564,14 @@ contract AccessGovernance is AccessControl {
         if (consumedOperationNonces[request.actorMemberId][request.operationNonce]) {
             revert OperationNonceAlreadyConsumed();
         }
+        if (fileOrganizations[request.fileId] == bytes32(0)) revert UnknownFile();
 
         Member storage actor = members[request.actorMemberId];
+        if (actor.status != MemberStatus.Active || actor.signingAddress == address(0)) {
+            revert MemberNotActive();
+        }
         if (
-            actor.status != MemberStatus.Active
-                || actor.signingAddress == address(0)
-                || !RrdsCid.isCanonicalV1(request.newEnvelopeSetCid)
+            !RrdsCid.isCanonicalV1(request.newEnvelopeSetCid)
                 || keccak256(bytes(request.oldEnvelopeSetCid))
                     == keccak256(bytes(request.newEnvelopeSetCid))
         ) revert InvalidEnvelopeReference();
@@ -585,14 +586,6 @@ contract AccessGovernance is AccessControl {
         if (digest.recover(signature) != actor.signingAddress) {
             revert InvalidOperationSignature();
         }
-
-        bytes32 organizationId = fileOrganizations[request.fileId];
-        if (organizationId == bytes32(0)) revert UnknownFile();
-        _requireFilePolicyAuthority(
-            request.fileId,
-            organizationId,
-            ENVELOPE_UPDATE_POLICY
-        );
 
         EnvelopePointer storage pointer = envelopePointers[request.fileId][request.versionNumber];
         if (

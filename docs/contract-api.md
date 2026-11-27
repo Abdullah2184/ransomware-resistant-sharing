@@ -29,14 +29,15 @@ Besu block gas limit `30,000,000`).
   - `reinstateMember(bytes32 memberId)`
   - `grantRole(FILE_REGISTRY_ROLE, address fileRegistry)` (scheduled & executed via `RrdsTimelockController`)
 - **Emergency Safe (`onlyRole(EMERGENCY_SUSPENDER_ROLE)`):**
-  - `suspendMember(bytes32 memberId)` — suspend-only; cannot grant ACLs or reinstate.
+  - `emergencySuspendMember(bytes32 memberId)` — suspend-only; cannot grant ACLs or reinstate.
 - **Organization / File Policy Safe:**
   - `registerMember(organizationId, memberId, signingAddress, signingKeyVersion, encryptionKeyVersion, encryptionPublicKey, proofNonce, proofDeadline, proofSignature)` — verifies EIP-712 `MemberKeyProof` proof-of-possession.
-  - `rotateMemberKeys(...)` / `setMemberStatus(memberId, newStatus)` / `setKeyStatus(...)`
-  - `setFilePolicyAuthority(fileId, policy, authority)`
+  - `supersedeMemberKeys(memberId, newSigningAddress, newSigningKeyVersion, newEncryptionKeyVersion, newEncryptionPublicKey, proofNonce, proofDeadline, proofSignature)` / `setMemberStatus(memberId, newStatus)`
+  - `setFilePolicyAuthority(fileId, policy, authority)` (`READ_ACL_POLICY`, `WRITE_ACL_POLICY`, `FILE_METADATA_POLICY`)
   - `setFilePermission(fileId, memberId, permission, granted, proposalId)` — revoking Read increments `readPermissionEpochs[fileId][memberId]`, invalidating prior historical grants.
   - `setHistoricalReadAccess(fileId, versionNumber, memberId, granted, proposalId)`
-  - `updateEnvelopeSet(EnvelopeSetUpdate request, bytes signature)` — verifies EIP-712 `EnvelopeSetUpdate` signature, increments `revision`, and updates current envelope-set CID pointer without modifying prior envelope sets or ciphertext.
+- **Relayed Signed Envelope Updates (EIP-712 `EnvelopeSetUpdate`; any non-authority `msg.sender` / gateway relayer):**
+  - `updateEnvelopeSet(EnvelopeSetUpdate request, bytes signature)` — verifies active member status, current file Read ACL, EIP-712 `EnvelopeSetUpdate` signature, deadline, nonce replay protection, canonical CIDv1, and `oldEnvelopeSetCid` continuity; increments `revision` and advances the current envelope-set pointer without modifying prior envelope sets, ciphertext, or any ACL permissions.
 - **Read-Only Queries (`eth_call`, zero gas, no tx):**
   - `memberIdentity(bytes32 memberId) -> Member`
   - `isActiveMember(bytes32 memberId) -> bool`
@@ -49,22 +50,23 @@ Besu block gas limit `30,000,000`).
 ### `FileRegistry`
 
 - **Relayed Signed Writes (EIP-712 `VersionAppend` recovered from signature; `msg.sender` is relayer):**
-  - `createFile(VersionAppend request, string contentCid, string envelopeSetCid, string displayName, bytes32 parentFolderId, bytes signature)` — creates file + V1 atomically and calls `AccessGovernance.initializeFileAndEnvelope` (granting creator initial Read & Write ACL + envelope revision `1`).
+  - `createFile(VersionAppend request, string contentCid, string envelopeSetCid, string displayName, bytes32 parentFolderId, bytes signature)` — creates file + V1 atomically and calls `AccessGovernance.registerFilePolicy` and `AccessGovernance.initializeEnvelopeSet` (granting creator initial Read & Write ACL + envelope revision `1`).
   - `appendVersion(VersionAppend request, string contentCid, string envelopeSetCid, bytes signature)` — verifies active Write ACL, `versionNumber == currentVersion + 1`, `parentManifestHash == currentHeadManifestHash`, unique `epochId`, and valid CIDv1 strings; appends immutable version and advances head.
-- **Governed Metadata / Folders (`FILE_METADATA_POLICY` / organization Safe):**
-  - `createFolder(bytes32 folderId, bytes32 organizationId, bytes32 parentFolderId, string displayName)`
-  - `renameFile(bytes32 fileId, string newDisplayName)` / `moveFile(bytes32 fileId, bytes32 newParentFolderId)` / `setFileStatus(bytes32 fileId, FileStatus newStatus)`
+- **Governed Metadata / Folders (`FILE_METADATA_POLICY` / organization Safe; status via timelock):**
+  - `createFolder(bytes32 folderId, bytes32 organizationId, bytes32 parentFolderId, string displayName)` / `renameFolder(bytes32 folderId, string displayName)`
+  - `updateFileMetadata(bytes32 fileId, string displayName, bytes32 parentFolderId)` / `setFileStatus(bytes32 fileId, FileStatus newStatus)` (timelock-only)
 - **Read-Only Queries (`eth_call`):**
-  - `getFile(bytes32 fileId) -> FileRecord`
+  - `getFile(bytes32 fileId) -> File`
   - `getVersion(bytes32 fileId, uint64 versionNumber) -> VersionRecord`
-  - `getFolder(bytes32 folderId) -> FolderRecord`
+  - `getFolder(bytes32 folderId) -> Folder`
 
 ---
 
 ## 3. Indexed Events (Consumed by `services/indexer`)
 
-- **`AccessGovernance`:** `OrganizationRegistered`, `OrganizationAuthorityChanged`, `MemberRegistered`, `MemberStatusChanged`, `MemberKeyRegistered`, `MemberKeySuperseded`, `MemberKeyStatusChanged`, `FilePolicyRegistered`, `FilePolicyAuthorityChanged`, `ReadAccessGranted`, `ReadAccessRevoked`, `WriteAccessGranted`, `WriteAccessRevoked`, `HistoricalReadAccessGranted`, `HistoricalReadAccessRevoked`, `EnvelopeSetInitialized`, `EnvelopeSetUpdated`.
-- **`FileRegistry`:** `FolderCreated`, `FileCreated`, `VersionAppended`, `FileMetadataChanged`, `FileStatusChanged`.
+- **`AccessGovernance`:** `OrganizationRegistered`, `OrganizationAuthorityChanged`, `MemberRegistered`, `MemberStatusChanged`, `MemberKeyRegistered`, `MemberKeySuperseded`, `MemberKeyStatusChanged`, `FilePolicyRegistered`, `FilePolicyAuthorityChanged`, `ReadAccessGranted`, `ReadAccessRevoked`, `WriteAccessGranted`, `WriteAccessRevoked`, `HistoricalReadAccessGranted`, `HistoricalReadAccessRevoked`, `EnvelopeSetInitialized`, `EnvelopeSetUpdated`, plus OpenZeppelin `AccessControl` events (`RoleGranted`, `RoleRevoked`, `RoleAdminChanged`).
+- **`FileRegistry`:** `FolderCreated`, `FolderRenamed`, `FileCreated`, `VersionAppended`, `CurrentHeadAdvanced`, `FileMetadataChanged`, `FileStatusChanged`.
+- **`RrdsTimelockController` (when `CONTRACT_TIMELOCK_ADDRESS` is configured):** `CallScheduled`, `CallExecuted`, `CallSalt`, `Cancelled`, `MinDelayChange`, plus `RoleGranted`, `RoleRevoked`, `RoleAdminChanged`.
 
 Routine read access lookups emit **no on-chain events** and submit **no blockchain transactions**; they are durably logged in PostgreSQL (`services/gateway`).
 
