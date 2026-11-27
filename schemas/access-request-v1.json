@@ -1,0 +1,55 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ransomware-resistant-sharing.invalid/schemas/access-request-v1.json",
+  "title": "RRDS Signed Access Lookup Request v1",
+  "description": "EIP-712 signed payload submitted to POST /v1/files/{fileId}/versions/{version}/access. Verified by gateway against authoritative AccessGovernance state and consumed atomically in PostgreSQL replay storage without submitting a blockchain transaction.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "memberId",
+    "fileId",
+    "versionNumber",
+    "encryptionKeyVersion",
+    "operationNonce",
+    "deadline",
+    "signature"
+  ],
+  "properties": {
+    "memberId": {
+      "type": "string",
+      "pattern": "^0x[0-9a-f]{64}$",
+      "description": "Canonical lower-case 32-byte member identifier."
+    },
+    "fileId": {
+      "type": "string",
+      "pattern": "^0x[0-9a-f]{64}$",
+      "description": "Canonical lower-case 32-byte stable file identifier."
+    },
+    "versionNumber": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Target non-zero file version number."
+    },
+    "encryptionKeyVersion": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 4294967295,
+      "description": "Active encryption key version matching AccessGovernance memberIdentity."
+    },
+    "operationNonce": {
+      "type": "string",
+      "pattern": "^0x[0-9a-f]{64}$",
+      "description": "One-time 32-byte operation nonce consumed atomically by the gateway replay store."
+    },
+    "deadline": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "UTC Unix timestamp in seconds after which the signed request expires."
+    },
+    "signature": {
+      "type": "string",
+      "pattern": "^0x[0-9a-f]{130}$",
+      "description": "65-byte low-s secp256k1 EIP-712 signature (r || s || v) over AccessLookup under the RRDS AccessGovernance domain."
+    }
+  }
+}

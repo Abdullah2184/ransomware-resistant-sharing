@@ -15,7 +15,8 @@ pub use encryption::{
 pub use envelope_set::{KeyEnvelopeEntry, KeyEnvelopeSet, MAX_ENVELOPE_SET_ENTRIES};
 pub use key_wrapping::{HpkeRecipientKeyPair, HpkeRecipientPublicKey, KeyEnvelope, WrapContext};
 pub use manifest::{
-    EncryptedChunkRef, EncryptedFileManifest, PrivateMetadataCiphertext, raw_sha256_cid,
+    EncryptedChunkRef, EncryptedFileManifest, MAX_PRIVATE_METADATA_BYTES,
+    PrivateMetadataCiphertext, raw_sha256_cid, verify_sha256_cid,
 };
 pub use nonce::NoncePrefix;
 pub use signing::{

@@ -8,7 +8,7 @@ use std::{
     collections::HashMap,
     fmt,
     io::Cursor,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, MutexGuard},
     time::Duration,
 };
 
@@ -25,7 +25,7 @@ use ports::{
     StorageError, StorageFuture, StorageReader, StoredContent, StoredEnvelopeSet,
     encode_content_package_frame,
 };
-use reqwest::{Client, StatusCode, Url};
+use reqwest::{Client, StatusCode, Url, redirect::Policy};
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncReadExt;
 use zeroize::Zeroizing;
@@ -35,7 +35,11 @@ use crate::car::extract_package_from_car;
 const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 const HEALTH_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_UPLOAD_FRAME_BYTES: usize = 64 * 1024 * 1024;
+const MAX_CONTENT_CAR_BYTES: usize = MAX_UPLOAD_FRAME_BYTES + 4 * 1024 * 1024;
 const MAX_ENVELOPE_BYTES: usize = 512 * 1024;
+const MAX_JSON_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
+const MAX_ERROR_BODY_BYTES: usize = 16 * 1024;
+const MAX_AUTHORIZED_CACHE_ENTRIES: usize = 1024;
 
 #[derive(Clone)]
 pub struct GatewayHttpClient {
@@ -51,16 +55,31 @@ impl fmt::Debug for GatewayHttpClient {
         formatter
             .debug_struct("GatewayHttpClient")
             .field("base_url", &self.base_url.as_str())
-            .field("authenticated", &self.token.lock().unwrap().is_some())
+            .field("authenticated", &lock_unpoisoned(&self.token).is_some())
             .finish()
     }
 }
 
+fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 impl GatewayHttpClient {
+    #[cfg(test)]
     pub fn new(base_url: &str) -> Result<Self, String> {
-        let base_url = validate_base_url(base_url)?;
+        Self::new_with_insecure_http_opt_in(base_url, false)
+    }
+
+    pub fn new_with_insecure_http_opt_in(
+        base_url: &str,
+        allow_insecure_http: bool,
+    ) -> Result<Self, String> {
+        let base_url = validate_base_url_with_policy(base_url, allow_insecure_http)?;
         let client = Client::builder()
             .timeout(HTTP_TIMEOUT)
+            .redirect(Policy::none())
             .build()
             .map_err(|_| "could not initialize the HTTP client".to_owned())?;
         Ok(Self {
@@ -73,7 +92,7 @@ impl GatewayHttpClient {
     }
 
     pub fn set_bearer_token(&self, token: String) {
-        *self.token.lock().unwrap() = Some(Zeroizing::new(token));
+        *lock_unpoisoned(&self.token) = Some(Zeroizing::new(token));
     }
 
     pub fn endpoint_url(&self, relative_path: &str) -> String {
@@ -86,6 +105,7 @@ impl GatewayHttpClient {
     pub async fn check_health(&self) -> Result<StatusCode, String> {
         let client = Client::builder()
             .timeout(HEALTH_TIMEOUT)
+            .redirect(Policy::none())
             .build()
             .map_err(|_| "could not initialize the HTTP client".to_owned())?;
         let response = client
@@ -107,6 +127,24 @@ impl GatewayHttpClient {
             .map_err(|_| DomainError::Internal)?;
         let body: SessionIdentityDto = decode_json_response(response).await?;
         Ok(body.member_id)
+    }
+
+    pub async fn logout(&self) -> Result<(), DomainError> {
+        let bearer = self.require_bearer()?;
+        let response = self
+            .client
+            .delete(self.endpoint_url("/v1/auth/session"))
+            .bearer_auth(&*bearer)
+            .send()
+            .await
+            .map_err(|_| DomainError::Internal)?;
+        let status = response.status();
+        if status.is_success() {
+            *lock_unpoisoned(&self.token) = None;
+            return Ok(());
+        }
+        let code = read_error_code(response).await;
+        Err(map_http_error(status, code.as_deref()))
     }
 
     pub async fn list_files(
@@ -165,7 +203,7 @@ impl GatewayHttpClient {
     }
 
     /// Downloads the CARv1 ciphertext stream for an already-authorized version
-    /// and extracts the verified `EncryptedPackageBytes` (manifest + chunks).
+    /// within a hard memory bound and extracts the verified `EncryptedPackageBytes`.
     pub async fn fetch_content_package(
         &self,
         access: &AccessReference,
@@ -182,22 +220,45 @@ impl GatewayHttpClient {
             .send()
             .await
             .map_err(|_| DomainError::StorageUnavailable)?;
-        if !response.status().is_success() {
-            return Err(map_http_error(response.status(), None));
+        let status = response.status();
+        if !status.is_success() {
+            let code = read_error_code(response).await;
+            return Err(map_http_error(status, code.as_deref()));
         }
-        let car_bytes = response
-            .bytes()
+        let car_bytes = read_response_bytes_bounded(response, MAX_CONTENT_CAR_BYTES)
             .await
-            .map_err(|_| DomainError::StorageUnavailable)?;
+            .map_err(|err| match err {
+                BoundedReadError::SizeLimitExceeded => DomainError::InvalidManifest,
+                BoundedReadError::Transport => DomainError::StorageUnavailable,
+            })?;
         extract_package_from_car(&car_bytes, access)
     }
 
     fn require_bearer(&self) -> Result<Zeroizing<String>, DomainError> {
-        self.token
-            .lock()
-            .unwrap()
+        lock_unpoisoned(&self.token)
             .clone()
             .ok_or(DomainError::Unauthenticated)
+    }
+
+    fn cache_authorized_refs(&self, access: &AccessReference) {
+        let mut envelopes = lock_unpoisoned(&self.authorized_envelopes);
+        if envelopes.len() >= MAX_AUTHORIZED_CACHE_ENTRIES {
+            envelopes.clear();
+        }
+        envelopes.insert(
+            access.envelope_set_cid.to_string(),
+            (access.file_id, access.version_number),
+        );
+        drop(envelopes);
+
+        let mut contents = lock_unpoisoned(&self.authorized_contents);
+        if contents.len() >= MAX_AUTHORIZED_CACHE_ENTRIES {
+            contents.clear();
+        }
+        contents.insert(
+            access.content_cid.to_string(),
+            (access.file_id, access.version_number),
+        );
     }
 }
 
@@ -292,13 +353,29 @@ impl LedgerPort for GatewayHttpClient {
 
     fn get_file_head(&self, file_id: FileId) -> PortFuture<'_, Option<HeadState>> {
         Box::pin(async move {
-            let history = self.version_history(file_id).await?;
+            let bearer = self.require_bearer()?;
+            let response = self
+                .client
+                .get(self.endpoint_url(&format!("/v1/files/{file_id}/versions")))
+                .bearer_auth(&*bearer)
+                .send()
+                .await
+                .map_err(|_| DomainError::Internal)?;
+            if response.status() == StatusCode::NOT_FOUND {
+                return Ok(None);
+            }
+            let history: VersionHistoryView = decode_json_response(response).await?;
+            let status = match history.file_status {
+                1 => FileStatus::Active,
+                2 => FileStatus::Archived,
+                _ => return Err(DomainError::Internal),
+            };
             let current_version = VersionNumber::new(history.current_version)?;
             let current_head_manifest_hash =
                 ManifestHash::from_bytes(parse_hex_32(&history.current_head_manifest_hash)?);
             Ok(Some(HeadState {
                 file_id,
-                status: FileStatus::Active,
+                status,
                 current_version,
                 current_head_manifest_hash,
             }))
@@ -329,23 +406,21 @@ impl LedgerPort for GatewayHttpClient {
                 .await
                 .map_err(|_| DomainError::Internal)?;
             let dto: AccessLookupDto = decode_json_response(response).await?;
+            let manifest_hash = ManifestHash::from_bytes(parse_hex_32(&dto.manifest_hash)?);
+            if manifest_hash == ManifestHash::ZERO {
+                return Err(DomainError::IntegrityCheckFailed);
+            }
             let access = AccessReference {
                 file_id: FileId::from_bytes(parse_hex_32(&dto.file_id)?),
                 version_number: VersionNumber::new(dto.version_number)?,
+                manifest_hash,
                 content_cid: ContentCid::parse(&dto.content_cid)?,
                 envelope_set_cid: EnvelopeSetCid::parse(&dto.envelope_set_cid)?,
                 epoch_id: EpochId::from_bytes(parse_hex_32(&dto.epoch_id)?),
                 envelope_revision: dto.envelope_revision,
                 finalized_block: dto.finalized_block,
             };
-            self.authorized_envelopes.lock().unwrap().insert(
-                access.envelope_set_cid.to_string(),
-                (access.file_id, access.version_number),
-            );
-            self.authorized_contents.lock().unwrap().insert(
-                access.content_cid.to_string(),
-                (access.file_id, access.version_number),
-            );
+            self.cache_authorized_refs(&access);
             Ok(access)
         })
     }
@@ -497,7 +572,7 @@ impl BlobStore for GatewayHttpClient {
 
     fn put_envelope_set<'a>(
         &'a self,
-        mut reader: StorageReader,
+        reader: StorageReader,
         byte_length: u64,
         min_replicas: usize,
     ) -> StorageFuture<'a, StoredEnvelopeSet> {
@@ -510,6 +585,7 @@ impl BlobStore for GatewayHttpClient {
             }
             let mut bytes = Vec::with_capacity(byte_length as usize);
             reader
+                .take(byte_length.saturating_add(1))
                 .read_to_end(&mut bytes)
                 .await
                 .map_err(|_| StorageError::TransportUnavailable)?;
@@ -547,10 +623,7 @@ impl BlobStore for GatewayHttpClient {
             let bearer = self
                 .require_bearer()
                 .map_err(|_| StorageError::TransportUnavailable)?;
-            let (file_id, version) = self
-                .authorized_contents
-                .lock()
-                .unwrap()
+            let (file_id, version) = lock_unpoisoned(&self.authorized_contents)
                 .get(&cid.to_string())
                 .copied()
                 .ok_or(StorageError::TransportUnavailable)?;
@@ -567,11 +640,10 @@ impl BlobStore for GatewayHttpClient {
             if !response.status().is_success() {
                 return Err(StorageError::TransportUnavailable);
             }
-            let bytes = response
-                .bytes()
+            let bytes = read_response_bytes_bounded(response, MAX_CONTENT_CAR_BYTES)
                 .await
-                .map_err(|_| StorageError::TransportUnavailable)?;
-            Ok(Box::pin(Cursor::new(bytes.to_vec())) as StorageReader)
+                .map_err(map_bounded_read_to_storage)?;
+            Ok(Box::pin(Cursor::new(bytes)) as StorageReader)
         })
     }
 
@@ -580,10 +652,7 @@ impl BlobStore for GatewayHttpClient {
             let bearer = self
                 .require_bearer()
                 .map_err(|_| StorageError::TransportUnavailable)?;
-            let (file_id, version) = self
-                .authorized_envelopes
-                .lock()
-                .unwrap()
+            let (file_id, version) = lock_unpoisoned(&self.authorized_envelopes)
                 .get(&cid.to_string())
                 .copied()
                 .ok_or(StorageError::TransportUnavailable)?;
@@ -600,11 +669,10 @@ impl BlobStore for GatewayHttpClient {
             if !response.status().is_success() {
                 return Err(StorageError::TransportUnavailable);
             }
-            let bytes = response
-                .bytes()
+            let bytes = read_response_bytes_bounded(response, MAX_ENVELOPE_BYTES)
                 .await
-                .map_err(|_| StorageError::TransportUnavailable)?;
-            Ok(Box::pin(Cursor::new(bytes.to_vec())) as StorageReader)
+                .map_err(map_bounded_read_to_storage)?;
+            Ok(Box::pin(Cursor::new(bytes)) as StorageReader)
         })
     }
 
@@ -621,10 +689,21 @@ impl BlobStore for GatewayHttpClient {
     }
 }
 
+#[cfg(test)]
 pub fn validate_base_url(base_url: &str) -> Result<Url, String> {
+    validate_base_url_with_policy(base_url, false)
+}
+
+pub fn validate_base_url_with_policy(
+    base_url: &str,
+    allow_insecure_http: bool,
+) -> Result<Url, String> {
     let url = Url::parse(base_url)
         .map_err(|_| "gateway URL must be a valid absolute HTTP or HTTPS URL".to_owned())?;
-    if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+    let Some(host) = url.host_str() else {
+        return Err("gateway URL must include an HTTP or HTTPS host".into());
+    };
+    if !matches!(url.scheme(), "http" | "https") {
         return Err("gateway URL must include an HTTP or HTTPS host".into());
     }
     if !url.username().is_empty()
@@ -634,7 +713,68 @@ pub fn validate_base_url(base_url: &str) -> Result<Url, String> {
     {
         return Err("gateway URL must not contain credentials, a query, or a fragment".into());
     }
+    if url.scheme() == "http" && !is_loopback_host(host) && !allow_insecure_http {
+        return Err(
+            "gateway URL must use https:// for non-loopback hosts (set RRDS_ALLOW_INSECURE_HTTP=true only for isolated testing)"
+                .into(),
+        );
+    }
     Ok(url)
+}
+
+fn is_loopback_host(host: &str) -> bool {
+    let normalized = host.trim_start_matches('[').trim_end_matches(']');
+    if normalized.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    normalized
+        .parse::<std::net::IpAddr>()
+        .is_ok_and(|ip| ip.is_loopback())
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BoundedReadError {
+    SizeLimitExceeded,
+    Transport,
+}
+
+fn map_bounded_read_to_storage(err: BoundedReadError) -> StorageError {
+    match err {
+        BoundedReadError::SizeLimitExceeded => StorageError::SizeLimitExceeded,
+        BoundedReadError::Transport => StorageError::TransportUnavailable,
+    }
+}
+
+async fn read_response_bytes_bounded(
+    mut response: reqwest::Response,
+    max_bytes: usize,
+) -> Result<Vec<u8>, BoundedReadError> {
+    if let Some(content_length) = response.content_length()
+        && content_length > max_bytes as u64
+    {
+        return Err(BoundedReadError::SizeLimitExceeded);
+    }
+    let mut out = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|_| BoundedReadError::Transport)?
+    {
+        if out.len().saturating_add(chunk.len()) > max_bytes {
+            return Err(BoundedReadError::SizeLimitExceeded);
+        }
+        out.extend_from_slice(&chunk);
+    }
+    Ok(out)
+}
+
+async fn read_error_code(response: reqwest::Response) -> Option<String> {
+    let bytes = read_response_bytes_bounded(response, MAX_ERROR_BODY_BYTES)
+        .await
+        .ok()?;
+    serde_json::from_slice::<GatewayErrorDto>(&bytes)
+        .ok()
+        .map(|dto| dto.error)
 }
 
 #[derive(Deserialize, Serialize)]
@@ -685,6 +825,7 @@ struct PublicIdentityDto {
 struct AccessLookupDto {
     file_id: String,
     version_number: u64,
+    manifest_hash: String,
     content_cid: String,
     envelope_set_cid: String,
     epoch_id: String,
@@ -759,6 +900,7 @@ pub struct ProjectedVersionView {
 #[serde(rename_all = "camelCase")]
 pub struct VersionHistoryView {
     pub file_id: String,
+    pub file_status: u64,
     pub current_version: u64,
     pub current_head_manifest_hash: String,
     pub finalized_block: u64,
@@ -787,13 +929,15 @@ async fn decode_json_response<T: serde::de::DeserializeOwned>(
 ) -> Result<T, DomainError> {
     let status = response.status();
     if status.is_success() {
-        return response.json().await.map_err(|_| DomainError::Internal);
+        let bytes = read_response_bytes_bounded(response, MAX_JSON_RESPONSE_BYTES)
+            .await
+            .map_err(|err| match err {
+                BoundedReadError::SizeLimitExceeded => DomainError::InvalidManifest,
+                BoundedReadError::Transport => DomainError::Internal,
+            })?;
+        return serde_json::from_slice(&bytes).map_err(|_| DomainError::Internal);
     }
-    let error_code = response
-        .json::<GatewayErrorDto>()
-        .await
-        .ok()
-        .map(|dto| dto.error);
+    let error_code = read_error_code(response).await;
     Err(map_http_error(status, error_code.as_deref()))
 }
 
@@ -802,35 +946,48 @@ async fn decode_blob_response<T: serde::de::DeserializeOwned>(
 ) -> Result<T, StorageError> {
     let status = response.status();
     if status.is_success() {
-        return response
-            .json()
+        let bytes = read_response_bytes_bounded(response, MAX_JSON_RESPONSE_BYTES)
             .await
-            .map_err(|_| StorageError::InvalidResponse);
+            .map_err(map_bounded_read_to_storage)?;
+        return serde_json::from_slice(&bytes).map_err(|_| StorageError::InvalidResponse);
     }
-    let error_code = response
-        .json::<GatewayErrorDto>()
-        .await
-        .ok()
-        .map(|dto| dto.error);
+    let error_code = read_error_code(response).await;
     Err(match (status, error_code.as_deref()) {
         (_, Some("replication_insufficient")) => StorageError::ReplicationInsufficient,
+        (_, Some("integrity_check_failed")) => StorageError::IntegrityCheckFailed,
+        (StatusCode::PAYLOAD_TOO_LARGE, _) => StorageError::SizeLimitExceeded,
+        (StatusCode::GATEWAY_TIMEOUT, _) => StorageError::TimedOut,
         (StatusCode::BAD_REQUEST, _) => StorageError::InvalidPackage,
         _ => StorageError::TransportUnavailable,
     })
 }
 
-fn map_http_error(status: StatusCode, code: Option<&str>) -> DomainError {
+pub(crate) fn map_http_error(status: StatusCode, code: Option<&str>) -> DomainError {
     match (status, code) {
-        (StatusCode::UNAUTHORIZED, _) => DomainError::Unauthorized,
+        (StatusCode::UNAUTHORIZED, Some("unauthenticated")) => DomainError::Unauthenticated,
+        (StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN, Some("member_suspended")) => {
+            DomainError::MemberSuspended
+        }
+        (StatusCode::UNAUTHORIZED, _) | (StatusCode::FORBIDDEN, _) => DomainError::Unauthorized,
+        (StatusCode::NOT_FOUND, _) => DomainError::ContractRejected,
         (StatusCode::CONFLICT, Some("stale_head")) => DomainError::StaleHead,
+        (StatusCode::CONFLICT, Some("replay_detected")) => DomainError::ReplayDetected,
+        (StatusCode::CONFLICT, Some("expired_request")) => DomainError::ExpiredRequest,
+        (StatusCode::CONFLICT, Some("member_suspended")) => DomainError::MemberSuspended,
         (StatusCode::CONFLICT, _) => DomainError::ContractRejected,
+        (StatusCode::PAYLOAD_TOO_LARGE, _) => DomainError::InvalidManifest,
         (StatusCode::TOO_MANY_REQUESTS, _) => DomainError::RateLimited,
         (StatusCode::SERVICE_UNAVAILABLE, Some("replication_insufficient")) => {
             DomainError::ReplicationInsufficient
         }
+        (StatusCode::SERVICE_UNAVAILABLE, Some("storage_unavailable" | "blob_unavailable")) => {
+            DomainError::StorageUnavailable
+        }
         (StatusCode::GATEWAY_TIMEOUT, _) | (StatusCode::SERVICE_UNAVAILABLE, _) => {
             DomainError::Internal
         }
+        (StatusCode::BAD_REQUEST, Some("expired_request")) => DomainError::ExpiredRequest,
+        (StatusCode::BAD_REQUEST, Some("invalid_signature")) => DomainError::InvalidSignature,
         (StatusCode::BAD_REQUEST, _) => DomainError::InvalidManifest,
         _ => DomainError::Internal,
     }

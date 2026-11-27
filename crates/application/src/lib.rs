@@ -9,7 +9,7 @@ pub mod download;
 pub mod share;
 pub mod upload;
 
-pub use auth::{AuthConfig, AuthService};
+pub use auth::{AuthConfig, AuthService, MAX_CHALLENGE_CLOCK_SKEW_SECONDS};
 pub use download::{DecryptedVersion, DownloadConfig, DownloadService, EncryptedPackageBytes};
 pub use share::{OrphanedEnvelopeDetails, ShareConfig, ShareError, ShareReceipt, ShareService};
 pub use upload::{OrphanedUploadDetails, UploadConfig, UploadError, UploadReceipt, UploadService};
@@ -354,6 +354,7 @@ mod tests {
                 Ok(AccessReference {
                     file_id: request.file_id,
                     version_number: request.version_number,
+                    manifest_hash: version.manifest_hash,
                     content_cid: version.content_cid.clone(),
                     envelope_set_cid: version.envelope_set_cid.clone(),
                     epoch_id: version.epoch_id,
@@ -1012,5 +1013,587 @@ mod tests {
 
         assert_eq!(error.domain_error(), DomainError::ReplicationInsufficient);
         assert_eq!(ledger.get_file_head(file_id).await.unwrap(), None);
+    }
+
+    struct StubScanner {
+        mode: ports::ScannerMode,
+        marker: &'static [u8],
+    }
+
+    impl ports::PreUploadScanner for StubScanner {
+        fn mode(&self) -> ports::ScannerMode {
+            self.mode
+        }
+
+        fn scan_plaintext<'a>(
+            &'a self,
+            _display_name: &'a str,
+            plaintext: &'a [u8],
+        ) -> PortFuture<'a, ports::ScanOutcome> {
+            let suspicious = plaintext
+                .windows(self.marker.len())
+                .any(|w| w == self.marker);
+            Box::pin(async move {
+                if suspicious {
+                    Ok(ports::ScanOutcome::Suspicious {
+                        reason: "matched test ransomware indicator".to_owned(),
+                    })
+                } else {
+                    Ok(ports::ScanOutcome::Clean)
+                }
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn pre_upload_scanner_honors_disabled_warn_and_enforce_modes_before_storage() {
+        let (alice_custody, alice) = make_member(11, MemberStatus::Active).await;
+        let store = InMemoryBlobStore::with_peers(&["peer-1", "peer-2"]);
+        let ledger = InMemoryLedger::default();
+        ledger.register_member(alice);
+
+        let payload = b"contains RANSOM_TEST_MARKER payload";
+
+        // Enforce mode blocks before pinning or committing.
+        let enforcing = UploadService::new(
+            ArcCustody(alice_custody.clone()),
+            store.clone(),
+            ledger.clone(),
+            FixedClock(1_800_000_000),
+            upload_config(),
+        )
+        .with_scanner(Arc::new(StubScanner {
+            mode: ports::ScannerMode::Enforce,
+            marker: b"RANSOM_TEST_MARKER",
+        }));
+        let blocked_id = FileId::from_bytes([0x71; 32]);
+        let err = enforcing
+            .create_file(
+                Some(blocked_id),
+                "blocked.txt".to_owned(),
+                FolderId::ROOT,
+                payload,
+                None,
+                &[],
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, UploadError::BlockedByScanner { .. }));
+        assert_eq!(ledger.get_file_head(blocked_id).await.unwrap(), None);
+        assert!(store.contents.lock().unwrap().is_empty());
+
+        // Warn mode commits and attaches scan_warning.
+        let warning = UploadService::new(
+            ArcCustody(alice_custody.clone()),
+            store.clone(),
+            ledger.clone(),
+            FixedClock(1_800_000_000),
+            upload_config(),
+        )
+        .with_scanner(Arc::new(StubScanner {
+            mode: ports::ScannerMode::Warn,
+            marker: b"RANSOM_TEST_MARKER",
+        }));
+        let warned_id = FileId::from_bytes([0x72; 32]);
+        let warned_receipt = warning
+            .create_file(
+                Some(warned_id),
+                "warned.txt".to_owned(),
+                FolderId::ROOT,
+                payload,
+                None,
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            warned_receipt.scan_warning.as_deref(),
+            Some("matched test ransomware indicator")
+        );
+
+        // Disabled mode skips scanning and attaches no warning.
+        let disabled = UploadService::new(
+            ArcCustody(alice_custody),
+            store,
+            ledger,
+            FixedClock(1_800_000_000),
+            upload_config(),
+        )
+        .with_scanner(Arc::new(StubScanner {
+            mode: ports::ScannerMode::Disabled,
+            marker: b"RANSOM_TEST_MARKER",
+        }));
+        let clean_receipt = disabled
+            .create_file(
+                Some(FileId::from_bytes([0x73; 32])),
+                "disabled.txt".to_owned(),
+                FolderId::ROOT,
+                payload,
+                None,
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(clean_receipt.scan_warning, None);
+    }
+
+    struct FailingCustody(ports::CustodyError);
+
+    impl KeyCustodyProvider for FailingCustody {
+        fn public_identity(&self) -> ports::CustodyFuture<'_, ports::PublicIdentityKeys> {
+            let err = self.0;
+            Box::pin(async move { Err(err) })
+        }
+
+        fn sign_typed_digest<'a>(
+            &'a self,
+            _key_id: &'a ports::KeyId,
+            _digest: &'a crypto::TypedDigest,
+        ) -> ports::CustodyFuture<'a, EvmSignature> {
+            let err = self.0;
+            Box::pin(async move { Err(err) })
+        }
+
+        fn unwrap_dek<'a>(
+            &'a self,
+            _key_id: &'a ports::KeyId,
+            _envelope: &'a crypto::KeyEnvelope,
+            _context: crypto::WrapContext,
+        ) -> ports::CustodyFuture<'a, zeroize::Zeroizing<[u8; 32]>> {
+            let err = self.0;
+            Box::pin(async move { Err(err) })
+        }
+
+        fn health_check(&self) -> ports::CustodyFuture<'_, ports::CustodyHealth> {
+            let err = self.0;
+            Box::pin(async move { Err(err) })
+        }
+    }
+
+    #[tokio::test]
+    async fn auth_handles_bounded_clock_skew_and_rejects_invalid_challenges_and_configs() {
+        let (alice_custody, alice) = make_member(20, MemberStatus::Active).await;
+        let base_challenge = LoginChallenge {
+            member_id: alice.member_id,
+            nonce: OperationNonce::from_bytes([0x45; 32]),
+            issued_at: 1_800_000_005,
+            expires_at: 1_800_000_125,
+            audience: "rrds-local".to_owned(),
+            protocol_version: 1,
+        };
+        let valid_cfg = AuthConfig {
+            chain_id: 1337,
+            access_governance: EvmAddress::from_bytes([0x22; 20]),
+            expected_audience: "rrds-local".to_owned(),
+            max_challenge_ttl_seconds: 120,
+        };
+
+        // 5-second future issued_at is tolerated under MAX_CHALLENGE_CLOCK_SKEW_SECONDS.
+        let within_skew = AuthService::new(
+            alice_custody.clone(),
+            MockGatewayAuth {
+                challenge: base_challenge.clone(),
+            },
+            FixedClock(1_800_000_000),
+            valid_cfg.clone(),
+        );
+        assert!(within_skew.login().await.is_ok());
+
+        // 6-second future issued_at exceeds bounded skew and fails closed.
+        let excess_skew = AuthService::new(
+            alice_custody.clone(),
+            MockGatewayAuth {
+                challenge: LoginChallenge {
+                    issued_at: 1_800_000_006,
+                    expires_at: 1_800_000_126,
+                    ..base_challenge.clone()
+                },
+            },
+            FixedClock(1_800_000_000),
+            valid_cfg.clone(),
+        );
+        assert_eq!(excess_skew.login().await, Err(DomainError::Unauthenticated));
+
+        // Wrong member_id, wrong protocol version, and excessive challenge TTL are rejected.
+        for bad_challenge in [
+            LoginChallenge {
+                member_id: MemberId::from_bytes([0x99; 32]),
+                ..base_challenge.clone()
+            },
+            LoginChallenge {
+                protocol_version: 2,
+                ..base_challenge.clone()
+            },
+            LoginChallenge {
+                expires_at: base_challenge.issued_at + 121,
+                ..base_challenge.clone()
+            },
+        ] {
+            let svc = AuthService::new(
+                alice_custody.clone(),
+                MockGatewayAuth {
+                    challenge: bad_challenge,
+                },
+                FixedClock(1_800_000_010),
+                valid_cfg.clone(),
+            );
+            assert_eq!(svc.login().await, Err(DomainError::Unauthenticated));
+        }
+
+        // Invalid AuthConfig rejected early.
+        let bad_cfg = AuthService::new(
+            alice_custody,
+            MockGatewayAuth {
+                challenge: base_challenge,
+            },
+            FixedClock(1_800_000_010),
+            AuthConfig {
+                chain_id: 0,
+                ..valid_cfg
+            },
+        );
+        assert_eq!(bad_cfg.login().await, Err(DomainError::Internal));
+    }
+
+    #[tokio::test]
+    async fn download_and_share_reject_envelope_cid_mismatch_manifest_mismatch_and_invalid_configs()
+    {
+        let (alice_custody, alice) = make_member(21, MemberStatus::Active).await;
+        let (_bob_custody, bob) = make_member(22, MemberStatus::Active).await;
+        let (_suspended_custody, suspended) = make_member(23, MemberStatus::Suspended).await;
+        let store = InMemoryBlobStore::with_peers(&["peer-1", "peer-2"]);
+        let ledger = InMemoryLedger::default();
+        for member in [&alice, &bob, &suspended] {
+            ledger.register_member(member.clone());
+        }
+
+        let uploader = UploadService::new(
+            alice_custody.clone(),
+            store.clone(),
+            ledger.clone(),
+            FixedClock(1_800_000_000),
+            upload_config(),
+        );
+        let v1 = uploader
+            .create_file(
+                None,
+                "integrity.txt".to_owned(),
+                FolderId::ROOT,
+                b"sensitive-data",
+                None,
+                &[],
+            )
+            .await
+            .unwrap();
+        let downloader = DownloadService::new(
+            alice_custody.clone(),
+            store.clone(),
+            ledger.clone(),
+            FixedClock(1_800_000_010),
+            download_config(),
+        );
+        let sharer = ShareService::new(
+            alice_custody.clone(),
+            store.clone(),
+            ledger.clone(),
+            FixedClock(1_800_000_020),
+            share_config(),
+        );
+
+        let access = downloader
+            .authorize_version(v1.file_id, VersionNumber::ONE)
+            .await
+            .unwrap();
+        let pkg = store.stored_package(&access.content_cid);
+
+        // Wrong access.manifest_hash fails closed even when expected_manifest_hash is None.
+        let mut bad_manifest_access = access.clone();
+        bad_manifest_access.manifest_hash = ManifestHash::from_bytes([0xee; 32]);
+        assert_eq!(
+            downloader
+                .decrypt_authorized_package(bad_manifest_access, None, &pkg)
+                .await
+                .err(),
+            Some(DomainError::IntegrityCheckFailed)
+        );
+
+        // Wrong explicit expected_manifest_hash also fails closed.
+        assert_eq!(
+            downloader
+                .decrypt_authorized_package(
+                    access.clone(),
+                    Some(ManifestHash::from_bytes([0xdd; 32])),
+                    &pkg
+                )
+                .await
+                .err(),
+            Some(DomainError::IntegrityCheckFailed)
+        );
+
+        // Tampered envelope bytes served under access.envelope_set_cid fail CID check in both download and share!
+        let original_env = store
+            .envelopes
+            .lock()
+            .unwrap()
+            .get(&access.envelope_set_cid.to_string())
+            .cloned()
+            .unwrap();
+        store.envelopes.lock().unwrap().insert(
+            access.envelope_set_cid.to_string(),
+            b"{\"forged\":true}".to_vec(),
+        );
+        assert_eq!(
+            downloader
+                .decrypt_authorized_package(access.clone(), None, &pkg)
+                .await
+                .err(),
+            Some(DomainError::IntegrityCheckFailed)
+        );
+        assert_eq!(
+            sharer
+                .share_version_envelope(&access, bob.member_id, ProposalId::from_bytes([1; 32]))
+                .await
+                .err(),
+            Some(ShareError::Domain(DomainError::IntegrityCheckFailed))
+        );
+        // Restore genuine envelope bytes.
+        store
+            .envelopes
+            .lock()
+            .unwrap()
+            .insert(access.envelope_set_cid.to_string(), original_env);
+
+        // Share rejects suspended recipient, unknown recipient, and redundant duplicate same-key-version share.
+        assert_eq!(
+            sharer
+                .share_version_envelope(
+                    &access,
+                    suspended.member_id,
+                    ProposalId::from_bytes([2; 32])
+                )
+                .await
+                .err(),
+            Some(ShareError::Domain(DomainError::MemberSuspended))
+        );
+        assert_eq!(
+            sharer
+                .share_version_envelope(
+                    &access,
+                    MemberId::from_bytes([0xfa; 32]),
+                    ProposalId::from_bytes([2; 32])
+                )
+                .await
+                .err(),
+            Some(ShareError::Domain(DomainError::Unauthorized))
+        );
+        // Alice already has an envelope for key version 1 -> redundant share rejected.
+        assert_eq!(
+            sharer
+                .share_version_envelope(&access, alice.member_id, ProposalId::from_bytes([3; 32]))
+                .await
+                .err(),
+            Some(ShareError::Domain(DomainError::ContractRejected))
+        );
+
+        // Share to Bob succeeds; then rotating Bob to encryption_key_version=2 allows re-share.
+        let first_share = sharer
+            .share_version_envelope(&access, bob.member_id, ProposalId::from_bytes([4; 32]))
+            .await
+            .unwrap();
+        assert_eq!(first_share.new_revision, 2);
+
+        let mut rotated_bob = bob.clone();
+        rotated_bob.encryption_key_version = KeyVersion::new(2).unwrap();
+        ledger.register_member(rotated_bob);
+        let access_rev2 = downloader
+            .authorize_version(v1.file_id, VersionNumber::ONE)
+            .await
+            .unwrap();
+        let rotated_share = sharer
+            .share_version_envelope(&access_rev2, bob.member_id, ProposalId::from_bytes([5; 32]))
+            .await
+            .unwrap();
+        assert_eq!(rotated_share.new_revision, 3);
+
+        // Ledger failure after pinning envelope returns OrphanedEnvelopeUpload.
+        let (_charlie_custody, charlie) = make_member(24, MemberStatus::Active).await;
+        ledger.register_member(charlie.clone());
+        let access_rev3 = downloader
+            .authorize_version(v1.file_id, VersionNumber::ONE)
+            .await
+            .unwrap();
+        ledger.fail_next_write(DomainError::StaleHead);
+        let orphan_err = sharer
+            .share_version_envelope(
+                &access_rev3,
+                charlie.member_id,
+                ProposalId::from_bytes([6; 32]),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            orphan_err,
+            ShareError::OrphanedEnvelopeUpload(details) if details.cause == DomainError::StaleHead
+        ));
+
+        // Invalid DownloadConfig / ShareConfig and unavailable custody fail closed.
+        let bad_download = DownloadService::new(
+            alice_custody.clone(),
+            store.clone(),
+            ledger.clone(),
+            FixedClock(1_800_000_010),
+            DownloadConfig {
+                chain_id: 0,
+                ..download_config()
+            },
+        );
+        assert_eq!(
+            bad_download
+                .authorize_version(v1.file_id, VersionNumber::ONE)
+                .await,
+            Err(DomainError::Internal)
+        );
+
+        let bad_share = ShareService::new(
+            alice_custody,
+            store.clone(),
+            ledger.clone(),
+            FixedClock(1_800_000_010),
+            ShareConfig {
+                min_pin_replicas: 0,
+                ..share_config()
+            },
+        );
+        assert_eq!(
+            bad_share
+                .share_version_envelope(
+                    &access_rev3,
+                    bob.member_id,
+                    ProposalId::from_bytes([7; 32])
+                )
+                .await,
+            Err(ShareError::Domain(DomainError::Internal))
+        );
+
+        let unavailable_custody_download = DownloadService::new(
+            FailingCustody(ports::CustodyError::ProviderUnavailable),
+            store,
+            ledger,
+            FixedClock(1_800_000_010),
+            download_config(),
+        );
+        assert_eq!(
+            unavailable_custody_download
+                .authorize_version(v1.file_id, VersionNumber::ONE)
+                .await,
+            Err(DomainError::KeyCustodyUnavailable)
+        );
+    }
+
+    #[tokio::test]
+    async fn upload_handles_empty_files_and_rejects_archived_files_bad_names_and_oversized_inputs()
+    {
+        let (alice_custody, alice) = make_member(25, MemberStatus::Active).await;
+        let store = InMemoryBlobStore::with_peers(&["peer-1", "peer-2"]);
+        let ledger = InMemoryLedger::default();
+        ledger.register_member(alice);
+
+        let uploader = UploadService::new(
+            alice_custody.clone(),
+            store.clone(),
+            ledger.clone(),
+            FixedClock(1_800_000_000),
+            UploadConfig {
+                max_file_bytes: 128,
+                ..upload_config()
+            },
+        );
+        let downloader = DownloadService::new(
+            alice_custody.clone(),
+            store.clone(),
+            ledger.clone(),
+            FixedClock(1_800_000_010),
+            download_config(),
+        );
+
+        // 0-byte empty file round-trips cleanly.
+        let empty = uploader
+            .create_file(None, "empty.txt".to_owned(), FolderId::ROOT, b"", None, &[])
+            .await
+            .unwrap();
+        let empty_access = downloader
+            .authorize_version(empty.file_id, VersionNumber::ONE)
+            .await
+            .unwrap();
+        let empty_pkg = store.stored_package(&empty_access.content_cid);
+        let empty_dec = downloader
+            .decrypt_authorized_package(empty_access, None, &empty_pkg)
+            .await
+            .unwrap();
+        assert!(empty_dec.plaintext.is_empty());
+
+        // Invalid display names and oversized plaintext fail BEFORE pinning any blobs.
+        let blobs_before = store.contents.lock().unwrap().len();
+        for bad_name in ["", "bad\nname.txt", &"a".repeat(256)] {
+            assert_eq!(
+                uploader
+                    .create_file(None, bad_name.to_owned(), FolderId::ROOT, b"ok", None, &[])
+                    .await
+                    .unwrap_err()
+                    .domain_error(),
+                DomainError::InvalidManifest
+            );
+        }
+        assert_eq!(
+            uploader
+                .create_file(
+                    None,
+                    "too-big.bin".to_owned(),
+                    FolderId::ROOT,
+                    &[0x11; 129],
+                    None,
+                    &[]
+                )
+                .await
+                .unwrap_err()
+                .domain_error(),
+            DomainError::InvalidManifest
+        );
+        // Oversized private metadata rejected cleanly.
+        assert_eq!(
+            uploader
+                .create_file(
+                    None,
+                    "big-meta.bin".to_owned(),
+                    FolderId::ROOT,
+                    b"ok",
+                    Some(&vec![0x22; crypto::MAX_PRIVATE_METADATA_BYTES]),
+                    &[]
+                )
+                .await
+                .unwrap_err()
+                .domain_error(),
+            DomainError::InvalidManifest
+        );
+        assert_eq!(store.contents.lock().unwrap().len(), blobs_before);
+
+        // Archived file head is rejected before pinning any new blobs.
+        ledger
+            .state
+            .lock()
+            .unwrap()
+            .heads
+            .get_mut(&empty.file_id)
+            .unwrap()
+            .status = FileStatus::Archived;
+        assert_eq!(
+            uploader
+                .append_version(empty.file_id, None, b"cannot-append", None, &[])
+                .await
+                .unwrap_err()
+                .domain_error(),
+            DomainError::Unauthorized
+        );
+        assert_eq!(store.contents.lock().unwrap().len(), blobs_before);
     }
 }

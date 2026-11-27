@@ -154,16 +154,34 @@ impl IpfsClusterStore {
         })
     }
 
-    async fn add(
+    async fn select_healthy_kubo_url(&self) -> Result<&Url, StorageError> {
+        if self.kubo_api_urls.len() == 1 {
+            return self
+                .kubo_api_urls
+                .first()
+                .ok_or(StorageError::TransportUnavailable);
+        }
+        for base in &self.kubo_api_urls {
+            let Ok(url) = base.join("api/v0/id") else {
+                continue;
+            };
+            if let Ok(response) = self.client.post(url).send().await
+                && response.status().is_success()
+            {
+                return Ok(base);
+            }
+        }
+        Err(StorageError::TransportUnavailable)
+    }
+
+    async fn add_to_peer(
         &self,
+        base: &Url,
         form: Form,
         wrap_with_directory: bool,
         expected_content: Option<(&EncryptedFileManifest, &str)>,
     ) -> Result<String, StorageError> {
-        let url = self
-            .kubo_api_urls
-            .first()
-            .ok_or(StorageError::TransportUnavailable)?
+        let url = base
             .join("api/v0/add")
             .map_err(|_| StorageError::InvalidPackage)?;
         let response = self
@@ -419,8 +437,9 @@ impl BlobStore for IpfsClusterStore {
                 return Err(StorageError::SizeLimitExceeded);
             }
 
+            let peer = self.select_healthy_kubo_url().await?;
             let root_cid = self
-                .add(form, true, Some((&manifest, &manifest_cid)))
+                .add_to_peer(peer, form, true, Some((&manifest, &manifest_cid)))
                 .await?;
             let cid = ContentCid::parse(&root_cid).map_err(|_| StorageError::InvalidCid)?;
             let replication = self
@@ -445,13 +464,33 @@ impl BlobStore for IpfsClusterStore {
             if byte_length == 0 || byte_length > self.max_upload_bytes {
                 return Err(StorageError::SizeLimitExceeded);
             }
-            let stream = ReaderStream::with_capacity(reader, 64 * 1024);
-            let part = Part::stream_with_length(reqwest::Body::wrap_stream(stream), byte_length)
-                .file_name("envelope-set.json")
-                .mime_str("application/json")
+            let mut bytes = Vec::with_capacity(usize::try_from(byte_length).unwrap_or(0));
+            reader
+                .take(byte_length.saturating_add(1))
+                .read_to_end(&mut bytes)
+                .await
                 .map_err(|_| StorageError::InvalidPackage)?;
-            let form = Form::new().part("file", part);
-            let cid = self.add(form, false, None).await?;
+            if bytes.len() as u64 != byte_length {
+                return Err(StorageError::InvalidPackage);
+            }
+
+            let mut uploaded_cid = None;
+            for peer in &self.kubo_api_urls {
+                let part = Part::bytes(bytes.clone())
+                    .file_name("envelope-set.json")
+                    .mime_str("application/json")
+                    .map_err(|_| StorageError::InvalidPackage)?;
+                let form = Form::new().part("file", part);
+                match self.add_to_peer(peer, form, false, None).await {
+                    Ok(cid) => {
+                        uploaded_cid = Some(cid);
+                        break;
+                    }
+                    Err(StorageError::TransportUnavailable) => continue,
+                    Err(other) => return Err(other),
+                }
+            }
+            let cid = uploaded_cid.ok_or(StorageError::TransportUnavailable)?;
             let cid = EnvelopeSetCid::parse(&cid).map_err(|_| StorageError::InvalidCid)?;
             let replication = self
                 .pin_and_wait(StorageCid::EnvelopeSet(cid.clone()), min_replicas)
@@ -937,5 +976,274 @@ mod tests {
             .filter(|peer| peer.status.eq_ignore_ascii_case("pinned"))
             .count();
         assert_eq!(count, 2);
+    }
+
+    async fn read_mock_http_request(socket: &mut tokio::net::TcpStream) -> String {
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 4096];
+        let header_end;
+        loop {
+            let n = socket.read(&mut chunk).await.unwrap();
+            assert!(n > 0);
+            buf.extend_from_slice(&chunk[..n]);
+            if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                header_end = pos + 4;
+                break;
+            }
+        }
+        let headers = String::from_utf8_lossy(&buf[..header_end]).into_owned();
+        let content_length = headers
+            .lines()
+            .find_map(|line| {
+                line.to_ascii_lowercase()
+                    .strip_prefix("content-length: ")
+                    .and_then(|v| v.trim().parse::<usize>().ok())
+            })
+            .unwrap_or(0);
+        while buf.len() < header_end + content_length {
+            let n = socket.read(&mut chunk).await.unwrap();
+            if n == 0 {
+                break;
+            }
+            buf.extend_from_slice(&chunk[..n]);
+        }
+        headers
+    }
+
+    async fn spawn_mock_cluster(
+        expected_cid: String,
+    ) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            for request_index in 0..2 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let headers = read_mock_http_request(&mut socket).await;
+                if request_index == 0 {
+                    assert!(headers.starts_with(&format!("POST /pins/{expected_cid}")));
+                    socket
+                        .write_all(
+                            b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        )
+                        .await
+                        .unwrap();
+                } else {
+                    assert!(headers.starts_with(&format!("GET /pins/{expected_cid} ")));
+                    let body = serde_json::json!({
+                        "cid": expected_cid,
+                        "peer_map": {
+                            "peer-one": { "status": "pinned" },
+                            "peer-two": { "status": "pinned" }
+                        }
+                    })
+                    .to_string();
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    socket.write_all(response.as_bytes()).await.unwrap();
+                }
+            }
+        });
+        (addr, handle)
+    }
+
+    #[tokio::test]
+    async fn put_envelope_set_fails_over_across_kubo_peers_and_pins() {
+        let envelope_bytes = b"{\"schema\":\"rrds.key-envelope-set.v1\"}".to_vec();
+        let expected_cid = raw_chunk_cid(&envelope_bytes).unwrap();
+
+        let bad_kubo = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let bad_addr = bad_kubo.local_addr().unwrap();
+        let bad_server = tokio::spawn(async move {
+            // Fails both add and block/get.
+            for _ in 0..2 {
+                let (mut socket, _) = bad_kubo.accept().await.unwrap();
+                let _ = read_mock_http_request(&mut socket).await;
+                socket
+                    .write_all(
+                        b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    )
+                    .await
+                    .unwrap();
+            }
+        });
+
+        let good_kubo = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let good_addr = good_kubo.local_addr().unwrap();
+        let good_cid = expected_cid.clone();
+        let good_bytes = envelope_bytes.clone();
+        let good_server = tokio::spawn(async move {
+            // 1. /api/v0/add
+            let (mut socket, _) = good_kubo.accept().await.unwrap();
+            let headers = read_mock_http_request(&mut socket).await;
+            assert!(headers.starts_with("POST /api/v0/add?"));
+            let add_body = format!("{{\"Name\":\"envelope-set.json\",\"Hash\":\"{good_cid}\"}}\n");
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                add_body.len(),
+                add_body
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+
+            // 2. /api/v0/block/get for root verification
+            let (mut socket, _) = good_kubo.accept().await.unwrap();
+            let headers = read_mock_http_request(&mut socket).await;
+            assert!(headers.starts_with("POST /api/v0/block/get?"));
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                good_bytes.len()
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+            socket.write_all(&good_bytes).await.unwrap();
+        });
+
+        let (cluster_addr, cluster_server) = spawn_mock_cluster(expected_cid.clone()).await;
+
+        let store = IpfsClusterStore::new(IpfsConfig {
+            kubo_api_urls: vec![format!("http://{bad_addr}"), format!("http://{good_addr}")],
+            cluster_api_url: format!("http://{cluster_addr}"),
+            cluster_credentials: ClusterCredentials::new("user", "password"),
+            request_timeout: Duration::from_secs(2),
+            replication_timeout: Duration::from_secs(2),
+            replication_poll_interval: Duration::from_millis(10),
+            max_upload_bytes: 1024 * 1024,
+        })
+        .unwrap();
+
+        let stored = store
+            .put_envelope_set(
+                Box::pin(std::io::Cursor::new(envelope_bytes.clone())),
+                envelope_bytes.len() as u64,
+                2,
+            )
+            .await
+            .unwrap();
+        assert_eq!(stored.cid.to_string(), expected_cid);
+        assert_eq!(
+            stored.replication.pinned_peers,
+            vec!["peer-one", "peer-two"]
+        );
+
+        bad_server.await.unwrap();
+        good_server.await.unwrap();
+        cluster_server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn put_content_fails_over_via_health_probe_to_second_kubo_peer() {
+        let ciphertext = vec![0x5cu8; 32];
+        let chunk_cid = ContentCid::parse(&raw_chunk_cid(&ciphertext).unwrap()).unwrap();
+        let manifest = EncryptedFileManifest::new(
+            FileId::from_bytes([4; 32]),
+            VersionNumber::ONE,
+            ManifestHash::ZERO,
+            EpochId::from_bytes([5; 32]),
+            NoncePrefix::from_bytes([6; 8]),
+            crypto::DEFAULT_CHUNK_SIZE_BYTES as u32,
+            vec![EncryptedChunkRef::new(1, chunk_cid.clone(), ciphertext.len() as u64).unwrap()],
+            None,
+        )
+        .unwrap();
+        let manifest_bytes = manifest.canonical_bytes().unwrap();
+        let manifest_cid = raw_chunk_cid(&manifest_bytes).unwrap();
+        let root_block = b"mock-unixfs-root-dir-block".to_vec();
+        let root_cid = raw_chunk_cid(&root_block).unwrap();
+
+        let bad_kubo = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let bad_addr = bad_kubo.local_addr().unwrap();
+        let bad_server = tokio::spawn(async move {
+            // Fails both /api/v0/id and /api/v0/block/get.
+            for _ in 0..2 {
+                let (mut socket, _) = bad_kubo.accept().await.unwrap();
+                let _ = read_mock_http_request(&mut socket).await;
+                socket
+                    .write_all(
+                        b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    )
+                    .await
+                    .unwrap();
+            }
+        });
+
+        let good_kubo = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let good_addr = good_kubo.local_addr().unwrap();
+        let good_root_cid = root_cid.clone();
+        let good_manifest_cid = manifest_cid.clone();
+        let good_chunk_cid = chunk_cid.to_string();
+        let good_root_block = root_block.clone();
+        let good_server = tokio::spawn(async move {
+            // 1. /api/v0/id
+            let (mut socket, _) = good_kubo.accept().await.unwrap();
+            let headers = read_mock_http_request(&mut socket).await;
+            assert!(headers.starts_with("POST /api/v0/id"));
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 13\r\nConnection: close\r\n\r\n{\"ID\":\"k2\"}\r\n",
+                )
+                .await
+                .unwrap();
+
+            // 2. /api/v0/add
+            let (mut socket, _) = good_kubo.accept().await.unwrap();
+            let headers = read_mock_http_request(&mut socket).await;
+            assert!(headers.starts_with("POST /api/v0/add?"));
+            let add_body = format!(
+                "{{\"Name\":\"\",\"Hash\":\"{good_root_cid}\"}}\n\
+                 {{\"Name\":\"manifest.json\",\"Hash\":\"{good_manifest_cid}\"}}\n\
+                 {{\"Name\":\"chunks/00000001\",\"Hash\":\"{good_chunk_cid}\"}}\n"
+            );
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                add_body.len(),
+                add_body
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+
+            // 3. /api/v0/block/get
+            let (mut socket, _) = good_kubo.accept().await.unwrap();
+            let headers = read_mock_http_request(&mut socket).await;
+            assert!(headers.starts_with("POST /api/v0/block/get?"));
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                good_root_block.len()
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+            socket.write_all(&good_root_block).await.unwrap();
+        });
+
+        let (cluster_addr, cluster_server) = spawn_mock_cluster(root_cid.clone()).await;
+
+        let store = IpfsClusterStore::new(IpfsConfig {
+            kubo_api_urls: vec![format!("http://{bad_addr}"), format!("http://{good_addr}")],
+            cluster_api_url: format!("http://{cluster_addr}"),
+            cluster_credentials: ClusterCredentials::new("user", "password"),
+            request_timeout: Duration::from_secs(2),
+            replication_timeout: Duration::from_secs(2),
+            replication_poll_interval: Duration::from_millis(10),
+            max_upload_bytes: 1024 * 1024,
+        })
+        .unwrap();
+
+        let package = ContentPackage::new(
+            manifest,
+            vec![ports::ContentChunk::new(
+                1,
+                ciphertext.len() as u64,
+                Box::pin(std::io::Cursor::new(ciphertext)),
+            )],
+        )
+        .unwrap();
+        let stored = store.put_content(package, 2).await.unwrap();
+        assert_eq!(stored.cid.to_string(), root_cid);
+        assert_eq!(
+            stored.replication.pinned_peers,
+            vec!["peer-one", "peer-two"]
+        );
+
+        bad_server.await.unwrap();
+        good_server.await.unwrap();
+        cluster_server.await.unwrap();
     }
 }

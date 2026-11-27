@@ -40,10 +40,25 @@ new chain; preserve the existing data and obtain maintainer approval before
 creating a replacement network.
 
 The root `.env.example` already points `BESU_RPC_URL` and `BESU_CHAIN_ID` at
-this network. The deployment key remains in the Hardhat keystore; no private
-key should be added to `.env`, Compose, or tracked files. Contract deployment
-and Safe/timelock activation remain separate steps and have not yet been
-verified on this network.
+this network. Production deployment keys belong in Hardhat's keystore / HSM; no
+private key should be added to `.env`, Compose, or tracked files.
+
+### Local Smoke-Test Deployment Status (27 November 2026)
+
+- Latest network verification passed at `chainId=1337`, `rpcPeerCount=4`,
+  `validatorCount=4`, `qbftCommittedBlock=47443` (and advancing through
+  `48196`).
+- `RrdsTimelockController`, `AccessGovernance`, and `FileRegistry` were
+  deployed locally using [`contracts/scripts/besu-bootstrap.mjs`](../../contracts/scripts/besu-bootstrap.mjs)
+  with **dev-only EOA placeholders** for `consortiumSafe`, `emergencySafe`, and
+  `organizationSafe` (git-ignored under `contracts/secrets/besu-dev-accounts.json`).
+  Real Safe smart accounts must replace these placeholders before staging or
+  production claims (see [`docs/adr/governance-authority-and-timelock.md`](../../docs/adr/governance-authority-and-timelock.md)).
+- The 24-hour (`86,400`s) timelocked activation batch (`FILE_REGISTRY_ROLE` +
+  demo org registration) was scheduled at block `48177` and becomes executable
+  at `2026-11-27T20:26:20.000Z` via `node contracts/scripts/besu-bootstrap.mjs execute`.
+  See [`contracts/README.md`](../../contracts/README.md) for the recorded public
+  contract addresses and verified role checks.
 
 ## Network assumptions and limitations
 

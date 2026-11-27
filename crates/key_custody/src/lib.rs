@@ -95,6 +95,9 @@ impl DevelopmentKeyCustody {
         signing_key_version: KeyVersion,
         encryption_key_version: KeyVersion,
     ) -> Result<Self, CustodyError> {
+        if member_id.as_bytes() == &[0; 32] {
+            return Err(CustodyError::KeyGenerationFailed);
+        }
         let signing_key = generate_signing_key()?;
         let signing_key_id = generate_key_id()?;
         let mut encryption_key_id = generate_key_id()?;
@@ -133,6 +136,12 @@ impl DevelopmentKeyCustody {
     ) -> Result<Self, CustodyError> {
         let signing_secret = Zeroizing::new(signing_secret);
         let encryption_seed = Zeroizing::new(encryption_seed);
+        if member_id.as_bytes() == &[0; 32]
+            || *encryption_seed == [0; 32]
+            || *signing_secret == *encryption_seed
+        {
+            return Err(CustodyError::KeyGenerationFailed);
+        }
         let signing_key = SigningKey::from_bytes(signing_secret.as_slice().into())
             .map_err(|_| CustodyError::KeyGenerationFailed)?;
         let encryption_key = HpkeRecipientKeyPair::derive_from_seed(&encryption_seed)
@@ -457,6 +466,165 @@ mod tests {
         assert_eq!(
             verify_provider_policy(&a, CustodyStartupPolicy::Production).await,
             Err(CustodyPolicyError::TestProviderRejectedInProduction)
+        );
+    }
+
+    #[test]
+    fn rejects_zero_member_id_and_reused_signing_encryption_key_material() {
+        assert_eq!(
+            DevelopmentKeyCustody::generate(
+                MemberId::from_bytes([0; 32]),
+                KeyVersion::new(1).unwrap(),
+                KeyVersion::new(1).unwrap(),
+            )
+            .err(),
+            Some(CustodyError::KeyGenerationFailed)
+        );
+        assert_eq!(
+            DevelopmentKeyCustody::from_dev_secrets(
+                MemberId::from_bytes([0; 32]),
+                KeyVersion::new(1).unwrap(),
+                KeyVersion::new(1).unwrap(),
+                [0x11; 32],
+                [0x22; 32],
+            )
+            .err(),
+            Some(CustodyError::KeyGenerationFailed)
+        );
+        // Reusing identical secret for signing and encryption violates key separation (§7.7.1).
+        assert_eq!(
+            DevelopmentKeyCustody::from_dev_secrets(
+                MemberId::from_bytes([7; 32]),
+                KeyVersion::new(1).unwrap(),
+                KeyVersion::new(1).unwrap(),
+                [0x33; 32],
+                [0x33; 32],
+            )
+            .err(),
+            Some(CustodyError::KeyGenerationFailed)
+        );
+        assert_eq!(
+            DevelopmentKeyCustody::from_dev_secrets(
+                MemberId::from_bytes([7; 32]),
+                KeyVersion::new(1).unwrap(),
+                KeyVersion::new(1).unwrap(),
+                [0x33; 32],
+                [0x00; 32],
+            )
+            .err(),
+            Some(CustodyError::KeyGenerationFailed)
+        );
+    }
+
+    struct StubPolicyProvider(Result<CustodyHealth, CustodyError>);
+
+    impl KeyCustodyProvider for StubPolicyProvider {
+        fn public_identity(&self) -> CustodyFuture<'_, PublicIdentityKeys> {
+            Box::pin(async { Err(CustodyError::ProviderUnavailable) })
+        }
+
+        fn sign_typed_digest<'a>(
+            &'a self,
+            _key_id: &'a KeyId,
+            _digest: &'a TypedDigest,
+        ) -> CustodyFuture<'a, EvmSignature> {
+            Box::pin(async { Err(CustodyError::ProviderUnavailable) })
+        }
+
+        fn unwrap_dek<'a>(
+            &'a self,
+            _key_id: &'a KeyId,
+            _envelope: &'a crypto::KeyEnvelope,
+            _context: crypto::WrapContext,
+        ) -> CustodyFuture<'a, Zeroizing<[u8; 32]>> {
+            Box::pin(async { Err(CustodyError::ProviderUnavailable) })
+        }
+
+        fn health_check(&self) -> CustodyFuture<'_, CustodyHealth> {
+            let result = self.0;
+            Box::pin(async move { result })
+        }
+    }
+
+    #[tokio::test]
+    async fn startup_policy_enforces_health_capabilities_and_non_exportable_keys() {
+        let unavailable = StubPolicyProvider(Err(CustodyError::ProviderUnavailable));
+        assert_eq!(
+            verify_provider_policy(&unavailable, CustodyStartupPolicy::Production).await,
+            Err(CustodyPolicyError::Custody(
+                CustodyError::ProviderUnavailable
+            ))
+        );
+
+        let unhealthy = StubPolicyProvider(Ok(CustodyHealth {
+            healthy: false,
+            capabilities: CustodyCapabilities {
+                secp256k1_signing: true,
+                hpke_x25519_unwrap: true,
+                private_keys_non_exportable: true,
+                test_only: false,
+            },
+        }));
+        assert_eq!(
+            verify_provider_policy(&unhealthy, CustodyStartupPolicy::UnsafeDevelopment).await,
+            Err(CustodyPolicyError::UnhealthyProvider)
+        );
+
+        let missing_secp = StubPolicyProvider(Ok(CustodyHealth {
+            healthy: true,
+            capabilities: CustodyCapabilities {
+                secp256k1_signing: false,
+                hpke_x25519_unwrap: true,
+                private_keys_non_exportable: true,
+                test_only: false,
+            },
+        }));
+        assert_eq!(
+            verify_provider_policy(&missing_secp, CustodyStartupPolicy::Production).await,
+            Err(CustodyPolicyError::MissingRequiredCapabilities)
+        );
+
+        let missing_hpke = StubPolicyProvider(Ok(CustodyHealth {
+            healthy: true,
+            capabilities: CustodyCapabilities {
+                secp256k1_signing: true,
+                hpke_x25519_unwrap: false,
+                private_keys_non_exportable: true,
+                test_only: false,
+            },
+        }));
+        assert_eq!(
+            verify_provider_policy(&missing_hpke, CustodyStartupPolicy::Production).await,
+            Err(CustodyPolicyError::MissingRequiredCapabilities)
+        );
+
+        let exportable_non_test = StubPolicyProvider(Ok(CustodyHealth {
+            healthy: true,
+            capabilities: CustodyCapabilities {
+                secp256k1_signing: true,
+                hpke_x25519_unwrap: true,
+                private_keys_non_exportable: false,
+                test_only: false,
+            },
+        }));
+        assert_eq!(
+            verify_provider_policy(&exportable_non_test, CustodyStartupPolicy::Production).await,
+            Err(CustodyPolicyError::ExportableKeysRejectedInProduction)
+        );
+
+        let production_hsm = StubPolicyProvider(Ok(CustodyHealth {
+            healthy: true,
+            capabilities: CustodyCapabilities {
+                secp256k1_signing: true,
+                hpke_x25519_unwrap: true,
+                private_keys_non_exportable: true,
+                test_only: false,
+            },
+        }));
+        assert!(
+            verify_provider_policy(&production_hsm, CustodyStartupPolicy::Production)
+                .await
+                .is_ok()
         );
     }
 }

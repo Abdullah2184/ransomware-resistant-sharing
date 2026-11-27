@@ -390,6 +390,7 @@ impl LedgerPort for HarnessLedger {
             Ok(AccessReference {
                 file_id: request.file_id,
                 version_number: request.version_number,
+                manifest_hash: version.manifest_hash,
                 content_cid: version.content_cid.clone(),
                 envelope_set_cid: version.envelope_set_cid.clone(),
                 epoch_id: version.epoch_id,

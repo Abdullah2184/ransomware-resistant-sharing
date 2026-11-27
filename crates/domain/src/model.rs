@@ -57,6 +57,7 @@ pub struct FileMetadata {
 pub struct AccessReference {
     pub file_id: FileId,
     pub version_number: VersionNumber,
+    pub manifest_hash: ManifestHash,
     pub content_cid: ContentCid,
     pub envelope_set_cid: EnvelopeSetCid,
     pub epoch_id: EpochId,

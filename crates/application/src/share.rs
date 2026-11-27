@@ -3,7 +3,7 @@ use std::{collections::BTreeMap, error::Error, fmt, io::Cursor};
 use crypto::{
     ChainId, DataEncryptionKey, Eip712Domain, EnvelopeSetUpdate, HpkeRecipientPublicKey,
     KeyEnvelope, KeyEnvelopeEntry, KeyEnvelopeSet, MAX_ENVELOPE_SET_ENTRIES, UnixDeadline,
-    WrapContext,
+    WrapContext, raw_sha256_cid,
 };
 use domain::{
     AccessReference, DomainError, EnvelopeSetCid, EvmAddress, MemberId, OperationNonce, ProposalId,
@@ -15,7 +15,7 @@ use ports::{
 };
 
 use crate::{
-    download::read_bounded,
+    download::{map_unwrap_custody_error, read_bounded},
     upload::{map_storage_error, random_nonzero_bytes32},
 };
 
@@ -28,6 +28,15 @@ pub struct ShareConfig {
     pub access_governance: EvmAddress,
     pub min_pin_replicas: usize,
     pub operation_ttl_seconds: u64,
+}
+
+impl ShareConfig {
+    pub fn validate(&self) -> Result<(), DomainError> {
+        if self.chain_id == 0 || self.min_pin_replicas == 0 || self.operation_ttl_seconds == 0 {
+            return Err(DomainError::Internal);
+        }
+        Ok(())
+    }
 }
 
 /// Receipt for a finalized envelope-set pointer update.
@@ -113,6 +122,7 @@ where
         recipient_member_id: MemberId,
         proposal_id: ProposalId,
     ) -> Result<ShareReceipt, ShareError> {
+        self.config.validate()?;
         if recipient_member_id.as_bytes() == &[0; 32] {
             return Err(DomainError::InvalidIdentifier.into());
         }
@@ -138,6 +148,11 @@ where
             MAX_ENVELOPE_SET_BYTES,
         )
         .await?;
+        let actual_existing_cid =
+            raw_sha256_cid(&existing_bytes).map_err(|_| DomainError::IntegrityCheckFailed)?;
+        if actual_existing_cid.to_string() != access.envelope_set_cid.to_string() {
+            return Err(DomainError::IntegrityCheckFailed.into());
+        }
         let existing_set = KeyEnvelopeSet::parse_canonical(&existing_bytes)
             .map_err(|_| DomainError::IntegrityCheckFailed)?;
         if existing_set.file_id() != access.file_id
@@ -146,6 +161,15 @@ where
             || existing_set.revision() != access.envelope_revision
         {
             return Err(DomainError::IntegrityCheckFailed.into());
+        }
+        // Reject redundant no-op shares when the recipient already has an
+        // envelope for their current encryption key version; re-sharing after
+        // key rotation (new encryption_key_version) remains allowed.
+        if existing_set.envelopes().iter().any(|entry| {
+            entry.member_id() == recipient.member_id
+                && entry.encryption_key_version() == recipient.encryption_key_version
+        }) {
+            return Err(DomainError::ContractRejected.into());
         }
 
         let actor_entry = existing_set
@@ -171,7 +195,7 @@ where
                 actor_wrap_context,
             )
             .await
-            .map_err(|_| DomainError::IntegrityCheckFailed)?;
+            .map_err(map_unwrap_custody_error)?;
         let dek = DataEncryptionKey::from_secret(dek_secret);
 
         let recipient_public_key =

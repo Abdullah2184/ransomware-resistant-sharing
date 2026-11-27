@@ -11,7 +11,7 @@ use chain_adapter::{
 };
 use config::GatewayConfig;
 use ipfs_adapter::{IpfsClusterStore, IpfsConfig};
-use metadata_store::PostgresStore;
+use metadata_store::{MigrationMode, PostgresPoolConfig, PostgresStore};
 use ports::BesuContractRelayer;
 use routes::{AppState, router};
 use store::GatewayStore;
@@ -25,8 +25,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
     if connected_chain_id != config.chain_id {
         return Err(std::io::Error::other("configured chain ID does not match Besu").into());
     }
-    let metadata = PostgresStore::connect(&config.database_url).await?;
-    metadata.migrate().await?;
+    let pool_config = PostgresPoolConfig::from_env()?;
+    let migration_mode = MigrationMode::from_env()?;
+    let metadata = PostgresStore::connect_with_config(&config.database_url, pool_config).await?;
+    metadata.apply_migration_mode(migration_mode).await?;
     let listener = TcpListener::bind(config.bind)?;
     listener.set_nonblocking(true)?;
     let listener = tokio::net::TcpListener::from_std(listener)?;

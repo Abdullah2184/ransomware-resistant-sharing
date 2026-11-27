@@ -2,4 +2,4 @@
 
 pub mod postgres;
 
-pub use postgres::PostgresStore;
+pub use postgres::{MetadataStoreError, MigrationMode, PostgresPoolConfig, PostgresStore};

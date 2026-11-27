@@ -30,12 +30,14 @@ The system provides:
 
 ## Documentation Map
 
-- **Canonical Specification:** [`TECHNICAL_SPECIFICATION.md`](TECHNICAL_SPECIFICATION.md)
+- **Canonical Specification:** [`docs/specifications/TECHNICAL_SPECIFICATION.md`](docs/specifications/TECHNICAL_SPECIFICATION.md)
 - **System Architecture & Trust Boundaries:** [`docs/architecture/README.md`](docs/architecture/README.md)
   - [Deployment Placement, Crate Boundaries & Data Isolation](docs/architecture/deployment-and-boundaries.md)
   - [Authentication and Challenge-Response Workflow](docs/architecture/authentication-and-challenge.md)
   - [Historical Access Model](docs/architecture/historical-access.md)
   - [Data Recovery and Key Revocation](docs/architecture/recovery-and-revocation.md)
+- **Threat Model & Security Boundaries:** [`docs/threat-model.md`](docs/threat-model.md)
+- **Smart Contract API & Gas Reference:** [`docs/contract-api.md`](docs/contract-api.md)
 - **Gateway HTTP API:** [`docs/api.md`](docs/api.md)
 - **Architecture Decision Records (ADRs):** [`docs/adr/`](docs/adr/)
 - **Design Decisions & MVP Limitations:** [`docs/decisions/README.md`](docs/decisions/README.md)
@@ -119,16 +121,20 @@ Docker Compose co-locates services for development convenience only):
     (`DisabledScanner`, disabled by default), and `crates/application`
     (`AuthService`, `UploadService`, `DownloadService`, `ShareService`).
   - Solidity `AccessGovernance`, `FileRegistry`, `RrdsTimelockController`, and
-    EIP-712/CID libraries (`39` Hardhat tests passing: 32 Solidity, 7 TypeScript).
-  - `crates/ipfs_adapter` (1 MiB chunk profile per
+    EIP-712/CID libraries (`35` Hardhat tests passing: 29 Solidity, 6 Node.js
+    including §7.9 gas-bound verification in `GasBounds.ts`).
+  - `crates/ipfs_adapter` (1 MiB chunk profile with multi-peer upload &
+    retrieval failover per
     [`docs/adr/content-package-unixfs-profile.md`](docs/adr/content-package-unixfs-profile.md)):
     verified live against two local Kubo `0.43.1` + Cluster `1.1.6` peers
     (`sh infra/ipfs-cluster/verify.sh` and `cluster_integration` passed).
-  - `crates/metadata_store` (migrations `0001`–`0005` with `build.rs`
-    migration-change tracking + least-privilege role separation template in
-    [`infra/postgres/init-roles.sql`](infra/postgres/init-roles.sql))
+  - `crates/metadata_store` (migrations `0001`–`0006`, configurable
+    `DATABASE_MIGRATION_MODE` defaulting to read-only `verify`, `build.rs`
+    migration-change tracking, and schema-aware least-privilege role separation
+    in [`infra/postgres/init-roles.sql`](infra/postgres/init-roles.sql))
     and `services/indexer`: verified live on host against PostgreSQL
-    `rrfs_indexer_test`.
+    `rrfs_indexer_test` including real `rrfs_gateway` & `rrfs_indexer` RBAC
+    enforcement (`28` passed).
   - `crates/chain_adapter`: QBFT finalized-head queries, ABI calldata encoders
     for `createFile` / `appendVersion` / `updateEnvelopeSet`, canonical RLP &
     EIP-2718 Type-2 zero-gas-price transaction relayer with sequential nonces
@@ -144,34 +150,44 @@ Docker Compose co-locates services for development convenience only):
     `POST /v1/files/{fileId}/versions/{version}/envelopes`) with pin-before-commit
     quorum enforcement, verified by real-HTTP Axum integration tests and live
     PostgreSQL tests on `rrfs_indexer_test`.
-  - `apps/cli`: thin CLI commands (`health`, `login`, `whoami`, `identity`, `ls`,
-    `history`, `upload`, `modify`, `download`, `share`, `restore`, `audit`)
-    wired to `crates/application` and `GatewayHttpClient` (with CARv1 raw-block
-    CID verification and `CustodyStartupPolicy` enforcement), verified end-to-end
-    over HTTP.
-  - **P7 (`tests/`, runbook, demo, Compose templates & design/dev docs):**
+  - `apps/cli`: thin CLI commands (`health`, `login`, `logout`, `whoami`,
+    `identity`, `ls`, `history`, `upload`, `modify`, `download`, `share`,
+    `restore`, `audit`) wired to `crates/application`, default-disabled
+    `PreUploadScanner`, and `GatewayHttpClient` (with regular-file/size input
+    validation, CARv1 raw-block CID verification, atomic `0600` + `fsync` +
+    `rename` output writes, and `CustodyStartupPolicy` enforcement), verified
+    end-to-end over HTTP.
+  - **P7 & Spec Hardening (`tests/`, `schemas/`, runbook, demo, Compose templates & docs):**
     cross-component `rrds-tests` workspace suite (`tests/end_to_end/acceptance.rs`,
     `tests/security/invariants.rs`, `tests/integration/cross_component.rs`),
+    cross-implementation RFC 9180 HPKE test vectors ([`tests/fixtures/hpke-rfc9180-v1.json`](tests/fixtures/hpke-rfc9180-v1.json)),
+    complete JSON schemas under [`schemas/`](schemas/),
     incident recovery runbook ([`docs/runbooks/ransomware-recovery.md`](docs/runbooks/ransomware-recovery.md)),
+    threat model ([`docs/threat-model.md`](docs/threat-model.md)),
+    contract API & gas reference ([`docs/contract-api.md`](docs/contract-api.md)),
     scripted local demo ([`scripts/demo-local.sh`](scripts/demo-local.sh)),
     production-separated per-role Compose templates ([`infra/compose/`](infra/compose/README.md)),
     design justifications ([`docs/decisions/README.md`](docs/decisions/README.md)),
     and cross-component development notes ([`docs/development-notes.md`](docs/development-notes.md)).
-  - Full offline Rust workspace suite: **106 passed, 0 failed** (101 executed
-    offline; 5 PostgreSQL tests return early when `DATABASE_URL` is unset and
-    were separately verified live on host against `rrfs_indexer_test`; 1 live
-    two-peer Cluster test is ignored by default and separately verified on host),
-    strict Clippy (`-D warnings`), `cargo fmt --check`, and `git diff --check`
-    passing.
+  - Full offline Rust workspace suite: **124 passed, 0 failed** (115 executed
+    offline; 9 PostgreSQL tests return early when `DATABASE_URL` is unset and
+    were separately verified live on host against `rrfs_indexer_test` with
+    `28` passed across `metadata-store`/`indexer`/`gateway`; 1 live two-peer
+    Cluster test is ignored by default and separately verified on host), strict
+    Clippy (`-D warnings`), `cargo fmt --check`, and `git diff --check` passing.
 
 - **Remaining before MVP acceptance (§15.4):**
-  - **P6 (Maintainer-gated):** Deploy contracts to local Besu with approved
-    Safe addresses, execute timelocked `FILE_REGISTRY_ROLE` activation, and run
-    live-Besu end-to-end verification; review `rrfs_dev` migration 3 checksum
-    discrepancy before touching `rrfs_dev`.
-  - **Optional cleanup:** Remove leftover Hardhat `Counter` template files,
-    empty `crates/metadata_store/src/migrations/`, and unused root `package.json`
-    once confirmed by the maintainer.
+  - **P6 (In progress — local Besu smoke-test deployed 27 Nov 2026):**
+    `RrdsTimelockController`, `AccessGovernance`, and `FileRegistry` are deployed
+    on local Besu (`chainId=1337`) using **dev-only EOA placeholders** (to be
+    replaced with real Safe multisigs later; see
+    [`contracts/README.md`](contracts/README.md)), and the 24-hour timelocked
+    activation batch (`FILE_REGISTRY_ROLE` + demo org) is scheduled (ready at
+    `2026-11-27T20:26:20.000Z`). Remaining: execute the ready timelock batch,
+    enroll demo member(s), configure contract addresses in local `.env`, run
+    live end-to-end verification (`indexer` + `gateway` + `scripts/demo-local.sh`),
+    inspect `rrfs_dev` migration 3 (`VersionMismatch(3)`), and later validate
+    real Safe smart-account proxies on Besu before any production claim.
 
 See [`progress_report.md`](progress_report.md) for the complete chronological
 record and maintainer decisions.

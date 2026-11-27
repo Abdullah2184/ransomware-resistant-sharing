@@ -2,7 +2,7 @@
 
 This directory documents the system architecture, trust boundaries, deployment
 placement, and core security workflows defined by
-[`TECHNICAL_SPECIFICATION.md`](../../TECHNICAL_SPECIFICATION.md) and the
+[`TECHNICAL_SPECIFICATION.md`](../specifications/TECHNICAL_SPECIFICATION.md) and the
 accepted ADRs under [`docs/adr/`](../adr/).
 
 ## Architecture Subdocuments

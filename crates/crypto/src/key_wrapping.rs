@@ -369,4 +369,74 @@ mod tests {
             Err(CryptoError::InvalidEnvelope)
         );
     }
+
+    fn decode_hex_str(hex: &str) -> Vec<u8> {
+        assert_eq!(hex.len() % 2, 0);
+        (0..hex.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn matches_rfc9180_and_cross_implementation_openssl_hpke_vectors() {
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../../../tests/fixtures/hpke-rfc9180-v1.json"))
+                .unwrap();
+
+        // 1. Official RFC 9180 Base mode (X25519 / HKDF-SHA256 / AES-256-GCM) vector
+        let rfc = &fixture["rfc9180BaseVector"];
+        let ikm_r: [u8; 32] = decode_hex_str(rfc["ikmR"].as_str().unwrap())
+            .try_into()
+            .unwrap();
+        let expected_pk_r = decode_hex_str(rfc["pkRm"].as_str().unwrap());
+        let recipient = HpkeRecipientKeyPair::derive_from_seed(&ikm_r).unwrap();
+        assert_eq!(recipient.public_key().to_bytes(), expected_pk_r);
+
+        let enc = RecipientEncappedKey::from_bytes(&decode_hex_str(rfc["enc"].as_str().unwrap()))
+            .unwrap();
+        let mut receiver = hpke::setup_receiver::<HpkeAead, HpkeKdf, RecipientKem>(
+            &OpModeR::Base,
+            &recipient.private_key,
+            &enc,
+            rfc["info"].as_str().unwrap().as_bytes(),
+        )
+        .unwrap();
+        let opened = receiver
+            .open(
+                &decode_hex_str(rfc["ciphertext"].as_str().unwrap()),
+                rfc["aad"].as_str().unwrap().as_bytes(),
+            )
+            .unwrap();
+        assert_eq!(opened, rfc["plaintext"].as_str().unwrap().as_bytes());
+
+        // 2. Cross-implementation OpenSSL -> Rust RRDS KeyEnvelope vector
+        let rrds = &fixture["rrdsDekWrapCrossImplVector"];
+        let rrds_ikm_r: [u8; 32] = decode_hex_str(rrds["ikmR"].as_str().unwrap())
+            .try_into()
+            .unwrap();
+        let rrds_recipient = HpkeRecipientKeyPair::derive_from_seed(&rrds_ikm_r).unwrap();
+        assert_eq!(
+            rrds_recipient.public_key().to_bytes(),
+            decode_hex_str(rrds["pkRm"].as_str().unwrap())
+        );
+
+        let envelope = KeyEnvelope::from_parts(
+            decode_hex_str(rrds["enc"].as_str().unwrap()),
+            decode_hex_str(rrds["ciphertext"].as_str().unwrap()),
+        )
+        .unwrap();
+        let wrap_ctx = WrapContext::new(
+            FileId::from_bytes([rrds["fileIdByte"].as_u64().unwrap() as u8; 32]),
+            VersionNumber::new(rrds["versionNumber"].as_u64().unwrap()).unwrap(),
+            EpochId::from_bytes([rrds["epochIdByte"].as_u64().unwrap() as u8; 32]),
+            MemberId::from_bytes([rrds["memberIdByte"].as_u64().unwrap() as u8; 32]),
+            KeyVersion::new(rrds["keyVersion"].as_u64().unwrap() as u32).unwrap(),
+        );
+        let unwrapped_dek = rrds_recipient.open_dek(&envelope, wrap_ctx).unwrap();
+        assert_eq!(
+            unwrapped_dek.expose_bytes(),
+            &[rrds["dekByte"].as_u64().unwrap() as u8; 32]
+        );
+    }
 }

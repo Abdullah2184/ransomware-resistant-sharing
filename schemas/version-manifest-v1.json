@@ -1,0 +1,89 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ransomware-resistant-sharing.invalid/schemas/version-manifest-v1.json",
+  "title": "RRDS Signed Version Append / File Creation Request v1",
+  "description": "EIP-712 signed version-registration payload submitted to POST /v1/files (version 1) and POST /v1/files/{fileId}/versions (version N > 1) after encrypted content and envelope-set objects satisfy the configured IPFS Cluster pin quorum.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "fileId",
+    "versionNumber",
+    "parentManifestHash",
+    "manifestHash",
+    "contentCid",
+    "envelopeSetCid",
+    "epochId",
+    "memberId",
+    "signerAddress",
+    "operationNonce",
+    "deadline",
+    "signature"
+  ],
+  "properties": {
+    "fileId": {
+      "type": "string",
+      "pattern": "^0x[0-9a-f]{64}$"
+    },
+    "displayName": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 255,
+      "description": "Required only for initial file creation (versionNumber = 1); visible consortium metadata."
+    },
+    "parentFolderId": {
+      "type": "string",
+      "pattern": "^0x[0-9a-f]{64}$",
+      "description": "Required only for initial file creation (versionNumber = 1); all-zero for root folder."
+    },
+    "versionNumber": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "parentManifestHash": {
+      "type": "string",
+      "pattern": "^0x[0-9a-f]{64}$",
+      "description": "All-zero for version 1; must equal currentHeadManifestHash for version N > 1."
+    },
+    "manifestHash": {
+      "type": "string",
+      "pattern": "^0x[0-9a-f]{64}$",
+      "description": "SHA-256 digest of the canonical encrypted-file-manifest-v1 JSON."
+    },
+    "contentCid": {
+      "type": "string",
+      "pattern": "^b[a-z2-7]+$",
+      "description": "Canonical lower-case base32 CIDv1 of the pinned encrypted content package."
+    },
+    "envelopeSetCid": {
+      "type": "string",
+      "pattern": "^b[a-z2-7]+$",
+      "description": "Canonical lower-case base32 CIDv1 of the pinned canonical key-envelope-set-v1 object."
+    },
+    "epochId": {
+      "type": "string",
+      "pattern": "^0x[0-9a-f]{64}$",
+      "description": "Unique 32-byte version key epoch identifier."
+    },
+    "memberId": {
+      "type": "string",
+      "pattern": "^0x[0-9a-f]{64}$"
+    },
+    "signerAddress": {
+      "type": "string",
+      "pattern": "^0x[0-9a-f]{40}$"
+    },
+    "operationNonce": {
+      "type": "string",
+      "pattern": "^0x[0-9a-f]{64}$"
+    },
+    "deadline": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "signature": {
+      "type": "string",
+      "pattern": "^0x[0-9a-f]{130}$",
+      "description": "65-byte low-s secp256k1 EIP-712 signature (r || s || v) over VersionAppend under the RRDS FileRegistry domain."
+    }
+  }
+}

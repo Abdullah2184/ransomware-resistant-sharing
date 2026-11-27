@@ -210,22 +210,25 @@ pub async fn encode_content_package_frame(
     for chunk in chunks {
         let index = chunk.index();
         let declared_len = chunk.ciphertext_bytes();
-        let mut bytes = Vec::new();
+        let declared_usize =
+            usize::try_from(declared_len).map_err(|_| StorageError::SizeLimitExceeded)?;
+        let next_len = out
+            .len()
+            .checked_add(12)
+            .and_then(|v| v.checked_add(declared_usize))
+            .ok_or(StorageError::SizeLimitExceeded)?;
+        if next_len > max_total_bytes {
+            return Err(StorageError::SizeLimitExceeded);
+        }
+        let mut bytes = Vec::with_capacity(declared_usize);
         chunk
             .into_reader()
+            .take(declared_len.saturating_add(1))
             .read_to_end(&mut bytes)
             .await
             .map_err(|_| StorageError::TransportUnavailable)?;
         if u64::try_from(bytes.len()).ok() != Some(declared_len) {
             return Err(StorageError::InvalidPackage);
-        }
-        let next_len = out
-            .len()
-            .checked_add(12)
-            .and_then(|v| v.checked_add(bytes.len()))
-            .ok_or(StorageError::SizeLimitExceeded)?;
-        if next_len > max_total_bytes {
-            return Err(StorageError::SizeLimitExceeded);
         }
         out.extend_from_slice(&index.to_be_bytes());
         out.extend_from_slice(&declared_len.to_be_bytes());
@@ -378,5 +381,116 @@ mod tests {
             decode_content_package_frame(b"not-an-encrypted-package").err(),
             Some(StorageError::InvalidPackage)
         );
+    }
+
+    #[tokio::test]
+    async fn content_package_frame_handles_empty_files_and_rejects_size_or_reader_mismatches() {
+        // 0-byte file (0 chunks) round-trips cleanly.
+        let empty_manifest = EncryptedFileManifest::new(
+            FileId::from_bytes([0x11; 32]),
+            VersionNumber::ONE,
+            ManifestHash::ZERO,
+            EpochId::from_bytes([0x22; 32]),
+            NoncePrefix::from_bytes([0x33; 8]),
+            64,
+            Vec::new(),
+            None,
+        )
+        .unwrap();
+        let empty_pkg = ContentPackage::new(empty_manifest.clone(), Vec::new()).unwrap();
+        let frame = encode_content_package_frame(empty_pkg, 4096).await.unwrap();
+        let decoded = decode_content_package_frame(&frame).unwrap();
+        assert_eq!(decoded.manifest(), &empty_manifest);
+        assert!(decoded.chunks().is_empty());
+
+        // Oversized frame rejected before buffering full chunk.
+        let chunk_data = vec![0x77; 48];
+        let chunk_cid = raw_sha256_cid(&chunk_data).unwrap();
+        let manifest = EncryptedFileManifest::new(
+            FileId::from_bytes([0x11; 32]),
+            VersionNumber::ONE,
+            ManifestHash::ZERO,
+            EpochId::from_bytes([0x22; 32]),
+            NoncePrefix::from_bytes([0x33; 8]),
+            64,
+            vec![EncryptedChunkRef::new(1, chunk_cid, 48).unwrap()],
+            None,
+        )
+        .unwrap();
+        let too_tight = ContentPackage::new(
+            manifest.clone(),
+            vec![ContentChunk::new(
+                1,
+                48,
+                Box::pin(Cursor::new(chunk_data.clone())) as StorageReader,
+            )],
+        )
+        .unwrap();
+        assert_eq!(
+            encode_content_package_frame(too_tight, frame.len() + 10).await,
+            Err(StorageError::SizeLimitExceeded)
+        );
+
+        // Oversized chunk reader (returns more bytes than declared_len) is bounded and rejected.
+        let lying_reader = ContentPackage::new(
+            manifest.clone(),
+            vec![ContentChunk::new(
+                1,
+                48,
+                Box::pin(Cursor::new(vec![0x77_u8; 200])) as StorageReader,
+            )],
+        )
+        .unwrap();
+        assert_eq!(
+            encode_content_package_frame(lying_reader, 1024 * 1024).await,
+            Err(StorageError::InvalidPackage)
+        );
+
+        // Truncated chunk reader rejected.
+        let short_reader = ContentPackage::new(
+            manifest.clone(),
+            vec![ContentChunk::new(
+                1,
+                48,
+                Box::pin(Cursor::new(vec![0x77_u8; 12])) as StorageReader,
+            )],
+        )
+        .unwrap();
+        assert_eq!(
+            encode_content_package_frame(short_reader, 1024 * 1024).await,
+            Err(StorageError::InvalidPackage)
+        );
+
+        // ContentPackage::new rejects mismatched chunk count or index.
+        assert!(ContentPackage::new(manifest.clone(), Vec::new()).is_err());
+        assert!(
+            ContentPackage::new(
+                manifest,
+                vec![ContentChunk::new(
+                    2,
+                    48,
+                    Box::pin(Cursor::new(chunk_data)) as StorageReader,
+                )],
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn sensitive_port_types_redact_secrets_in_debug_output() {
+        let session = crate::AuthenticatedSession::new(
+            "super-secret-bearer-token".to_owned(),
+            domain::MemberId::from_bytes([0x11; 32]),
+            1_800_000_000,
+        );
+        let session_dbg = format!("{session:?}");
+        assert!(session_dbg.contains("[REDACTED]"));
+        assert!(!session_dbg.contains("super-secret-bearer-token"));
+
+        let key_id = crate::KeyId::from_bytes([0xab; 32]);
+        assert_eq!(format!("{key_id:?}"), "KeyId([REDACTED])");
+
+        let sig = crate::EvmSignature::from_bytes([0xcd; 65]);
+        assert!(!format!("{sig:?}").contains("205"));
     }
 }

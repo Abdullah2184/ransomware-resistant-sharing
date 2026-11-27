@@ -114,6 +114,7 @@ struct PublicIdentityResponse {
 struct AccessLookupResponse {
     file_id: String,
     version_number: u64,
+    manifest_hash: String,
     content_cid: String,
     envelope_set_cid: String,
     epoch_id: String,
@@ -151,6 +152,7 @@ struct FileListResponse {
 #[serde(rename_all = "camelCase")]
 struct VersionHistoryResponse {
     file_id: String,
+    file_status: u64,
     current_version: u64,
     current_head_manifest_hash: String,
     finalized_block: u64,
@@ -1244,6 +1246,7 @@ async fn access_lookup(
         Ok(true) => Json(AccessLookupResponse {
             file_id: file_id.to_string(),
             version_number,
+            manifest_hash: encode_hex(&content.manifest_hash),
             content_cid: content.content_cid,
             envelope_set_cid: envelope.cid,
             epoch_id: encode_hex(&envelope.epoch_id),
@@ -2163,7 +2166,7 @@ async fn file_version_history(
         Ok(head) => head,
         Err(_) => return error(StatusCode::SERVICE_UNAVAILABLE, "service_unavailable"),
     };
-    let Some(head) = head.filter(|head| head.status == 1) else {
+    let Some(head) = head.filter(|head| matches!(head.status, 1 | 2)) else {
         return failure(
             &state,
             "file.history",
@@ -2199,6 +2202,7 @@ async fn file_version_history(
     {
         Ok(history) => Json(VersionHistoryResponse {
             file_id: file_id.to_string(),
+            file_status: head.status,
             current_version: head.version_number,
             current_head_manifest_hash: head.manifest_hash,
             finalized_block: finalized.number,
@@ -5867,12 +5871,14 @@ mod tests {
                     (*file_id.as_bytes(), 1),
                     FileVersionState {
                         content_cid: content_v1_cid.clone(),
+                        manifest_hash: [0xdd; 32],
                     },
                 );
                 chain.versions.insert(
                     (*file_id.as_bytes(), 2),
                     FileVersionState {
                         content_cid: content_v2_cid.clone(),
+                        manifest_hash: [0xee; 32],
                     },
                 );
                 chain.envelopes.insert(

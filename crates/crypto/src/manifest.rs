@@ -12,6 +12,8 @@ const NONCE_SCHEME: &str = "prefix64-index32-v1";
 const GCM_TAG_BYTES: usize = 16;
 const NONCE_PREFIX_BYTES: usize = 8;
 const MAX_CHUNK_SIZE_BYTES: u32 = 1024 * 1024;
+/// Upper bound on encrypted private metadata ciphertext+tag inside a version manifest.
+pub const MAX_PRIVATE_METADATA_BYTES: usize = 64 * 1024;
 
 /// A reference to one immutable ciphertext chunk in the encrypted package.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -52,7 +54,9 @@ pub struct PrivateMetadataCiphertext(Vec<u8>);
 
 impl PrivateMetadataCiphertext {
     pub fn new(ciphertext_and_tag: Vec<u8>) -> Result<Self, CryptoError> {
-        if ciphertext_and_tag.len() < GCM_TAG_BYTES {
+        if ciphertext_and_tag.len() < GCM_TAG_BYTES
+            || ciphertext_and_tag.len() > MAX_PRIVATE_METADATA_BYTES
+        {
             return Err(CryptoError::InvalidManifest);
         }
         Ok(Self(ciphertext_and_tag))
@@ -170,6 +174,19 @@ impl EncryptedFileManifest {
     }
 
     pub fn validate(&self) -> Result<(), CryptoError> {
+        if self.file_id.as_bytes() == &[0; 32] || self.epoch_id.as_bytes() == &[0; 32] {
+            return Err(CryptoError::InvalidManifest);
+        }
+        if (self.version_number == VersionNumber::ONE)
+            != (self.parent_manifest_hash == ManifestHash::ZERO)
+        {
+            return Err(CryptoError::InvalidManifest);
+        }
+        if let Some(metadata) = &self.private_metadata
+            && (metadata.0.len() < GCM_TAG_BYTES || metadata.0.len() > MAX_PRIVATE_METADATA_BYTES)
+        {
+            return Err(CryptoError::InvalidManifest);
+        }
         if self.chunk_size_bytes == 0
             || self.chunk_size_bytes > MAX_CHUNK_SIZE_BYTES
             || u32::try_from(self.chunks.len()).ok() != Some(self.chunk_count)
@@ -340,6 +357,21 @@ pub fn raw_sha256_cid(bytes: &[u8]) -> Result<ContentCid, CryptoError> {
         .map_err(|_| CryptoError::ManifestEncodingFailed)?;
     let cid = Cid::new_v1(0x55, multihash).to_string();
     ContentCid::parse(&cid).map_err(|_| CryptoError::ManifestEncodingFailed)
+}
+
+/// Verifies that `cid` is a CIDv1 with a `sha2-256` multihash (`0x12`, 32 bytes)
+/// whose digest matches `Sha256(bytes)`. Works for both `raw` (`0x55`) leaf blocks
+/// and `dag-pb` (`0x70`) UnixFS directory blocks.
+pub fn verify_sha256_cid(cid: &Cid, bytes: &[u8]) -> bool {
+    if cid.version() != cid::Version::V1 {
+        return false;
+    }
+    let hash = cid.hash();
+    if hash.code() != 0x12 || hash.size() != 32 {
+        return false;
+    }
+    let digest = Sha256::digest(bytes);
+    hash.digest() == &digest[..]
 }
 
 fn parse_bytes32(value: &str) -> Result<[u8; 32], CryptoError> {
@@ -580,5 +612,83 @@ mod tests {
             EncryptedFileManifest::try_from(dto),
             Err(CryptoError::InvalidManifest)
         ));
+    }
+
+    #[test]
+    fn rejects_zero_ids_broken_parent_chain_and_oversized_private_metadata() {
+        assert_eq!(
+            EncryptedFileManifest::new(
+                FileId::from_bytes([0; 32]),
+                VersionNumber::ONE,
+                ManifestHash::ZERO,
+                EpochId::from_bytes([2; 32]),
+                NoncePrefix::from_bytes([3; 8]),
+                4,
+                Vec::new(),
+                None,
+            ),
+            Err(CryptoError::InvalidManifest)
+        );
+        assert_eq!(
+            EncryptedFileManifest::new(
+                FileId::from_bytes([1; 32]),
+                VersionNumber::ONE,
+                ManifestHash::ZERO,
+                EpochId::from_bytes([0; 32]),
+                NoncePrefix::from_bytes([3; 8]),
+                4,
+                Vec::new(),
+                None,
+            ),
+            Err(CryptoError::InvalidManifest)
+        );
+        // V1 must have zero parent manifest hash; V2+ must have non-zero parent manifest hash.
+        assert_eq!(
+            EncryptedFileManifest::new(
+                FileId::from_bytes([1; 32]),
+                VersionNumber::ONE,
+                ManifestHash::from_bytes([0xaa; 32]),
+                EpochId::from_bytes([2; 32]),
+                NoncePrefix::from_bytes([3; 8]),
+                4,
+                Vec::new(),
+                None,
+            ),
+            Err(CryptoError::InvalidManifest)
+        );
+        assert_eq!(
+            EncryptedFileManifest::new(
+                FileId::from_bytes([1; 32]),
+                VersionNumber::new(2).unwrap(),
+                ManifestHash::ZERO,
+                EpochId::from_bytes([2; 32]),
+                NoncePrefix::from_bytes([3; 8]),
+                4,
+                Vec::new(),
+                None,
+            ),
+            Err(CryptoError::InvalidManifest)
+        );
+        // Oversized private metadata rejected.
+        assert_eq!(
+            PrivateMetadataCiphertext::new(vec![0x55; MAX_PRIVATE_METADATA_BYTES + 1]),
+            Err(CryptoError::InvalidManifest)
+        );
+    }
+
+    #[test]
+    fn verifies_sha256_cids_for_raw_and_dag_pb_blocks_and_rejects_tamper() {
+        let data = b"dag-pb-or-raw-payload";
+        let raw_cid: Cid = raw_sha256_cid(data).unwrap().to_string().parse().unwrap();
+        let dag_pb_cid = Cid::new_v1(0x70, *raw_cid.hash());
+
+        assert!(verify_sha256_cid(&raw_cid, data));
+        assert!(verify_sha256_cid(&dag_pb_cid, data));
+        assert!(!verify_sha256_cid(&dag_pb_cid, b"tampered-payload"));
+
+        // Non-sha2-256 multihash (identity code 0x00) rejected.
+        let id_mh = cid::multihash::Multihash::<64>::wrap(0x00, &[0x11; 32]).unwrap();
+        let non_sha2 = Cid::new_v1(0x55, id_mh);
+        assert!(!verify_sha256_cid(&non_sha2, &[0x11; 32]));
     }
 }

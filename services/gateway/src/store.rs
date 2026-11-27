@@ -129,6 +129,10 @@ impl GatewayStore {
             "invalid canonical challenge nonce".into(),
         ))?;
 
+        sqlx::query("DELETE FROM gateway_login_challenges WHERE expires_at <= $1")
+            .bind(unix_seconds()? as i64)
+            .execute(&mut **transaction)
+            .await?;
         sqlx::query(
             "INSERT INTO gateway_login_challenges \
              (member_id, nonce, issued_at, expires_at, audience, protocol_version) \
@@ -195,6 +199,10 @@ impl GatewayStore {
             return Ok(false);
         };
 
+        sqlx::query("DELETE FROM gateway_sessions WHERE expires_at <= $1")
+            .bind(unix_seconds()? as i64)
+            .execute(&mut **transaction)
+            .await?;
         sqlx::query(
             "INSERT INTO gateway_sessions (token_hash, member_id, expires_at) \
              VALUES ($1, $2, $3)",
@@ -841,23 +849,47 @@ async fn take_rate_limit_token_in_transaction(
     capacity: f64,
     refill_per_second: f64,
 ) -> Result<bool, sqlx::Error> {
-    sqlx::query_scalar(
-            "INSERT INTO gateway_rate_buckets (bucket_key, tokens, updated_at) \
-             VALUES ($1, $2 - 1, clock_timestamp()) \
-             ON CONFLICT (bucket_key) DO UPDATE SET \
-                 tokens = LEAST( \
-                     $2, \
-                     gateway_rate_buckets.tokens + \
-                         GREATEST(0, EXTRACT(EPOCH FROM (clock_timestamp() - gateway_rate_buckets.updated_at))::double precision * $3) \
-                 ) - 1, \
-                 updated_at = clock_timestamp() \
-             RETURNING tokens >= 0",
-        )
-        .bind(key)
-        .bind(capacity)
-        .bind(refill_per_second)
-        .fetch_one(&mut **transaction)
-        .await
+    if !capacity.is_finite() || capacity < 1.0 || !refill_per_second.is_finite() {
+        return Ok(false);
+    }
+    let refill_rate = refill_per_second.max(0.0);
+    sqlx::query(
+        "INSERT INTO gateway_rate_buckets (bucket_key, tokens, updated_at) \
+         VALUES ($1, $2, clock_timestamp()) \
+         ON CONFLICT (bucket_key) DO NOTHING",
+    )
+    .bind(key)
+    .bind(capacity)
+    .execute(&mut **transaction)
+    .await?;
+
+    let (stored_tokens, elapsed_seconds): (f64, f64) = sqlx::query_as(
+        "SELECT tokens, \
+                GREATEST(0.0, EXTRACT(EPOCH FROM (clock_timestamp() - updated_at))::double precision) \
+         FROM gateway_rate_buckets \
+         WHERE bucket_key = $1 \
+         FOR UPDATE",
+    )
+    .bind(key)
+    .fetch_one(&mut **transaction)
+    .await?;
+
+    let available = (stored_tokens.max(0.0) + elapsed_seconds * refill_rate).min(capacity);
+    let (allowed, next_tokens) = if available >= 1.0 {
+        (true, available - 1.0)
+    } else {
+        (false, available)
+    };
+    sqlx::query(
+        "UPDATE gateway_rate_buckets \
+         SET tokens = $2, updated_at = clock_timestamp() \
+         WHERE bucket_key = $1",
+    )
+    .bind(key)
+    .bind(next_tokens)
+    .execute(&mut **transaction)
+    .await?;
+    Ok(allowed)
 }
 
 async fn append_audit(
@@ -1138,6 +1170,113 @@ mod tests {
         revoke_hasher.update(revoke_row.0.as_bytes());
         assert_eq!(&revoke_hasher.finalize()[..], revoke_row.2);
 
+        // Burst denial recovery test: 10 consecutive denied requests must NOT accumulate
+        // negative token debt; a single token refill interval must allow the next request.
+        for _ in 0..2 {
+            assert!(
+                take_rate_limit_token_in_transaction(
+                    &mut transaction,
+                    "gateway-burst-recovery-bucket",
+                    2.0,
+                    20.0,
+                )
+                .await
+                .expect("consume initial burst capacity")
+            );
+        }
+        for _ in 0..10 {
+            assert!(
+                !take_rate_limit_token_in_transaction(
+                    &mut transaction,
+                    "gateway-burst-recovery-bucket",
+                    2.0,
+                    20.0,
+                )
+                .await
+                .expect("deny requests beyond burst capacity")
+            );
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(75)).await;
+        assert!(
+            take_rate_limit_token_in_transaction(
+                &mut transaction,
+                "gateway-burst-recovery-bucket",
+                2.0,
+                20.0,
+            )
+            .await
+            .expect("allow request immediately after 1 token refills (no negative debt)")
+        );
+
+        // Expired challenge & session pruning on new auth activity.
+        let expired_nonce = [0xee_u8; 32];
+        sqlx::query(
+            "INSERT INTO gateway_login_challenges \
+             (member_id, nonce, issued_at, expires_at, audience, protocol_version) \
+             VALUES ($1, $2, 100, 200, 'gateway-test', 1)",
+        )
+        .bind(&challenge.member_id)
+        .bind(expired_nonce.as_slice())
+        .execute(&mut *transaction)
+        .await
+        .expect("seed expired login challenge");
+        let expired_session_hash = [0xed_u8; 32];
+        sqlx::query(
+            "INSERT INTO gateway_sessions (token_hash, member_id, expires_at) \
+             VALUES ($1, $2, 200)",
+        )
+        .bind(expired_session_hash.as_slice())
+        .bind(&challenge.member_id)
+        .execute(&mut *transaction)
+        .await
+        .expect("seed expired session");
+        let fresh_challenge = LoginChallenge {
+            member_id: challenge.member_id.clone(),
+            nonce: format!("0x{}", "de".repeat(32)),
+            issued_at: unix_seconds().unwrap(),
+            expires_at: unix_seconds().unwrap() + 120,
+            audience: "gateway-test".to_owned(),
+            protocol_version: 1,
+        };
+        store
+            .create_challenge_in_transaction(
+                &mut transaction,
+                &fresh_challenge,
+                "test-source",
+                1337,
+            )
+            .await
+            .expect("create challenge triggers expired challenge pruning");
+        let expired_challenge_remaining: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM gateway_login_challenges WHERE nonce = $1")
+                .bind(expired_nonce.as_slice())
+                .fetch_one(&mut *transaction)
+                .await
+                .expect("check expired challenge pruned");
+        assert_eq!(expired_challenge_remaining, 0);
+
+        let fresh_token_hash = hash_session_token(&[0x56; 32]);
+        assert!(
+            store
+                .complete_login_in_transaction(
+                    &mut transaction,
+                    &fresh_challenge,
+                    &fresh_token_hash,
+                    fresh_challenge.expires_at + 900,
+                    "test-source",
+                    1337,
+                )
+                .await
+                .expect("complete fresh login triggers expired session pruning")
+        );
+        let expired_session_remaining: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM gateway_sessions WHERE token_hash = $1")
+                .bind(expired_session_hash.as_slice())
+                .fetch_one(&mut *transaction)
+                .await
+                .expect("check expired session pruned");
+        assert_eq!(expired_session_remaining, 0);
+
         let audit_sequence: i64 = sqlx::query_scalar(
             "SELECT sequence FROM gateway_audit_events \
              WHERE record->>'operation_id' = $1 ORDER BY sequence DESC LIMIT 1",
@@ -1146,17 +1285,415 @@ mod tests {
         .fetch_one(&mut *transaction)
         .await
         .expect("find test audit entry");
+
+        // Verify UPDATE, DELETE, and TRUNCATE are all blocked by DB triggers.
+        sqlx::query("SAVEPOINT sp_audit_update")
+            .execute(&mut *transaction)
+            .await
+            .unwrap();
         assert!(
             sqlx::query("UPDATE gateway_audit_events SET record = record WHERE sequence = $1")
                 .bind(audit_sequence)
                 .execute(&mut *transaction)
                 .await
                 .is_err(),
-            "audit rows reject mutation"
+            "audit rows reject UPDATE"
         );
+        sqlx::query("ROLLBACK TO SAVEPOINT sp_audit_update")
+            .execute(&mut *transaction)
+            .await
+            .unwrap();
+
+        sqlx::query("SAVEPOINT sp_audit_delete")
+            .execute(&mut *transaction)
+            .await
+            .unwrap();
+        assert!(
+            sqlx::query("DELETE FROM gateway_audit_events WHERE sequence = $1")
+                .bind(audit_sequence)
+                .execute(&mut *transaction)
+                .await
+                .is_err(),
+            "audit rows reject DELETE"
+        );
+        sqlx::query("ROLLBACK TO SAVEPOINT sp_audit_delete")
+            .execute(&mut *transaction)
+            .await
+            .unwrap();
+
+        sqlx::query("SAVEPOINT sp_audit_truncate")
+            .execute(&mut *transaction)
+            .await
+            .unwrap();
+        assert!(
+            sqlx::query("TRUNCATE TABLE gateway_audit_events")
+                .execute(&mut *transaction)
+                .await
+                .is_err(),
+            "audit table rejects TRUNCATE"
+        );
+        sqlx::query("ROLLBACK TO SAVEPOINT sp_audit_truncate")
+            .execute(&mut *transaction)
+            .await
+            .unwrap();
+
         transaction
             .rollback()
             .await
             .expect("rollback gateway test records");
+    }
+
+    #[tokio::test]
+    async fn concurrent_challenges_nonces_rate_limits_and_audit_chain_are_race_free() {
+        let _guard = TEST_LOCK.lock().await;
+        let Ok(database_url) = std::env::var("DATABASE_URL") else {
+            eprintln!("Skipping gateway concurrency PostgreSQL test: DATABASE_URL is not set");
+            return;
+        };
+        let pool_config = metadata_store::PostgresPoolConfig {
+            max_connections: 12,
+            acquire_timeout: std::time::Duration::from_secs(10),
+        };
+        let metadata = PostgresStore::connect_with_config(&database_url, pool_config)
+            .await
+            .expect("connect to PostgreSQL for concurrency test");
+        metadata
+            .migrate()
+            .await
+            .expect("apply migrations for concurrency test");
+        let store = GatewayStore::new(metadata.pool().clone());
+
+        let run_tag = unix_millis().unwrap() as u64;
+        let mut member_bytes = [0x41u8; 32];
+        member_bytes[24..32].copy_from_slice(&run_tag.to_be_bytes());
+        let member_id = encode_hex(&member_bytes);
+
+        let mut challenge_nonce_bytes = [0x42u8; 32];
+        challenge_nonce_bytes[24..32].copy_from_slice(&run_tag.to_be_bytes());
+        let now = unix_seconds().unwrap();
+        let challenge = LoginChallenge {
+            member_id: member_id.clone(),
+            nonce: encode_hex(&challenge_nonce_bytes),
+            issued_at: now,
+            expires_at: now + 120,
+            audience: "gateway-concurrency-test".to_owned(),
+            protocol_version: 1,
+        };
+        store
+            .create_challenge(&challenge, "concurrency-src", 1337)
+            .await
+            .expect("insert shared challenge");
+
+        // 1. 8 concurrent login attempts against the same one-time challenge -> exactly 1 succeeds.
+        let mut login_handles = Vec::new();
+        for idx in 0..8u8 {
+            let s = store.clone();
+            let c = challenge.clone();
+            login_handles.push(tokio::spawn(async move {
+                let mut raw_token = [idx.wrapping_add(1); 32];
+                raw_token[24..32].copy_from_slice(&run_tag.to_be_bytes());
+                let token_hash = hash_session_token(&raw_token);
+                s.complete_login(&c, &token_hash, now + 900, "concurrency-src", 1337)
+                    .await
+                    .expect("complete_login must not error under concurrency")
+            }));
+        }
+        let mut login_wins = 0usize;
+        for h in login_handles {
+            if h.await.unwrap() {
+                login_wins += 1;
+            }
+        }
+        assert_eq!(
+            login_wins, 1,
+            "exactly one concurrent login must consume challenge"
+        );
+
+        // 2. 8 concurrent AccessLookup attempts with the same nonce -> exactly 1 authorized, 7 replayed,
+        //    and all 8 serialized cleanly in the Keccak-256 audit hash chain.
+        let mut access_nonce = [0x43u8; 32];
+        access_nonce[24..32].copy_from_slice(&run_tag.to_be_bytes());
+        let file_id = format!("0x{}", "5a".repeat(32));
+        let mut access_handles = Vec::new();
+        for _ in 0..8 {
+            let s = store.clone();
+            let m = member_id.clone();
+            let f = file_id.clone();
+            access_handles.push(tokio::spawn(async move {
+                s.record_access_attempt(
+                    &m,
+                    "concurrency-src",
+                    &f,
+                    1,
+                    &access_nonce,
+                    now + 120,
+                    1337,
+                    500,
+                    true,
+                    None,
+                )
+                .await
+                .expect("record_access_attempt must not error under concurrency")
+            }));
+        }
+        let mut access_wins = 0usize;
+        for h in access_handles {
+            if h.await.unwrap() {
+                access_wins += 1;
+            }
+        }
+        assert_eq!(
+            access_wins, 1,
+            "exactly one concurrent access lookup must succeed"
+        );
+
+        let access_op_id = encode_hex(&access_nonce);
+        let audit_chain: Vec<(i64, String, Vec<u8>, Vec<u8>)> = sqlx::query_as(
+            "SELECT sequence, record_canonical, previous_hash, record_hash \
+             FROM gateway_audit_events \
+             WHERE record->>'operation_id' = $1 \
+             ORDER BY sequence ASC",
+        )
+        .bind(&access_op_id)
+        .fetch_all(metadata.pool())
+        .await
+        .expect("fetch concurrent audit entries");
+        assert_eq!(audit_chain.len(), 8);
+        for (i, (_, canonical, prev, hash)) in audit_chain.iter().enumerate() {
+            let mut hasher = Keccak256::new();
+            hasher.update(prev);
+            hasher.update(canonical.as_bytes());
+            assert_eq!(&hasher.finalize()[..], hash.as_slice());
+            if i > 0 {
+                assert_eq!(prev, &audit_chain[i - 1].3);
+            }
+        }
+
+        // 3. 8 concurrent rate-limit acquisitions against capacity 3.0 -> exactly 3 allowed.
+        let bucket_key = format!("concurrency-bucket-{run_tag}");
+        let mut rate_handles = Vec::new();
+        for _ in 0..8 {
+            let s = store.clone();
+            let key = bucket_key.clone();
+            rate_handles.push(tokio::spawn(async move {
+                s.take_rate_limit_token(&key, 3.0, 0.0001)
+                    .await
+                    .expect("take_rate_limit_token must serialize cleanly")
+            }));
+        }
+        let mut rate_wins = 0usize;
+        for h in rate_handles {
+            if h.await.unwrap() {
+                rate_wins += 1;
+            }
+        }
+        assert_eq!(
+            rate_wins, 3,
+            "FOR UPDATE bucket must enforce exact capacity under concurrency"
+        );
+
+        // Clean up mutable operational rows (audit events are intentionally append-only).
+        let _ = sqlx::query("DELETE FROM gateway_login_challenges WHERE member_id = $1")
+            .bind(&member_id)
+            .execute(metadata.pool())
+            .await;
+        let _ = sqlx::query("DELETE FROM gateway_sessions WHERE member_id = $1")
+            .bind(&member_id)
+            .execute(metadata.pool())
+            .await;
+        let _ = sqlx::query("DELETE FROM gateway_used_access_nonces WHERE member_id = $1")
+            .bind(&member_id)
+            .execute(metadata.pool())
+            .await;
+        let _ = sqlx::query("DELETE FROM gateway_rate_buckets WHERE bucket_key = $1")
+            .bind(&bucket_key)
+            .execute(metadata.pool())
+            .await;
+    }
+
+    #[tokio::test]
+    async fn projection_listings_version_history_and_self_audited_queries_execute_on_postgres() {
+        let _guard = TEST_LOCK.lock().await;
+        let Ok(database_url) = std::env::var("DATABASE_URL") else {
+            eprintln!("Skipping gateway projection query PostgreSQL test: DATABASE_URL is not set");
+            return;
+        };
+        let metadata = PostgresStore::connect(&database_url)
+            .await
+            .expect("connect to PostgreSQL");
+        metadata.migrate().await.expect("apply migrations");
+        let pool = metadata.pool();
+        let store = GatewayStore::new(pool.clone());
+
+        let chain_id = 99_1337u64;
+        let org_id = format!("0x{}", "a1".repeat(32));
+        let alice = format!("0x{}", "b1".repeat(32));
+        let mallory = format!("0x{}", "b2".repeat(32));
+        let root_folder = format!("0x{}", "00".repeat(32));
+        let sub_folder = format!("0x{}", "c1".repeat(32));
+        let file_id = format!("0x{}", "d1".repeat(32));
+        let head_hash = format!("0x{}", "e2".repeat(32));
+        let block_hash = format!("0x{}", "f1".repeat(32));
+
+        sqlx::query(
+            "INSERT INTO indexer_checkpoints (chain_id, block_number, block_hash) \
+             VALUES ($1, 777, $2) ON CONFLICT (chain_id) DO UPDATE \
+             SET block_number = EXCLUDED.block_number, block_hash = EXCLUDED.block_hash",
+        )
+        .bind(chain_id as i64)
+        .bind(&block_hash)
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO folders_projection (folder_id, organization_id, parent_folder_id, display_name, updated_block_number) \
+             VALUES ($1, $2, $3, 'Finance', 770) ON CONFLICT (folder_id) DO UPDATE SET display_name = EXCLUDED.display_name",
+        )
+        .bind(&sub_folder)
+        .bind(&org_id)
+        .bind(&root_folder)
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO files_projection \
+             (file_id, organization_id, creator_member_id, display_name, parent_folder_id, file_status, current_version, current_head_manifest_hash, updated_block_number) \
+             VALUES ($1, $2, $3, 'ledger.pdf', $4, 1, 2, $5, 777) \
+             ON CONFLICT (file_id) DO UPDATE SET current_version = EXCLUDED.current_version",
+        )
+        .bind(&file_id)
+        .bind(&org_id)
+        .bind(&alice)
+        .bind(&root_folder)
+        .bind(&head_hash)
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO access_projection \
+             (file_id, member_id, permission, granted, actor, proposal_id, updated_block_number) \
+             VALUES ($1, $2, 0, TRUE, $3, $4, 771) \
+             ON CONFLICT (file_id, member_id, permission) DO UPDATE SET granted = TRUE",
+        )
+        .bind(&file_id)
+        .bind(&alice)
+        .bind(format!("0x{}", "12".repeat(20)))
+        .bind(&root_folder)
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO versions_projection \
+             (file_id, version_number, manifest_hash, parent_manifest_hash, epoch_id, author_member_id, author_signing_address, content_cid, initial_envelope_set_cid, transaction_hash, block_number) \
+             VALUES \
+             ($1, 1, $2, $3, $4, $5, $6, 'bafkreiaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaq', 'bafkreiafaucqkbifaucqkbifaucqkbifaucqkbifaucqkbifaucqkbifau', $7, 771), \
+             ($1, 2, $8, $2, $9, $5, $6, 'bafkreiafaucqkbifaucqkbifaucqkbifaucqkbifaucqkbifaucqkbifau', 'bafkreiambqgaydambqgaydambqgaydambqgaydambqgaydambqgaydambq', $7, 777) \
+             ON CONFLICT (file_id, version_number) DO NOTHING",
+        )
+        .bind(&file_id)
+        .bind(format!("0x{}", "e1".repeat(32)))
+        .bind(&root_folder)
+        .bind(format!("0x{}", "aa".repeat(32)))
+        .bind(&alice)
+        .bind(format!("0x{}", "12".repeat(20)))
+        .bind(format!("0x{}", "99".repeat(32)))
+        .bind(&head_hash)
+        .bind(format!("0x{}", "bb".repeat(32)))
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO envelope_sets_projection \
+             (file_id, version_number, epoch_id, envelope_set_cid, revision, updated_block_number) \
+             VALUES ($1, 1, $2, 'bafkreianbugq2dinbugq2dinbugq2dinbugq2dinbugq2dinbugq2dinbu', 2, 775) \
+             ON CONFLICT (file_id, version_number) DO UPDATE SET revision = 2, envelope_set_cid = EXCLUDED.envelope_set_cid",
+        )
+        .bind(&file_id)
+        .bind(format!("0x{}", "aa".repeat(32)))
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO historical_read_access_projection \
+             (file_id, version_number, member_id, granted, actor, proposal_id, updated_block_number) \
+             VALUES ($1, 1, $2, TRUE, $3, $4, 775) \
+             ON CONFLICT (file_id, version_number, member_id) DO UPDATE SET granted = TRUE",
+        )
+        .bind(&file_id)
+        .bind(&alice)
+        .bind(format!("0x{}", "12".repeat(20)))
+        .bind(&root_folder)
+        .execute(pool)
+        .await
+        .unwrap();
+
+        // Authorized reader sees folder + file; unauthorized member sees folder only (0 files).
+        let alice_list = store
+            .list_files_and_folders(chain_id, &alice, &org_id, &root_folder)
+            .await
+            .expect("alice file listing");
+        assert_eq!(alice_list.indexed_block, Some(777));
+        assert_eq!(alice_list.folders.len(), 1);
+        assert_eq!(alice_list.folders[0].display_name, "Finance");
+        assert_eq!(alice_list.files.len(), 1);
+        assert_eq!(alice_list.files[0].display_name, "ledger.pdf");
+
+        let mallory_list = store
+            .list_files_and_folders(chain_id, &mallory, &org_id, &root_folder)
+            .await
+            .expect("mallory file listing");
+        assert!(mallory_list.files.is_empty());
+
+        // Version history reflects updated envelope revision on V1 + historical_read_granted flag.
+        let history = store
+            .list_file_versions(chain_id, &file_id, &alice)
+            .await
+            .expect("version history query");
+        assert_eq!(history.versions.len(), 2);
+        assert_eq!(history.versions[0].version_number, 1);
+        assert_eq!(history.versions[0].envelope_revision, 2);
+        assert_eq!(
+            history.versions[0].current_envelope_set_cid,
+            "bafkreianbugq2dinbugq2dinbugq2dinbugq2dinbugq2dinbugq2dinbu"
+        );
+        assert!(history.versions[0].historical_read_granted);
+        assert_eq!(history.versions[1].version_number, 2);
+        assert_eq!(history.versions[1].envelope_revision, 1);
+        assert!(!history.versions[1].historical_read_granted);
+
+        // Self-audited query records its own `audit.query` entry and filters by member + action.
+        let audit_events = store
+            .query_member_audit_events(
+                &alice,
+                "proj-test-src",
+                chain_id,
+                777,
+                Some("audit.query"),
+                10,
+            )
+            .await
+            .expect("self-audited query");
+        assert!(!audit_events.is_empty());
+        assert_eq!(audit_events[0].record["action"], "audit.query");
+        assert_eq!(audit_events[0].record["actor_member_id"], alice);
+
+        // Clean up temporary projection fixture rows.
+        for sql in [
+            "DELETE FROM historical_read_access_projection WHERE file_id = $1",
+            "DELETE FROM envelope_sets_projection WHERE file_id = $1",
+            "DELETE FROM versions_projection WHERE file_id = $1",
+            "DELETE FROM access_projection WHERE file_id = $1",
+            "DELETE FROM files_projection WHERE file_id = $1",
+        ] {
+            let _ = sqlx::query(sql).bind(&file_id).execute(pool).await;
+        }
+        let _ = sqlx::query("DELETE FROM folders_projection WHERE folder_id = $1")
+            .bind(&sub_folder)
+            .execute(pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM indexer_checkpoints WHERE chain_id = $1")
+            .bind(chain_id as i64)
+            .execute(pool)
+            .await;
     }
 }

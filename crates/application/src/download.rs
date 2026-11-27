@@ -4,7 +4,9 @@ use crypto::{
     decrypt_private_metadata, raw_sha256_cid,
 };
 use domain::{AccessReference, DomainError, EvmAddress, FileId, ManifestHash, VersionNumber};
-use ports::{BlobStore, Clock, KeyCustodyProvider, LedgerPort, SignedAccessLookupRequest};
+use ports::{
+    BlobStore, Clock, CustodyError, KeyCustodyProvider, LedgerPort, SignedAccessLookupRequest,
+};
 use tokio::io::AsyncReadExt;
 use zeroize::Zeroizing;
 
@@ -18,6 +20,15 @@ pub struct DownloadConfig {
     pub chain_id: u64,
     pub access_governance: EvmAddress,
     pub operation_ttl_seconds: u64,
+}
+
+impl DownloadConfig {
+    pub fn validate(&self) -> Result<(), DomainError> {
+        if self.chain_id == 0 || self.operation_ttl_seconds == 0 {
+            return Err(DomainError::Internal);
+        }
+        Ok(())
+    }
 }
 
 /// Verified encrypted content package extracted from IPFS storage for local decryption.
@@ -67,6 +78,7 @@ where
         file_id: FileId,
         version_number: VersionNumber,
     ) -> Result<AccessReference, DomainError> {
+        self.config.validate()?;
         if file_id.as_bytes() == &[0; 32] {
             return Err(DomainError::InvalidIdentifier);
         }
@@ -137,6 +149,11 @@ where
             MAX_ENVELOPE_SET_BYTES,
         )
         .await?;
+        let actual_envelope_cid =
+            raw_sha256_cid(&envelope_bytes).map_err(|_| DomainError::IntegrityCheckFailed)?;
+        if actual_envelope_cid.to_string() != access.envelope_set_cid.to_string() {
+            return Err(DomainError::IntegrityCheckFailed);
+        }
         let envelope_set = KeyEnvelopeSet::parse_canonical(&envelope_bytes)
             .map_err(|_| DomainError::IntegrityCheckFailed)?;
         if envelope_set.file_id() != access.file_id
@@ -171,7 +188,7 @@ where
                 wrap_context,
             )
             .await
-            .map_err(|_| DomainError::IntegrityCheckFailed)?;
+            .map_err(map_unwrap_custody_error)?;
 
         let manifest = EncryptedFileManifest::parse_canonical(&package.manifest_bytes)
             .map_err(|_| DomainError::InvalidManifest)?;
@@ -184,6 +201,9 @@ where
         let manifest_hash = manifest
             .manifest_hash()
             .map_err(|_| DomainError::InvalidManifest)?;
+        if access.manifest_hash == ManifestHash::ZERO || manifest_hash != access.manifest_hash {
+            return Err(DomainError::IntegrityCheckFailed);
+        }
         if let Some(expected) = expected_manifest_hash
             && manifest_hash != expected
         {
@@ -260,6 +280,18 @@ where
 
 fn build_encrypted_chunk(index: u32, ciphertext_and_tag: Vec<u8>) -> EncryptedChunk {
     EncryptedChunk::from_parts(index, ciphertext_and_tag)
+}
+
+pub(crate) fn map_unwrap_custody_error(error: CustodyError) -> DomainError {
+    match error {
+        CustodyError::ProviderUnavailable | CustodyError::RandomnessUnavailable => {
+            DomainError::KeyCustodyUnavailable
+        }
+        CustodyError::UnwrapFailed
+        | CustodyError::KeyNotFound
+        | CustodyError::KeyGenerationFailed
+        | CustodyError::SigningFailed => DomainError::IntegrityCheckFailed,
+    }
 }
 
 pub(crate) async fn read_bounded(

@@ -21,6 +21,10 @@
 .env.*
 !.env.example
 
+# Local Ignition deployment parameters (never commit real Safe/network configs)
+ignition/*.local.json
+ignition/deployments/
+
 # Hardhat coverage reports
 /coverage
 

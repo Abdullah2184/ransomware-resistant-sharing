@@ -72,9 +72,28 @@ jobs:
       - name: Cache Cargo registry and build artifacts
         uses: Swatinem/rust-cache@v2
 
-      - name: Run live PostgreSQL integration tests
+      - name: Provision least-privilege roles and run migrations
         env:
-          DATABASE_URL: postgres://rrfs_ci:rrfs_ci_password@127.0.0.1:5432/rrfs_ci_test
+          PGPASSWORD: rrfs_ci_password
+        run: |
+          set -eu
+          psql -v ON_ERROR_STOP=1 -h 127.0.0.1 -U rrfs_ci -d rrfs_ci_test <<'SQL'
+            CREATE ROLE rrfs_migrator LOGIN PASSWORD 'rrfs_migrator_ci';
+            CREATE ROLE rrfs_indexer LOGIN PASSWORD 'rrfs_indexer_ci';
+            CREATE ROLE rrfs_gateway LOGIN PASSWORD 'rrfs_gateway_ci';
+            CREATE ROLE rrfs_audit_reader LOGIN PASSWORD 'rrfs_audit_ci';
+            GRANT USAGE, CREATE ON SCHEMA public TO rrfs_migrator;
+          SQL
+          DATABASE_URL=postgres://rrfs_migrator:rrfs_migrator_ci@127.0.0.1:5432/rrfs_ci_test \
+            cargo test -p metadata-store --locked --test postgres_connection migrates_metadata_schema
+          psql -v ON_ERROR_STOP=1 -h 127.0.0.1 -U rrfs_ci -d rrfs_ci_test -f infra/postgres/init-roles.sql
+
+      - name: Run live PostgreSQL integration & least-privilege RBAC tests
+        env:
+          DATABASE_URL: postgres://rrfs_migrator:rrfs_migrator_ci@127.0.0.1:5432/rrfs_ci_test
+          DATABASE_GATEWAY_URL: postgres://rrfs_gateway:rrfs_gateway_ci@127.0.0.1:5432/rrfs_ci_test
+          DATABASE_INDEXER_URL: postgres://rrfs_indexer:rrfs_indexer_ci@127.0.0.1:5432/rrfs_ci_test
+          DATABASE_AUDIT_READER_URL: postgres://rrfs_audit_reader:rrfs_audit_ci@127.0.0.1:5432/rrfs_ci_test
         run: cargo test -p metadata-store -p indexer -p gateway --locked
 
   contracts:

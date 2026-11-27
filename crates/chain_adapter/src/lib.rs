@@ -118,6 +118,7 @@ impl MemberIdentityState {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FileVersionState {
     pub content_cid: String,
+    pub manifest_hash: [u8; 32],
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -454,6 +455,28 @@ impl BesuClient {
         }))
     }
 
+    async fn eth_call_bool(
+        &self,
+        contract: &EvmAddress,
+        call_data: &[u8],
+        block_number: u64,
+    ) -> Result<bool, ChainError> {
+        let result: String = self
+            .rpc(
+                "eth_call",
+                json!([{
+                    "to": format_address(contract),
+                    "data": format!("0x{}", encode_hex(call_data)),
+                }, quantity(block_number)]),
+            )
+            .await?;
+        let result = decode_hex(&result)?;
+        if result.len() != 32 || result[..31].iter().any(|byte| *byte != 0) || result[31] > 1 {
+            return Err(ChainError::InvalidResponse);
+        }
+        Ok(result[31] == 1)
+    }
+
     pub async fn has_read_access(
         &self,
         access_governance: &EvmAddress,
@@ -466,20 +489,8 @@ impl BesuClient {
         call_data.extend_from_slice(&selector[..4]);
         call_data.extend_from_slice(member_id);
         call_data.extend_from_slice(file_id);
-        let result: String = self
-            .rpc(
-                "eth_call",
-                json!([{
-                    "to": format_address(access_governance),
-                    "data": format!("0x{}", encode_hex(&call_data)),
-                }, quantity(block_number)]),
-            )
-            .await?;
-        let result = decode_hex(&result)?;
-        if result.len() != 32 || result[..31].iter().any(|byte| *byte != 0) || result[31] > 1 {
-            return Err(ChainError::InvalidResponse);
-        }
-        Ok(result[31] == 1)
+        self.eth_call_bool(access_governance, &call_data, block_number)
+            .await
     }
 
     pub async fn has_write_access(
@@ -494,20 +505,8 @@ impl BesuClient {
         call_data.extend_from_slice(&selector[..4]);
         call_data.extend_from_slice(member_id);
         call_data.extend_from_slice(file_id);
-        let result: String = self
-            .rpc(
-                "eth_call",
-                json!([{
-                    "to": format_address(access_governance),
-                    "data": format!("0x{}", encode_hex(&call_data)),
-                }, quantity(block_number)]),
-            )
-            .await?;
-        let result = decode_hex(&result)?;
-        if result.len() != 32 || result[..31].iter().any(|byte| *byte != 0) || result[31] > 1 {
-            return Err(ChainError::InvalidResponse);
-        }
-        Ok(result[31] == 1)
+        self.eth_call_bool(access_governance, &call_data, block_number)
+            .await
     }
 
     pub async fn has_historical_read_access(
@@ -524,20 +523,8 @@ impl BesuClient {
         call_data.extend_from_slice(member_id);
         call_data.extend_from_slice(file_id);
         call_data.extend_from_slice(&abi_word_u64(version_number));
-        let result: String = self
-            .rpc(
-                "eth_call",
-                json!([{
-                    "to": format_address(access_governance),
-                    "data": format!("0x{}", encode_hex(&call_data)),
-                }, quantity(block_number)]),
-            )
-            .await?;
-        let result = decode_hex(&result)?;
-        if result.len() != 32 || result[..31].iter().any(|byte| *byte != 0) || result[31] > 1 {
-            return Err(ChainError::InvalidResponse);
-        }
-        Ok(result[31] == 1)
+        self.eth_call_bool(access_governance, &call_data, block_number)
+            .await
     }
 
     pub async fn file_version(
@@ -586,8 +573,13 @@ impl BesuClient {
         let content_cid = decode_abi_string(&encoded, tuple_offset, content_offset)?;
         let cid =
             domain::ContentCid::parse(&content_cid).map_err(|_| ChainError::InvalidResponse)?;
+        let manifest_hash = read_word_bytes32(&encoded, tuple_offset + 6 * 32)?;
+        if manifest_hash == [0; 32] {
+            return Err(ChainError::InvalidResponse);
+        }
         Ok(Some(FileVersionState {
             content_cid: cid.to_string(),
+            manifest_hash,
         }))
     }
 
@@ -901,6 +893,14 @@ fn validate_hash(value: &str) -> Result<(), ChainError> {
         return Err(ChainError::InvalidResponse);
     }
     Ok(())
+}
+
+fn read_word_bytes32(data: &[u8], offset: usize) -> Result<[u8; 32], ChainError> {
+    let end = offset.checked_add(32).ok_or(ChainError::InvalidResponse)?;
+    let word = data.get(offset..end).ok_or(ChainError::InvalidResponse)?;
+    let mut value = [0u8; 32];
+    value.copy_from_slice(word);
+    Ok(value)
 }
 
 fn read_word_u64(data: &[u8], offset: usize) -> Result<u64, ChainError> {
@@ -1335,6 +1335,230 @@ mod tests {
                 )
                 .await
                 .unwrap()
+        );
+        server.await.unwrap();
+    }
+
+    fn abi_encode_string(value: &str) -> Vec<u8> {
+        let bytes = value.as_bytes();
+        let padded_len = bytes.len().div_ceil(32) * 32;
+        let mut out = Vec::with_capacity(32 + padded_len);
+        out.extend_from_slice(&abi_word_u64(bytes.len() as u64));
+        out.extend_from_slice(bytes);
+        out.resize(32 + padded_len, 0);
+        out
+    }
+
+    async fn spawn_rpc_sequence(
+        responses: Vec<Value>,
+    ) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            for response_payload in responses {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 4096];
+                let body_start;
+                loop {
+                    let n = stream.read(&mut chunk).await.unwrap();
+                    buf.extend_from_slice(&chunk[..n]);
+                    if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                        body_start = pos + 4;
+                        break;
+                    }
+                }
+                let headers = String::from_utf8_lossy(&buf[..body_start]);
+                let content_length = headers
+                    .lines()
+                    .find_map(|line| {
+                        line.to_ascii_lowercase()
+                            .strip_prefix("content-length: ")
+                            .and_then(|v| v.trim().parse::<usize>().ok())
+                    })
+                    .unwrap_or(0);
+                while buf.len() < body_start + content_length {
+                    let n = stream.read(&mut chunk).await.unwrap();
+                    buf.extend_from_slice(&chunk[..n]);
+                }
+                let body = response_payload.to_string();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        (addr, handle)
+    }
+
+    #[tokio::test]
+    async fn queries_file_head_at_explicit_block_and_handles_unregistered_files() {
+        let mut active_words = Vec::new();
+        active_words.extend_from_slice(&abi_word_u64(32)); // tuple offset
+        active_words.extend_from_slice(&abi_word_u64(8 * 32)); // displayName offset
+        active_words.extend_from_slice(&[0u8; 32]); // parentFolderId
+        active_words.extend_from_slice(&[0x11; 32]); // creatorMemberId
+        active_words.extend_from_slice(&[0x22; 32]); // organizationId
+        active_words.extend_from_slice(&abi_word_u64(1_800_000_000)); // createdAt
+        active_words.extend_from_slice(&abi_word_u64(1)); // status = Active
+        active_words.extend_from_slice(&abi_word_u64(4)); // currentVersionNumber
+        active_words.extend_from_slice(&[0xab; 32]); // currentHeadManifestHash
+        active_words.extend_from_slice(&abi_encode_string("report.pdf"));
+
+        let mut unregistered_words = Vec::new();
+        unregistered_words.extend_from_slice(&abi_word_u64(32));
+        for _ in 0..8 {
+            unregistered_words.extend_from_slice(&[0u8; 32]);
+        }
+
+        let (addr, server) = spawn_rpc_sequence(vec![
+            json!({ "jsonrpc": "2.0", "id": 1, "result": format!("0x{}", encode_hex(&active_words)) }),
+            json!({ "jsonrpc": "2.0", "id": 2, "result": format!("0x{}", encode_hex(&unregistered_words)) }),
+        ])
+        .await;
+
+        let client = BesuClient::new(&format!("http://{addr}")).unwrap();
+        let registry = EvmAddress::from_bytes([0x10; 20]);
+        let head = client
+            .file_head_at(&registry, &[0x99; 32], 42)
+            .await
+            .unwrap()
+            .expect("active head");
+        assert_eq!(head.status, 1);
+        assert_eq!(head.version_number, 4);
+        assert_eq!(head.manifest_hash, format!("0x{}", "ab".repeat(32)));
+
+        assert_eq!(
+            client
+                .file_head_at(&registry, &[0x88; 32], 42)
+                .await
+                .unwrap(),
+            None
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn queries_read_access_and_rejects_malformed_boolean_words() {
+        let (addr, server) = spawn_rpc_sequence(vec![
+            json!({ "jsonrpc": "2.0", "id": 1, "result": format!("0x{:064x}", 1) }),
+            json!({ "jsonrpc": "2.0", "id": 2, "result": format!("0x{:064x}", 0) }),
+            json!({ "jsonrpc": "2.0", "id": 3, "result": format!("0x{:064x}", 2) }),
+        ])
+        .await;
+
+        let client = BesuClient::new(&format!("http://{addr}")).unwrap();
+        let gov = EvmAddress::from_bytes([0x20; 20]);
+        assert!(
+            client
+                .has_read_access(&gov, &[1; 32], &[2; 32], 12)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !client
+                .has_read_access(&gov, &[1; 32], &[2; 32], 12)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            client.has_read_access(&gov, &[1; 32], &[2; 32], 12).await,
+            Err(ChainError::InvalidResponse)
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn queries_file_version_and_handles_missing_or_mismatched_versions() {
+        let content_cid = "bafkreiewgvgk44czrxzm3u42r3ypxj76o6uebclaabcq7wsnlgaotpvcx4";
+        let build_version_tuple = |returned_version: u64| {
+            let mut out = Vec::new();
+            out.extend_from_slice(&abi_word_u64(32)); // tuple offset
+            out.extend_from_slice(&[0x77; 32]); // fileId
+            out.extend_from_slice(&abi_word_u64(returned_version)); // versionNumber
+            out.extend_from_slice(&[0u8; 32]); // parentManifestHash
+            out.extend_from_slice(&abi_word_u64(9 * 32)); // contentCid offset within tuple
+            out.extend_from_slice(&abi_word_u64(12 * 32)); // initialEnvelopeSetCid offset
+            out.extend_from_slice(&[0x33; 32]); // epochId
+            out.extend_from_slice(&[0x44; 32]); // manifestHash
+            out.extend_from_slice(&[0x55; 32]); // authorMemberId
+            out.extend_from_slice(&[0x66; 32]); // authorSigningAddress
+            out.extend_from_slice(&abi_encode_string(content_cid));
+            out
+        };
+
+        let (addr, server) = spawn_rpc_sequence(vec![
+            json!({ "jsonrpc": "2.0", "id": 1, "result": format!("0x{}", encode_hex(&build_version_tuple(3))) }),
+            json!({ "jsonrpc": "2.0", "id": 2, "error": { "code": -32000, "message": "execution reverted" } }),
+            json!({ "jsonrpc": "2.0", "id": 3, "result": format!("0x{}", encode_hex(&build_version_tuple(99))) }),
+        ])
+        .await;
+
+        let client = BesuClient::new(&format!("http://{addr}")).unwrap();
+        let registry = EvmAddress::from_bytes([0x10; 20]);
+        let found = client
+            .file_version(&registry, &[0x77; 32], 3, 20)
+            .await
+            .unwrap()
+            .expect("version 3");
+        assert_eq!(found.content_cid, content_cid);
+        assert_eq!(found.manifest_hash, [0x44; 32]);
+        assert_eq!(
+            client
+                .file_version(&registry, &[0x77; 32], 4, 20)
+                .await
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            client.file_version(&registry, &[0x77; 32], 3, 20).await,
+            Err(ChainError::InvalidResponse)
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn queries_current_envelope_set_and_rejects_zero_revision() {
+        let envelope_cid = "bafkreiewgvgk44czrxzm3u42r3ypxj76o6uebclaabcq7wsnlgaotpvcx4";
+        let build_envelope_return = |revision: u64| {
+            let mut out = Vec::new();
+            out.extend_from_slice(&abi_word_u64(96)); // string offset
+            out.extend_from_slice(&[0xee; 32]); // epochId
+            out.extend_from_slice(&abi_word_u64(revision)); // revision
+            out.extend_from_slice(&abi_encode_string(envelope_cid));
+            out
+        };
+
+        let (addr, server) = spawn_rpc_sequence(vec![
+            json!({ "jsonrpc": "2.0", "id": 1, "result": format!("0x{}", encode_hex(&build_envelope_return(2))) }),
+            json!({ "jsonrpc": "2.0", "id": 2, "error": { "code": -32000, "message": "execution reverted" } }),
+            json!({ "jsonrpc": "2.0", "id": 3, "result": format!("0x{}", encode_hex(&build_envelope_return(0))) }),
+        ])
+        .await;
+
+        let client = BesuClient::new(&format!("http://{addr}")).unwrap();
+        let gov = EvmAddress::from_bytes([0x20; 20]);
+        let env = client
+            .current_envelope_set(&gov, &[0x77; 32], 1, 25)
+            .await
+            .unwrap()
+            .expect("envelope set");
+        assert_eq!(env.cid, envelope_cid);
+        assert_eq!(env.epoch_id, [0xee; 32]);
+        assert_eq!(env.revision, 2);
+
+        assert_eq!(
+            client
+                .current_envelope_set(&gov, &[0x77; 32], 2, 25)
+                .await
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            client.current_envelope_set(&gov, &[0x77; 32], 1, 25).await,
+            Err(ChainError::InvalidResponse)
         );
         server.await.unwrap();
     }

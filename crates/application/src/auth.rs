@@ -2,6 +2,13 @@ use crypto::{ChainId, Eip712Domain, LoginChallengeDigestInput};
 use domain::{DomainError, EvmAddress};
 use ports::{AuthenticatedSession, Clock, GatewayAuthPort, KeyCustodyProvider};
 
+/// Bounded clock-skew tolerance for `challenge.issued_at` (seconds).
+///
+/// Permits up to 5 seconds of routine NTP drift between endpoint and gateway
+/// clocks while still strictly requiring `challenge.expires_at > now` and
+/// bounding total challenge lifetime to `max_challenge_ttl_seconds`.
+pub const MAX_CHALLENGE_CLOCK_SKEW_SECONDS: u64 = 5;
+
 /// Configuration for authenticating an endpoint session against a gateway.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AuthConfig {
@@ -9,6 +16,20 @@ pub struct AuthConfig {
     pub access_governance: EvmAddress,
     pub expected_audience: String,
     pub max_challenge_ttl_seconds: u64,
+}
+
+impl AuthConfig {
+    pub fn validate(&self) -> Result<(), DomainError> {
+        if self.chain_id == 0
+            || self.expected_audience.is_empty()
+            || self.expected_audience.len() > 512
+            || self.expected_audience.chars().any(char::is_control)
+            || self.max_challenge_ttl_seconds == 0
+        {
+            return Err(DomainError::Internal);
+        }
+        Ok(())
+    }
 }
 
 /// Orchestrates EIP-712 challenge-response login using key custody.
@@ -36,6 +57,7 @@ where
 
     /// Runs the one-time EIP-712 login challenge flow and returns a short-lived session.
     pub async fn login(&self) -> Result<AuthenticatedSession, DomainError> {
+        self.config.validate()?;
         let identity = self
             .custody
             .public_identity()
@@ -48,7 +70,8 @@ where
             || challenge.audience != self.config.expected_audience
             || challenge.protocol_version != 1
             || challenge.issued_at == 0
-            || challenge.issued_at > now
+            || challenge.issued_at > now.saturating_add(MAX_CHALLENGE_CLOCK_SKEW_SECONDS)
+            || challenge.expires_at <= challenge.issued_at
             || challenge.expires_at <= now
             || challenge.expires_at.saturating_sub(challenge.issued_at)
                 > self.config.max_challenge_ttl_seconds

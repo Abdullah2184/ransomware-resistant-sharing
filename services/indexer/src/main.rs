@@ -4,7 +4,7 @@ use std::{collections::BTreeMap, env, error::Error, fmt, time::Duration};
 
 use chain_adapter::{BesuClient, ChainError, ChainLog, FileHeadState, FinalizedBlock};
 use domain::EvmAddress;
-use metadata_store::PostgresStore;
+use metadata_store::{MigrationMode, PostgresPoolConfig, PostgresStore};
 use serde_json::Value;
 use sqlx::{AssertSqlSafe, PgPool, Row};
 use tokio::{signal, sync::Mutex, time};
@@ -271,14 +271,18 @@ async fn run() -> Result<(), IndexerError> {
     let config = Config::from_env()?;
     let rpc_endpoint = env::var("BESU_RPC_URL").map_err(|_| IndexerError::InvalidConfiguration)?;
     let database_url = env::var("DATABASE_URL").map_err(|_| IndexerError::InvalidConfiguration)?;
+    let pool_config =
+        PostgresPoolConfig::from_env().map_err(|_| IndexerError::InvalidConfiguration)?;
+    let migration_mode =
+        MigrationMode::from_env().map_err(|_| IndexerError::InvalidConfiguration)?;
     let client = BesuClient::new(&rpc_endpoint).map_err(IndexerError::Chain)?;
-    let database = PostgresStore::connect(&database_url)
+    let database = PostgresStore::connect_with_config(&database_url, pool_config)
         .await
         .map_err(|_| IndexerError::Database)?;
     database
-        .migrate()
+        .apply_migration_mode(migration_mode)
         .await
-        .map_err(|_| IndexerError::Database)?;
+        .map_err(|error| IndexerError::DatabaseCause(error.to_string()))?;
 
     let indexer = Indexer {
         config,
@@ -1585,5 +1589,128 @@ mod tests {
             .rollback()
             .await
             .expect("rollback identity test data");
+    }
+
+    #[tokio::test]
+    async fn read_revocation_invalidates_historical_grants_and_reindex_reset_clears_state() {
+        let _guard = TEST_LOCK.lock().await;
+        let Some((pool, mut transaction)) = integration_transaction().await else {
+            return;
+        };
+
+        let file_id = format!("0x{}", "88".repeat(32));
+        let member_id = format!("0x{}", "77".repeat(32));
+        let actor_topic = format!("0x{}{}", "00".repeat(12), "aa".repeat(20));
+        let actor_word = format!("{}{}", "00".repeat(12), "aa".repeat(20));
+        let proposal_word = "99".repeat(32);
+
+        let grant_read = log(
+            "ReadAccessGranted(bytes32,bytes32,address,bytes32)",
+            &[
+                topic_word(&file_id[2..]),
+                topic_word(&member_id[2..]),
+                actor_topic.clone(),
+            ],
+            &format!("0x{proposal_word}"),
+            30,
+            0,
+        );
+        let grant_hist = log(
+            "HistoricalReadAccessGranted(bytes32,uint64,bytes32,address,bytes32)",
+            &[
+                topic_word(&file_id[2..]),
+                topic_word(&word(1)),
+                topic_word(&member_id[2..]),
+            ],
+            &format!("0x{actor_word}{proposal_word}"),
+            30,
+            1,
+        );
+        let hashes = BTreeMap::from([
+            (30, format!("0x{}", "22".repeat(32))),
+            (31, format!("0x{}", "22".repeat(32))),
+        ]);
+        apply_range_in_transaction(
+            &mut transaction,
+            TEST_CHAIN_ID,
+            30,
+            &hashes,
+            &[grant_read, grant_hist],
+        )
+        .await
+        .expect("grant file read and historical read");
+
+        let granted_before: bool = sqlx::query_scalar(
+            "SELECT granted FROM historical_read_access_projection \
+             WHERE file_id = $1 AND version_number = 1 AND member_id = $2",
+        )
+        .bind(&file_id)
+        .bind(&member_id)
+        .fetch_one(&mut *transaction)
+        .await
+        .expect("read active historical grant");
+        assert!(granted_before);
+
+        // Revoking file-level Read MUST invalidate historical_read_access_projection.
+        let revoke_read = log(
+            "ReadAccessRevoked(bytes32,bytes32,address,bytes32)",
+            &[
+                topic_word(&file_id[2..]),
+                topic_word(&member_id[2..]),
+                actor_topic,
+            ],
+            &format!("0x{proposal_word}"),
+            31,
+            0,
+        );
+        apply_range_in_transaction(&mut transaction, TEST_CHAIN_ID, 31, &hashes, &[revoke_read])
+            .await
+            .expect("revoke file read");
+
+        let granted_after: bool = sqlx::query_scalar(
+            "SELECT granted FROM historical_read_access_projection \
+             WHERE file_id = $1 AND version_number = 1 AND member_id = $2",
+        )
+        .bind(&file_id)
+        .bind(&member_id)
+        .fetch_one(&mut *transaction)
+        .await
+        .expect("read invalidated historical grant");
+        assert!(
+            !granted_after,
+            "ReadAccessRevoked must invalidate prior version-scoped historical read grants"
+        );
+
+        // --reindex-from-chain reset must clear checkpoints, events, and all projection tables.
+        reset_indexed_chain_in_transaction(&mut transaction, TEST_CHAIN_ID)
+            .await
+            .expect("reset indexed chain");
+        let events_left: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM indexed_contract_events WHERE chain_id = $1")
+                .bind(TEST_CHAIN_ID as i64)
+                .fetch_one(&mut *transaction)
+                .await
+                .unwrap();
+        let checkpoint_left: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM indexer_checkpoints WHERE chain_id = $1")
+                .bind(TEST_CHAIN_ID as i64)
+                .fetch_one(&mut *transaction)
+                .await
+                .unwrap();
+        let hist_left: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM historical_read_access_projection")
+                .fetch_one(&mut *transaction)
+                .await
+                .unwrap();
+        assert_eq!((events_left, checkpoint_left, hist_left), (0, 0, 0));
+
+        // Reconcile rejects missing on-chain file head (None -> ChainMismatch).
+        let missing_err = reconcile_head(&pool, &[0x88; 32], None, 31).await;
+        assert!(matches!(missing_err, Err(IndexerError::ChainMismatch)));
+
+        transaction
+            .rollback()
+            .await
+            .expect("rollback revocation/reset test");
     }
 }

@@ -12,6 +12,7 @@ domain = { path = "../../crates/domain" }
 key-custody = { path = "../../crates/key_custody" }
 ports = { path = "../../crates/ports" }
 reqwest.workspace = true
+scanner = { path = "../../crates/scanner" }
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true

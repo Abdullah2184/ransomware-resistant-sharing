@@ -1,11 +1,11 @@
-use std::{collections::BTreeMap, error::Error, fmt, io::Cursor};
+use std::{collections::BTreeMap, error::Error, fmt, io::Cursor, sync::Arc};
 
 use crypto::{
-    ChainId, ChunkEncryptor, DEFAULT_CHUNK_SIZE_BYTES, DataEncryptionKey, Eip712Domain,
-    EncryptedChunkRef, EncryptedFileManifest, EncryptionContext, HpkeRecipientPublicKey,
-    KeyEnvelope, KeyEnvelopeEntry, KeyEnvelopeSet, MAX_ENVELOPE_SET_ENTRIES, NoncePrefix,
-    UnixDeadline, VersionAppend, WrapContext, chunk_count_for_len, encrypt_private_metadata,
-    raw_sha256_cid,
+    ChainId, ChunkEncryptor, CryptoError, DEFAULT_CHUNK_SIZE_BYTES, DataEncryptionKey,
+    Eip712Domain, EncryptedChunkRef, EncryptedFileManifest, EncryptionContext,
+    HpkeRecipientPublicKey, KeyEnvelope, KeyEnvelopeEntry, KeyEnvelopeSet,
+    MAX_ENVELOPE_SET_ENTRIES, NoncePrefix, UnixDeadline, VersionAppend, WrapContext,
+    chunk_count_for_len, encrypt_private_metadata, raw_sha256_cid,
 };
 use domain::{
     ContentCid, DomainError, EnvelopeSetCid, EpochId, EvmAddress, FileId, FileStatus, FolderId,
@@ -14,8 +14,8 @@ use domain::{
 };
 use ports::{
     BlobStore, Clock, ContentChunk, ContentPackage, KeyCustodyProvider, LedgerPort,
-    ReplicationReceipt, SignedAppendVersionRequest, SignedCreateFileRequest, StorageError,
-    StorageReader,
+    PreUploadScanner, ReplicationReceipt, ScanVerdict, SignedAppendVersionRequest,
+    SignedCreateFileRequest, StorageError, StorageReader,
 };
 
 /// Configuration for client-side encryption, pinning, and version submission.
@@ -57,6 +57,7 @@ pub struct UploadReceipt {
     pub content_replication: ReplicationReceipt,
     pub envelope_replication: ReplicationReceipt,
     pub transaction: TransactionReceipt,
+    pub scan_warning: Option<String>,
 }
 
 /// Orphaned storage references returned when pinning succeeded but ledger commit failed.
@@ -71,6 +72,7 @@ pub struct OrphanedUploadDetails {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum UploadError {
     Domain(DomainError),
+    BlockedByScanner { reason: String },
     OrphanedUpload(Box<OrphanedUploadDetails>),
 }
 
@@ -78,6 +80,7 @@ impl UploadError {
     pub const fn domain_error(&self) -> DomainError {
         match self {
             Self::Domain(error) => *error,
+            Self::BlockedByScanner { .. } => DomainError::Unauthorized,
             Self::OrphanedUpload(_) => DomainError::OrphanedUpload,
         }
     }
@@ -87,6 +90,9 @@ impl fmt::Display for UploadError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Domain(error) => error.fmt(formatter),
+            Self::BlockedByScanner { reason } => {
+                write!(formatter, "upload blocked by pre-upload scanner: {reason}")
+            }
             Self::OrphanedUpload(details) => {
                 write!(
                     formatter,
@@ -113,6 +119,7 @@ pub struct UploadService<K, B, L, C> {
     ledger: L,
     clock: C,
     config: UploadConfig,
+    scanner: Option<Arc<dyn PreUploadScanner>>,
 }
 
 impl<K, B, L, C> UploadService<K, B, L, C>
@@ -129,6 +136,30 @@ where
             ledger,
             clock,
             config,
+            scanner: None,
+        }
+    }
+
+    /// Attaches an optional endpoint-local pre-upload plaintext scanner.
+    ///
+    /// Runs strictly on the client before encryption; disabled by default.
+    pub fn with_scanner(mut self, scanner: Arc<dyn PreUploadScanner>) -> Self {
+        self.scanner = Some(scanner);
+        self
+    }
+
+    async fn run_pre_upload_scan(
+        &self,
+        label: &str,
+        plaintext: &[u8],
+    ) -> Result<Option<String>, UploadError> {
+        let Some(scanner) = &self.scanner else {
+            return Ok(None);
+        };
+        match scanner.evaluate(label, plaintext).await? {
+            ScanVerdict::Allow => Ok(None),
+            ScanVerdict::AllowWithWarning { reason } => Ok(Some(reason)),
+            ScanVerdict::Block { reason } => Err(UploadError::BlockedByScanner { reason }),
         }
     }
 
@@ -144,9 +175,13 @@ where
         reader_member_ids: &[MemberId],
     ) -> Result<UploadReceipt, UploadError> {
         self.config.validate()?;
-        if display_name.is_empty() || display_name.chars().any(char::is_control) {
+        if display_name.is_empty()
+            || display_name.len() > 255
+            || display_name.chars().any(char::is_control)
+        {
             return Err(DomainError::InvalidManifest.into());
         }
+        let scan_warning = self.run_pre_upload_scan(&display_name, plaintext).await?;
         let file_id = match file_id {
             Some(id) if id.as_bytes() != &[0; 32] => id,
             Some(_) => return Err(DomainError::InvalidIdentifier.into()),
@@ -238,6 +273,7 @@ where
             content_replication: prepared.content_replication,
             envelope_replication: prepared.envelope_replication,
             transaction,
+            scan_warning,
         })
     }
 
@@ -255,6 +291,8 @@ where
         if file_id.as_bytes() == &[0; 32] {
             return Err(DomainError::InvalidIdentifier.into());
         }
+        let scan_label = file_id.to_string();
+        let scan_warning = self.run_pre_upload_scan(&scan_label, plaintext).await?;
         let head = self
             .ledger
             .get_file_head(file_id)
@@ -355,6 +393,7 @@ where
             content_replication: prepared.content_replication,
             envelope_replication: prepared.envelope_replication,
             transaction,
+            scan_warning,
         })
     }
 
@@ -433,7 +472,10 @@ where
                 encrypt_private_metadata(&dek, nonce_prefix, context, total_chunks, metadata)
             })
             .transpose()
-            .map_err(|_| DomainError::Internal)?;
+            .map_err(|err| match err {
+                CryptoError::InvalidManifest => DomainError::InvalidManifest,
+                _ => DomainError::Internal,
+            })?;
 
         let mut entries = Vec::with_capacity(recipients.len());
         for recipient in recipients {

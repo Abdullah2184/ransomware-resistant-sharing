@@ -38,6 +38,14 @@ append-only audit records before a successful login is returned.
 6. Challenge/session JSON is capped at 8 KiB and parsed with bounded error
    responses. Authentication endpoints apply source-address limits before
    body parsing; malformed JSON failures are included in the auth audit.
+7. Client endpoints (`application::AuthService`) allow a bounded clock-skew
+   tolerance of `MAX_CHALLENGE_CLOCK_SKEW_SECONDS = 5` seconds on
+   `challenge.issued_at` (`issued_at <= now + 5`) so routine NTP drift between
+   user workstations and the gateway does not cause spurious login failures,
+   while still strictly enforcing `challenge.expires_at > now`,
+   `challenge.expires_at > challenge.issued_at`,
+   `challenge.expires_at - challenge.issued_at <= max_challenge_ttl_seconds`,
+   and `session.expires_at > now`.
 
 ## Consequences and limitations
 

@@ -2,7 +2,7 @@
 
 This document summarizes the engineering rationale behind the RRDS technology
 stack, cryptographic choices, and architectural trade-offs defined in
-[`TECHNICAL_SPECIFICATION.md`](../../TECHNICAL_SPECIFICATION.md) and the
+[`TECHNICAL_SPECIFICATION.md`](../specifications/TECHNICAL_SPECIFICATION.md) and the
 detailed ADRs in [`docs/adr/`](../adr/).
 
 ## 1. Language and Toolchain Choices

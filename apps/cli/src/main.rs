@@ -2,9 +2,15 @@ mod car;
 mod gateway_client;
 
 use std::{
-    env, fs,
+    env,
+    fs::{self, OpenOptions},
+    io::{Read, Write},
     path::{Path, PathBuf},
     process::ExitCode,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 use application::{
@@ -16,6 +22,10 @@ use domain::{EvmAddress, FileId, FolderId, KeyVersion, MemberId, ProposalId, Ver
 use gateway_client::{GatewayHttpClient, encode_hex, parse_hex_20, parse_hex_32};
 use key_custody::{CustodyStartupPolicy, DevelopmentKeyCustody, verify_provider_policy};
 use ports::{KeyCustodyProvider, LedgerPort, SystemClock};
+use scanner::DisabledScanner;
+use zeroize::Zeroizing;
+
+static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 const DEFAULT_GATEWAY_URL: &str = "http://127.0.0.1:8080";
 const DEFAULT_CHAIN_ID: u64 = 1337;
@@ -47,6 +57,7 @@ async fn run(args: Vec<String>) -> Result<(), String> {
         }
         "health" => cmd_health(rest).await,
         "login" => cmd_login(rest).await,
+        "logout" => cmd_logout(rest).await,
         "whoami" => cmd_whoami(rest).await,
         "identity" => cmd_identity(rest).await,
         "ls" => cmd_ls(rest).await,
@@ -63,6 +74,7 @@ async fn run(args: Vec<String>) -> Result<(), String> {
 
 struct CliEnvConfig {
     gateway_url: String,
+    allow_insecure_http: bool,
     chain_id: u64,
     access_governance: Option<EvmAddress>,
     file_registry: Option<EvmAddress>,
@@ -75,6 +87,9 @@ impl CliEnvConfig {
     fn from_env() -> Result<Self, String> {
         let gateway_url =
             env::var("GATEWAY_URL").unwrap_or_else(|_| DEFAULT_GATEWAY_URL.to_owned());
+        let allow_insecure_http = env::var("RRDS_ALLOW_INSECURE_HTTP")
+            .map(|v| v == "true")
+            .unwrap_or(false);
         let chain_id = env::var("BESU_CHAIN_ID")
             .ok()
             .map(|v| {
@@ -83,6 +98,9 @@ impl CliEnvConfig {
             })
             .transpose()?
             .unwrap_or(DEFAULT_CHAIN_ID);
+        if chain_id == 0 {
+            return Err("BESU_CHAIN_ID must be a positive integer".into());
+        }
         let access_governance = env::var("CONTRACT_ACCESS_GOVERNANCE_ADDRESS")
             .ok()
             .filter(|v| !v.is_empty())
@@ -110,12 +128,22 @@ impl CliEnvConfig {
             })
             .transpose()?
             .unwrap_or(DEFAULT_MIN_PIN_REPLICAS);
+        if min_pin_replicas == 0 {
+            return Err("MIN_PIN_REPLICAS must be a positive integer".into());
+        }
+        let scanner_mode = env::var("RRDS_SCANNER_MODE").unwrap_or_else(|_| "disabled".to_owned());
+        if !scanner_mode.eq_ignore_ascii_case("disabled") {
+            return Err(format!(
+                "RRDS_SCANNER_MODE `{scanner_mode}` requires an active scanner adapter (only `disabled` is available in the MVP)"
+            ));
+        }
         let session_file = env::var("RRDS_SESSION_FILE")
             .ok()
             .filter(|v| !v.is_empty())
             .map(PathBuf::from);
         Ok(Self {
             gateway_url,
+            allow_insecure_http,
             chain_id,
             access_governance,
             file_registry,
@@ -123,6 +151,13 @@ impl CliEnvConfig {
             min_pin_replicas,
             session_file,
         })
+    }
+
+    fn gateway_client(&self) -> Result<GatewayHttpClient, String> {
+        GatewayHttpClient::new_with_insecure_http_opt_in(
+            &self.gateway_url,
+            self.allow_insecure_http,
+        )
     }
 
     fn require_access_governance(&self) -> Result<EvmAddress, String> {
@@ -204,24 +239,152 @@ fn load_bearer_token(config: &CliEnvConfig) -> Result<String, String> {
 }
 
 fn write_session_file(path: &Path, token: &str) -> Result<(), String> {
-    fs::write(path, format!("{token}\n"))
-        .map_err(|_| format!("could not write session file {}", path.display()))?;
+    write_file_atomic_restricted(path, format!("{token}\n").as_bytes())
+        .map_err(|_| format!("could not write session file {}", path.display()))
+}
+
+/// Validates that `path` is a regular file (rejecting symlinks, directories,
+/// and special files) and reads at most `max_bytes` into a zeroizing buffer
+/// (`TECHNICAL_SPECIFICATION.md` §9.2 #1).
+fn read_regular_file_bounded(path: &Path, max_bytes: u64) -> Result<Zeroizing<Vec<u8>>, String> {
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|_| format!("could not inspect input file `{}`", path.display()))?;
+    if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+        return Err(format!(
+            "input path `{}` must be a regular file (symlinks and directories are rejected)",
+            path.display()
+        ));
+    }
+    if metadata.len() > max_bytes {
+        return Err(format!(
+            "input file `{}` exceeds maximum allowed size ({max_bytes} bytes)",
+            path.display()
+        ));
+    }
+    let file = fs::File::open(path)
+        .map_err(|_| format!("could not open input file `{}`", path.display()))?;
+    let mut bytes = Zeroizing::new(Vec::with_capacity(
+        usize::try_from(metadata.len()).unwrap_or(0),
+    ));
+    file.take(max_bytes.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|_| format!("could not read input file `{}`", path.display()))?;
+    if bytes.len() as u64 > max_bytes {
+        return Err(format!(
+            "input file `{}` exceeds maximum allowed size ({max_bytes} bytes)",
+            path.display()
+        ));
+    }
+    Ok(bytes)
+}
+
+/// Writes `bytes` to a `0600` temporary file in the destination's directory,
+/// calls `sync_all()` (`fsync`), and atomically renames it into `path`
+/// (`TECHNICAL_SPECIFICATION.md` §9.3 #7).
+fn write_file_atomic_restricted(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| format!("invalid output path `{}`", path.display()))?;
+    let seq = TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let temp_path = parent.join(format!(
+        ".{file_name}.rrds.tmp.{}.{seq}",
+        std::process::id()
+    ));
+
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o600))
-            .map_err(|_| format!("could not restrict permissions on {}", path.display()))?;
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
     }
+
+    let write_result = (|| -> std::io::Result<()> {
+        let mut file = options.open(&temp_path)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        drop(file);
+        fs::rename(&temp_path, path)?;
+        Ok(())
+    })();
+
+    if write_result.is_err() {
+        let _ = fs::remove_file(&temp_path);
+    }
+    write_result.map_err(|_| format!("could not atomically write `{}`", path.display()))
+}
+
+fn build_upload_service<K: KeyCustodyProvider>(
+    custody: K,
+    gateway: GatewayHttpClient,
+    config: &CliEnvConfig,
+    file_registry: EvmAddress,
+) -> UploadService<K, GatewayHttpClient, GatewayHttpClient, SystemClock> {
+    UploadService::new(
+        custody,
+        gateway.clone(),
+        gateway,
+        SystemClock,
+        UploadConfig {
+            chain_id: config.chain_id,
+            file_registry,
+            min_pin_replicas: config.min_pin_replicas,
+            chunk_size_bytes: DEFAULT_CHUNK_SIZE_BYTES,
+            max_file_bytes: DEFAULT_MAX_FILE_BYTES,
+            operation_ttl_seconds: DEFAULT_OPERATION_TTL_SECONDS,
+        },
+    )
+    .with_scanner(Arc::new(DisabledScanner))
+}
+
+async fn cmd_logout(args: &[String]) -> Result<(), String> {
+    let config = CliEnvConfig::from_env()?;
+    let mut session_file = config.session_file.clone();
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--session-file" => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or("usage: rrds logout [--session-file <path>]")?;
+                session_file = Some(PathBuf::from(value));
+                index += 2;
+            }
+            _ => return Err("usage: rrds logout [--session-file <path>]".into()),
+        }
+    }
+    let effective_config = CliEnvConfig {
+        session_file: session_file.clone(),
+        ..config
+    };
+    let gateway = effective_config.gateway_client()?;
+    gateway.set_bearer_token(load_bearer_token(&effective_config)?);
+    gateway.logout().await.map_err(|e| e.to_string())?;
+    if let Some(path) = &session_file
+        && path.exists()
+    {
+        fs::remove_file(path)
+            .map_err(|_| format!("session revoked, but could not remove {}", path.display()))?;
+    }
+    println!("session revoked");
     Ok(())
 }
 
 async fn cmd_health(args: &[String]) -> Result<(), String> {
+    let allow_insecure_http = env::var("RRDS_ALLOW_INSECURE_HTTP")
+        .map(|v| v == "true")
+        .unwrap_or(false);
     let base_url = match args {
         [] => env::var("GATEWAY_URL").unwrap_or_else(|_| DEFAULT_GATEWAY_URL.into()),
         [url] => url.clone(),
         _ => return Err("usage: rrds health [gateway-url]".into()),
     };
-    let client = GatewayHttpClient::new(&base_url)?;
+    let client = GatewayHttpClient::new_with_insecure_http_opt_in(&base_url, allow_insecure_http)?;
     let status = client.check_health().await?;
     if status.is_success() {
         println!("gateway healthy ({status})");
@@ -234,22 +397,33 @@ async fn cmd_health(args: &[String]) -> Result<(), String> {
 async fn cmd_login(args: &[String]) -> Result<(), String> {
     let config = CliEnvConfig::from_env()?;
     let mut session_file = config.session_file.clone();
+    let mut print_token = false;
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
             "--session-file" => {
                 let value = args
                     .get(index + 1)
-                    .ok_or("usage: rrds login [--session-file <path>]")?;
+                    .ok_or("usage: rrds login [--session-file <path>] [--print-token]")?;
                 session_file = Some(PathBuf::from(value));
                 index += 2;
             }
-            _ => return Err("usage: rrds login [--session-file <path>]".into()),
+            "--print-token" => {
+                print_token = true;
+                index += 1;
+            }
+            _ => return Err("usage: rrds login [--session-file <path>] [--print-token]".into()),
         }
+    }
+    if session_file.is_none() && !print_token {
+        return Err(
+            "pass --session-file <path> (or set RRDS_SESSION_FILE) to save the session token with mode 0600, or pass --print-token to explicitly print it to stdout"
+                .into(),
+        );
     }
     let access_governance = config.require_access_governance()?;
     let custody = load_custody_from_env().await?;
-    let gateway = GatewayHttpClient::new(&config.gateway_url)?;
+    let gateway = config.gateway_client()?;
     let auth = AuthService::new(
         custody,
         gateway,
@@ -269,7 +443,8 @@ async fn cmd_login(args: &[String]) -> Result<(), String> {
     if let Some(path) = session_file {
         write_session_file(&path, session.bearer_token())?;
         println!("session saved to {} (mode 0600)", path.display());
-    } else {
+    }
+    if print_token {
         println!("sessionToken={}", session.bearer_token());
     }
     Ok(())
@@ -280,7 +455,7 @@ async fn cmd_whoami(args: &[String]) -> Result<(), String> {
         return Err("usage: rrds whoami".into());
     }
     let config = CliEnvConfig::from_env()?;
-    let gateway = GatewayHttpClient::new(&config.gateway_url)?;
+    let gateway = config.gateway_client()?;
     gateway.set_bearer_token(load_bearer_token(&config)?);
     let member_id = gateway.whoami().await.map_err(|e| e.to_string())?;
     println!("memberId={member_id}");
@@ -295,7 +470,7 @@ async fn cmd_identity(args: &[String]) -> Result<(), String> {
         parse_hex_32(raw_member_id).map_err(|_| "invalid member ID (expected 0x + 64 hex)")?,
     );
     let config = CliEnvConfig::from_env()?;
-    let gateway = GatewayHttpClient::new(&config.gateway_url)?;
+    let gateway = config.gateway_client()?;
     let Some(identity) = gateway
         .get_member(member_id)
         .await
@@ -338,7 +513,7 @@ async fn cmd_ls(args: &[String]) -> Result<(), String> {
         }
     }
     let config = CliEnvConfig::from_env()?;
-    let gateway = GatewayHttpClient::new(&config.gateway_url)?;
+    let gateway = config.gateway_client()?;
     gateway.set_bearer_token(load_bearer_token(&config)?);
     let listing = gateway
         .list_files(folder_id)
@@ -373,7 +548,7 @@ async fn cmd_history(args: &[String]) -> Result<(), String> {
     };
     let file_id = FileId::from_bytes(parse_hex_32(raw_file_id).map_err(|_| "invalid file ID")?);
     let config = CliEnvConfig::from_env()?;
-    let gateway = GatewayHttpClient::new(&config.gateway_url)?;
+    let gateway = config.gateway_client()?;
     gateway.set_bearer_token(load_bearer_token(&config)?);
     let history = gateway
         .version_history(file_id)
@@ -450,28 +625,14 @@ async fn cmd_upload(args: &[String]) -> Result<(), String> {
         }
     }
     let display_name = display_name.ok_or("--name <display-name> is required")?;
-    let plaintext =
-        fs::read(file_path).map_err(|_| format!("could not read input file `{file_path}`"))?;
+    let plaintext = read_regular_file_bounded(Path::new(file_path), DEFAULT_MAX_FILE_BYTES)?;
     let config = CliEnvConfig::from_env()?;
     let file_registry = config.require_file_registry()?;
     let custody = load_custody_from_env().await?;
-    let gateway = GatewayHttpClient::new(&config.gateway_url)?;
+    let gateway = config.gateway_client()?;
     gateway.set_bearer_token(load_bearer_token(&config)?);
 
-    let uploader = UploadService::new(
-        custody,
-        gateway.clone(),
-        gateway,
-        SystemClock,
-        UploadConfig {
-            chain_id: config.chain_id,
-            file_registry,
-            min_pin_replicas: config.min_pin_replicas,
-            chunk_size_bytes: DEFAULT_CHUNK_SIZE_BYTES,
-            max_file_bytes: DEFAULT_MAX_FILE_BYTES,
-            operation_ttl_seconds: DEFAULT_OPERATION_TTL_SECONDS,
-        },
-    );
+    let uploader = build_upload_service(custody, gateway, &config, file_registry);
     let receipt = uploader
         .create_file(file_id, display_name, folder_id, &plaintext, None, &readers)
         .await
@@ -487,29 +648,15 @@ async fn cmd_modify(args: &[String]) -> Result<(), String> {
     let file_id = FileId::from_bytes(parse_hex_32(&args[0]).map_err(|_| "invalid file ID")?);
     let file_path = &args[1];
     let readers = parse_reader_flags(&args[2..])?;
-    let plaintext =
-        fs::read(file_path).map_err(|_| format!("could not read input file `{file_path}`"))?;
+    let plaintext = read_regular_file_bounded(Path::new(file_path), DEFAULT_MAX_FILE_BYTES)?;
 
     let config = CliEnvConfig::from_env()?;
     let file_registry = config.require_file_registry()?;
     let custody = load_custody_from_env().await?;
-    let gateway = GatewayHttpClient::new(&config.gateway_url)?;
+    let gateway = config.gateway_client()?;
     gateway.set_bearer_token(load_bearer_token(&config)?);
 
-    let uploader = UploadService::new(
-        custody,
-        gateway.clone(),
-        gateway,
-        SystemClock,
-        UploadConfig {
-            chain_id: config.chain_id,
-            file_registry,
-            min_pin_replicas: config.min_pin_replicas,
-            chunk_size_bytes: DEFAULT_CHUNK_SIZE_BYTES,
-            max_file_bytes: DEFAULT_MAX_FILE_BYTES,
-            operation_ttl_seconds: DEFAULT_OPERATION_TTL_SECONDS,
-        },
-    );
+    let uploader = build_upload_service(custody, gateway, &config, file_registry);
     let receipt = uploader
         .append_version(file_id, None, &plaintext, None, &readers)
         .await
@@ -531,7 +678,7 @@ async fn cmd_download(args: &[String]) -> Result<(), String> {
     let config = CliEnvConfig::from_env()?;
     let access_governance = config.require_access_governance()?;
     let custody = load_custody_from_env().await?;
-    let gateway = GatewayHttpClient::new(&config.gateway_url)?;
+    let gateway = config.gateway_client()?;
     gateway.set_bearer_token(load_bearer_token(&config)?);
 
     let downloader = DownloadService::new(
@@ -549,17 +696,18 @@ async fn cmd_download(args: &[String]) -> Result<(), String> {
         .authorize_version(file_id, version)
         .await
         .map_err(|e| e.to_string())?;
+    let expected_manifest_hash = access.manifest_hash;
     let package = gateway
         .fetch_content_package(&access)
         .await
         .map_err(|e| e.to_string())?;
     let decrypted = downloader
-        .decrypt_authorized_package(access, None, &package)
+        .decrypt_authorized_package(access, Some(expected_manifest_hash), &package)
         .await
         .map_err(|e| e.to_string())?;
-    // Plaintext is written only after full manifest, CID, and AES-GCM tag verification.
-    fs::write(output_path, decrypted.plaintext.as_slice())
-        .map_err(|_| format!("could not write decrypted output to `{output_path}`"))?;
+    // Plaintext is written atomically via a 0600 fsync'd temp file only after
+    // full manifest, CID, and AES-GCM tag verification (§9.3 #7).
+    write_file_atomic_restricted(Path::new(output_path), decrypted.plaintext.as_slice())?;
     println!(
         "downloaded fileId={} version={} bytes={} manifestHash={} output={output_path}",
         decrypted.access.file_id,
@@ -602,13 +750,12 @@ async fn cmd_share(args: &[String]) -> Result<(), String> {
 
     let config = CliEnvConfig::from_env()?;
     let access_governance = config.require_access_governance()?;
-    let custody = load_custody_from_env().await?;
-    let custody_for_share = load_custody_from_env().await?;
-    let gateway = GatewayHttpClient::new(&config.gateway_url)?;
+    let custody = Arc::new(load_custody_from_env().await?);
+    let gateway = config.gateway_client()?;
     gateway.set_bearer_token(load_bearer_token(&config)?);
 
     let downloader = DownloadService::new(
-        custody,
+        custody.clone(),
         gateway.clone(),
         gateway.clone(),
         SystemClock,
@@ -623,7 +770,7 @@ async fn cmd_share(args: &[String]) -> Result<(), String> {
         .await
         .map_err(|e| e.to_string())?;
     let sharer = ShareService::new(
-        custody_for_share,
+        custody,
         gateway.clone(),
         gateway,
         SystemClock,
@@ -668,13 +815,12 @@ async fn cmd_restore(args: &[String]) -> Result<(), String> {
     let config = CliEnvConfig::from_env()?;
     let access_governance = config.require_access_governance()?;
     let file_registry = config.require_file_registry()?;
-    let custody_download = load_custody_from_env().await?;
-    let custody_upload = load_custody_from_env().await?;
-    let gateway = GatewayHttpClient::new(&config.gateway_url)?;
+    let custody = Arc::new(load_custody_from_env().await?);
+    let gateway = config.gateway_client()?;
     gateway.set_bearer_token(load_bearer_token(&config)?);
 
     let downloader = DownloadService::new(
-        custody_download,
+        custody.clone(),
         gateway.clone(),
         gateway.clone(),
         SystemClock,
@@ -688,29 +834,17 @@ async fn cmd_restore(args: &[String]) -> Result<(), String> {
         .authorize_version(file_id, source_version)
         .await
         .map_err(|e| e.to_string())?;
+    let expected_manifest_hash = access.manifest_hash;
     let package = gateway
         .fetch_content_package(&access)
         .await
         .map_err(|e| e.to_string())?;
     let decrypted = downloader
-        .decrypt_authorized_package(access, None, &package)
+        .decrypt_authorized_package(access, Some(expected_manifest_hash), &package)
         .await
         .map_err(|e| e.to_string())?;
 
-    let uploader = UploadService::new(
-        custody_upload,
-        gateway.clone(),
-        gateway,
-        SystemClock,
-        UploadConfig {
-            chain_id: config.chain_id,
-            file_registry,
-            min_pin_replicas: config.min_pin_replicas,
-            chunk_size_bytes: DEFAULT_CHUNK_SIZE_BYTES,
-            max_file_bytes: DEFAULT_MAX_FILE_BYTES,
-            operation_ttl_seconds: DEFAULT_OPERATION_TTL_SECONDS,
-        },
-    );
+    let uploader = build_upload_service(custody, gateway, &config, file_registry);
     let receipt = uploader
         .restore_version(
             file_id,
@@ -757,7 +891,7 @@ async fn cmd_audit(args: &[String]) -> Result<(), String> {
         }
     }
     let config = CliEnvConfig::from_env()?;
-    let gateway = GatewayHttpClient::new(&config.gateway_url)?;
+    let gateway = config.gateway_client()?;
     gateway.set_bearer_token(load_bearer_token(&config)?);
     let audit = gateway
         .query_audit(action.as_deref(), limit)
@@ -799,6 +933,9 @@ fn parse_reader_flags(args: &[String]) -> Result<Vec<MemberId>, String> {
 fn format_upload_error(error: UploadError) -> String {
     match error {
         UploadError::Domain(err) => err.to_string(),
+        UploadError::BlockedByScanner { reason } => {
+            format!("upload blocked by pre-upload scanner: {reason}")
+        }
         UploadError::OrphanedUpload(details) => format!(
             "ledger commit failed ({}) after pinning contentCid={} envelopeSetCid={} (retained as orphan candidates)",
             details.cause, details.content_cid, details.envelope_set_cid
@@ -829,6 +966,9 @@ fn print_upload_receipt(verb: &str, receipt: &application::UploadReceipt) {
         encode_hex(&receipt.transaction.transaction_hash),
         receipt.transaction.block_number
     );
+    if let Some(warning) = &receipt.scan_warning {
+        eprintln!("rrds: pre-upload scanner warning: {warning}");
+    }
 }
 
 #[allow(dead_code)]
@@ -838,7 +978,8 @@ fn print_help() {
     println!(
         "Usage:
   rrds health [gateway-url]
-  rrds login [--session-file <path>]
+  rrds login [--session-file <path>] [--print-token]
+  rrds logout [--session-file <path>]
   rrds whoami
   rrds identity <member-id>
   rrds ls [--folder <folder-id>]
@@ -883,7 +1024,7 @@ mod tests {
     };
 
     use super::*;
-    use crate::{car::encode_package_to_car, gateway_client::validate_base_url};
+    use crate::gateway_client::validate_base_url;
 
     #[test]
     fn builds_health_url_from_gateway_base_url() {
@@ -903,14 +1044,24 @@ mod tests {
         assert!(validate_base_url("http://user:password@gateway").is_err());
     }
 
+    #[derive(Clone)]
+    struct MockVersionEntry {
+        manifest_hash: String,
+        content_cid: String,
+        envelope_set_cid: String,
+        epoch_id: String,
+        envelope_revision: u32,
+    }
+
     #[derive(Default)]
     struct MockGatewayState {
         members: HashMap<String, Value>,
         blobs_content: HashMap<String, Vec<u8>>, // cid -> CARv1
         blobs_envelopes: HashMap<String, Vec<u8>>, // cid -> canonical JSON
         heads: HashMap<String, (u64, String)>,
-        versions: HashMap<(String, u64), (String, String, String, u32)>, // (content_cid, env_cid, epoch_id, rev)
+        versions: HashMap<(String, u64), MockVersionEntry>,
         session_token: String,
+        session_revoked: bool,
         block: u64,
     }
 
@@ -1050,7 +1201,9 @@ mod tests {
                                 .duration_since(std::time::UNIX_EPOCH)
                                 .unwrap()
                                 .as_secs();
-                            let token = server_state.lock().unwrap().session_token.clone();
+                            let mut st = server_state.lock().unwrap();
+                            st.session_revoked = false;
+                            let token = st.session_token.clone();
                             let resp = json!({
                                 "token": token,
                                 "tokenType": "Bearer",
@@ -1061,6 +1214,26 @@ mod tests {
                                 "application/json",
                                 serde_json::to_vec(&resp).unwrap(),
                             )
+                        }
+                        ("DELETE", "/v1/auth/session") => {
+                            server_state.lock().unwrap().session_revoked = true;
+                            ("204 No Content", "application/json", Vec::new())
+                        }
+                        ("GET", "/v1/auth/session") => {
+                            if server_state.lock().unwrap().session_revoked {
+                                (
+                                    "401 Unauthorized",
+                                    "application/json",
+                                    b"{\"error\":\"unauthenticated\"}".to_vec(),
+                                )
+                            } else {
+                                let resp = json!({ "memberId": alice_id.to_string() });
+                                (
+                                    "200 OK",
+                                    "application/json",
+                                    serde_json::to_vec(&resp).unwrap(),
+                                )
+                            }
                         }
                         ("GET", p) if p.starts_with("/v1/identities/") => {
                             let id = p.trim_start_matches("/v1/identities/");
@@ -1091,11 +1264,12 @@ mod tests {
                                 total += data.len() as u64;
                                 extracted_chunks.push((idx, data));
                             }
-                            let cid = raw_sha256_cid(&manifest_bytes).unwrap().to_string();
-                            let car = encode_package_to_car(&EncryptedPackageBytes {
-                                manifest_bytes,
-                                chunks: extracted_chunks,
-                            });
+                            let (cid, car) =
+                                crate::car::encode_unixfs_package_to_car(&EncryptedPackageBytes {
+                                    manifest_bytes,
+                                    chunks: extracted_chunks,
+                                });
+                            let cid = cid.to_string();
                             server_state
                                 .lock()
                                 .unwrap()
@@ -1144,12 +1318,16 @@ mod tests {
                             );
                             st.versions.insert(
                                 (fid.clone(), 1),
-                                (
-                                    req["contentCid"].as_str().unwrap().to_owned(),
-                                    req["envelopeSetCid"].as_str().unwrap().to_owned(),
-                                    req["epochId"].as_str().unwrap().to_owned(),
-                                    1,
-                                ),
+                                MockVersionEntry {
+                                    manifest_hash: req["manifestHash"].as_str().unwrap().to_owned(),
+                                    content_cid: req["contentCid"].as_str().unwrap().to_owned(),
+                                    envelope_set_cid: req["envelopeSetCid"]
+                                        .as_str()
+                                        .unwrap()
+                                        .to_owned(),
+                                    epoch_id: req["epochId"].as_str().unwrap().to_owned(),
+                                    envelope_revision: 1,
+                                },
                             );
                             let resp = json!({
                                 "fileId": fid,
@@ -1173,6 +1351,7 @@ mod tests {
                             let (ver, head_hash) = st.heads.get(fid).unwrap().clone();
                             let resp = json!({
                                 "fileId": fid,
+                                "fileStatus": 1,
                                 "currentVersion": ver,
                                 "currentHeadManifestHash": head_hash,
                                 "finalizedBlock": st.block,
@@ -1202,12 +1381,16 @@ mod tests {
                             );
                             st.versions.insert(
                                 (fid.clone(), ver),
-                                (
-                                    req["contentCid"].as_str().unwrap().to_owned(),
-                                    req["envelopeSetCid"].as_str().unwrap().to_owned(),
-                                    req["epochId"].as_str().unwrap().to_owned(),
-                                    1,
-                                ),
+                                MockVersionEntry {
+                                    manifest_hash: req["manifestHash"].as_str().unwrap().to_owned(),
+                                    content_cid: req["contentCid"].as_str().unwrap().to_owned(),
+                                    envelope_set_cid: req["envelopeSetCid"]
+                                        .as_str()
+                                        .unwrap()
+                                        .to_owned(),
+                                    epoch_id: req["epochId"].as_str().unwrap().to_owned(),
+                                    envelope_revision: 1,
+                                },
                             );
                             let resp = json!({
                                 "fileId": fid,
@@ -1230,15 +1413,15 @@ mod tests {
                             let (fid, ver_str) = trimmed.split_once("/versions/").unwrap();
                             let ver: u64 = ver_str.parse().unwrap();
                             let st = server_state.lock().unwrap();
-                            let (content_cid, env_cid, epoch_id, rev) =
-                                st.versions.get(&(fid.to_owned(), ver)).unwrap().clone();
+                            let entry = st.versions.get(&(fid.to_owned(), ver)).unwrap().clone();
                             let resp = json!({
                                 "fileId": fid,
                                 "versionNumber": ver,
-                                "contentCid": content_cid,
-                                "envelopeSetCid": env_cid,
-                                "epochId": epoch_id,
-                                "envelopeRevision": rev,
+                                "manifestHash": entry.manifest_hash,
+                                "contentCid": entry.content_cid,
+                                "envelopeSetCid": entry.envelope_set_cid,
+                                "epochId": entry.epoch_id,
+                                "envelopeRevision": entry.envelope_revision,
                                 "finalizedBlock": st.block,
                             });
                             (
@@ -1254,9 +1437,8 @@ mod tests {
                             let (fid, ver_str) = trimmed.split_once("/versions/").unwrap();
                             let ver: u64 = ver_str.parse().unwrap();
                             let st = server_state.lock().unwrap();
-                            let (content_cid, _, _, _) =
-                                st.versions.get(&(fid.to_owned(), ver)).unwrap();
-                            let car = st.blobs_content.get(content_cid).unwrap().clone();
+                            let entry = st.versions.get(&(fid.to_owned(), ver)).unwrap();
+                            let car = st.blobs_content.get(&entry.content_cid).unwrap().clone();
                             ("200 OK", "application/vnd.ipld.car", car)
                         }
                         ("GET", p) if p.starts_with("/v1/files/") && p.ends_with("/envelope") => {
@@ -1266,9 +1448,12 @@ mod tests {
                             let (fid, ver_str) = trimmed.split_once("/versions/").unwrap();
                             let ver: u64 = ver_str.parse().unwrap();
                             let st = server_state.lock().unwrap();
-                            let (_, env_cid, _, _) =
-                                st.versions.get(&(fid.to_owned(), ver)).unwrap();
-                            let env = st.blobs_envelopes.get(env_cid).unwrap().clone();
+                            let entry = st.versions.get(&(fid.to_owned(), ver)).unwrap();
+                            let env = st
+                                .blobs_envelopes
+                                .get(&entry.envelope_set_cid)
+                                .unwrap()
+                                .clone();
                             ("200 OK", "application/json", env)
                         }
                         ("POST", p) if p.starts_with("/v1/files/") && p.ends_with("/envelopes") => {
@@ -1281,8 +1466,9 @@ mod tests {
                             let mut st = server_state.lock().unwrap();
                             st.block += 1;
                             let entry = st.versions.get_mut(&(fid.to_owned(), ver)).unwrap();
-                            entry.1 = req["newEnvelopeSetCid"].as_str().unwrap().to_owned();
-                            entry.3 += 1;
+                            entry.envelope_set_cid =
+                                req["newEnvelopeSetCid"].as_str().unwrap().to_owned();
+                            entry.envelope_revision += 1;
                             let resp = json!({
                                 "fileId": fid,
                                 "versionNumber": ver,
@@ -1478,6 +1664,283 @@ mod tests {
             .unwrap();
         assert_eq!(v3_decrypted.plaintext.as_slice(), v1_data);
 
+        // 6. Session revocation (DELETE /v1/auth/session) clears client token and rejects reuse.
+        assert_eq!(alice_gw.whoami().await.unwrap(), alice_id.to_string());
+        alice_gw.logout().await.unwrap();
+        assert_eq!(
+            alice_gw.whoami().await,
+            Err(domain::DomainError::Unauthenticated)
+        );
+        alice_gw.set_bearer_token(session.bearer_token().to_owned());
+        assert_eq!(
+            alice_gw.whoami().await,
+            Err(domain::DomainError::Unauthenticated)
+        );
+
         server.abort();
+    }
+
+    #[test]
+    fn bounded_regular_file_reader_enforces_size_and_rejects_non_regular_paths() {
+        let dir = env::temp_dir().join(format!("rrds-cli-read-test-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let regular = dir.join("ok.bin");
+        fs::write(&regular, b"hello-world").unwrap();
+
+        assert_eq!(
+            read_regular_file_bounded(&regular, 11).unwrap().as_slice(),
+            b"hello-world"
+        );
+        assert!(read_regular_file_bounded(&regular, 10).is_err());
+        assert!(read_regular_file_bounded(&dir, 1024).is_err());
+
+        #[cfg(unix)]
+        {
+            let link = dir.join("sym.bin");
+            let _ = fs::remove_file(&link);
+            std::os::unix::fs::symlink(&regular, &link).unwrap();
+            assert!(read_regular_file_bounded(&link, 1024).is_err());
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn atomic_restricted_writer_sets_0600_and_leaves_no_temp_files() {
+        let dir = env::temp_dir().join(format!("rrds-cli-write-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("decrypted.txt");
+
+        write_file_atomic_restricted(&target, b"first-version").unwrap();
+        assert_eq!(fs::read(&target).unwrap(), b"first-version");
+        write_file_atomic_restricted(&target, b"second-version").unwrap();
+        assert_eq!(fs::read(&target).unwrap(), b"second-version");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&target).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+
+        let entries: Vec<_> = fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(entries, vec!["decrypted.txt".to_owned()]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn enforces_https_for_non_loopback_gateways_unless_explicitly_opted_in() {
+        assert!(validate_base_url("http://127.0.0.1:8080").is_ok());
+        assert!(validate_base_url("http://localhost:8080").is_ok());
+        assert!(validate_base_url("http://[::1]:8080").is_ok());
+        assert!(validate_base_url("https://gateway.consortium.example").is_ok());
+        assert!(validate_base_url("http://gateway.consortium.example").is_err());
+        assert!(
+            gateway_client::validate_base_url_with_policy(
+                "http://gateway.consortium.example",
+                true
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn maps_gateway_http_error_statuses_and_codes_accurately() {
+        use gateway_client::map_http_error;
+        use reqwest::StatusCode;
+
+        assert_eq!(
+            map_http_error(StatusCode::UNAUTHORIZED, Some("unauthenticated")),
+            domain::DomainError::Unauthenticated
+        );
+        assert_eq!(
+            map_http_error(StatusCode::UNAUTHORIZED, Some("member_suspended")),
+            domain::DomainError::MemberSuspended
+        );
+        assert_eq!(
+            map_http_error(StatusCode::FORBIDDEN, Some("unauthorized")),
+            domain::DomainError::Unauthorized
+        );
+        assert_eq!(
+            map_http_error(StatusCode::NOT_FOUND, None),
+            domain::DomainError::ContractRejected
+        );
+        assert_eq!(
+            map_http_error(StatusCode::CONFLICT, Some("stale_head")),
+            domain::DomainError::StaleHead
+        );
+        assert_eq!(
+            map_http_error(StatusCode::CONFLICT, Some("replay_detected")),
+            domain::DomainError::ReplayDetected
+        );
+        assert_eq!(
+            map_http_error(StatusCode::CONFLICT, Some("expired_request")),
+            domain::DomainError::ExpiredRequest
+        );
+        assert_eq!(
+            map_http_error(StatusCode::PAYLOAD_TOO_LARGE, None),
+            domain::DomainError::InvalidManifest
+        );
+        assert_eq!(
+            map_http_error(StatusCode::TOO_MANY_REQUESTS, None),
+            domain::DomainError::RateLimited
+        );
+        assert_eq!(
+            map_http_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                Some("replication_insufficient")
+            ),
+            domain::DomainError::ReplicationInsufficient
+        );
+        assert_eq!(
+            map_http_error(StatusCode::SERVICE_UNAVAILABLE, Some("storage_unavailable")),
+            domain::DomainError::StorageUnavailable
+        );
+        assert_eq!(
+            map_http_error(StatusCode::BAD_REQUEST, Some("invalid_signature")),
+            domain::DomainError::InvalidSignature
+        );
+    }
+
+    #[tokio::test]
+    async fn gateway_client_refuses_redirects_bounds_responses_and_maps_head_status() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let (method, path, _) = read_http_request(&mut stream).await;
+                match (method.as_str(), path.as_str()) {
+                    ("GET", "/v1/auth/session") => {
+                        let resp = "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:9/steal\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                        stream.write_all(resp.as_bytes()).await.unwrap();
+                    }
+                    ("GET", p) if p.contains("1111") && p.ends_with("/versions") => {
+                        write_http_response(
+                            &mut stream,
+                            "404 Not Found",
+                            "application/json",
+                            br#"{"error":"not_found"}"#,
+                        )
+                        .await;
+                    }
+                    ("GET", p) if p.contains("2222") && p.ends_with("/versions") => {
+                        let body = serde_json::to_vec(&json!({
+                            "fileId": format!("0x{}", "22".repeat(32)),
+                            "fileStatus": 2,
+                            "currentVersion": 3,
+                            "currentHeadManifestHash": format!("0x{}", "aa".repeat(32)),
+                            "finalizedBlock": 42,
+                            "indexedBlock": 42,
+                            "versions": [],
+                        }))
+                        .unwrap();
+                        write_http_response(&mut stream, "200 OK", "application/json", &body).await;
+                    }
+                    ("POST", p) if p.ends_with("/access") => {
+                        let cid = raw_sha256_cid(b"env").unwrap().to_string();
+                        let body = serde_json::to_vec(&json!({
+                            "fileId": format!("0x{}", "33".repeat(32)),
+                            "versionNumber": 1,
+                            "manifestHash": format!("0x{}", "bb".repeat(32)),
+                            "contentCid": cid,
+                            "envelopeSetCid": cid,
+                            "epochId": format!("0x{}", "cc".repeat(32)),
+                            "envelopeRevision": 1,
+                            "finalizedBlock": 10,
+                        }))
+                        .unwrap();
+                        write_http_response(&mut stream, "200 OK", "application/json", &body).await;
+                    }
+                    ("GET", p) if p.ends_with("/envelope") => {
+                        // Oversized > 512 KiB response must be rejected by bounded reader.
+                        let huge = vec![b'x'; 600 * 1024];
+                        write_http_response(&mut stream, "200 OK", "application/json", &huge).await;
+                    }
+                    _ => {
+                        write_http_response(
+                            &mut stream,
+                            "404 Not Found",
+                            "application/json",
+                            br#"{"error":"not_found"}"#,
+                        )
+                        .await;
+                    }
+                }
+            }
+        });
+
+        let client = GatewayHttpClient::new(&format!("http://{addr}")).unwrap();
+        client.set_bearer_token("test-bearer-token".to_owned());
+
+        // Redirects are refused (never followed).
+        assert!(client.whoami().await.is_err());
+
+        // 404 returns Ok(None) on get_file_head.
+        assert_eq!(
+            client
+                .get_file_head(FileId::from_bytes([0x11; 32]))
+                .await
+                .unwrap(),
+            None
+        );
+
+        // Archived fileStatus=2 is decoded faithfully as FileStatus::Archived.
+        let head = client
+            .get_file_head(FileId::from_bytes([0x22; 32]))
+            .await
+            .unwrap()
+            .expect("archived head");
+        assert_eq!(head.status, domain::FileStatus::Archived);
+        assert_eq!(head.current_version.get(), 3);
+
+        // Oversized envelope response fails closed with StorageError::SizeLimitExceeded.
+        let access = client
+            .authorize_read(&ports::SignedAccessLookupRequest {
+                member_id: MemberId::from_bytes([1; 32]),
+                file_id: FileId::from_bytes([0x33; 32]),
+                version_number: VersionNumber::ONE,
+                encryption_key_version: KeyVersion::new(1).unwrap(),
+                operation_nonce: domain::OperationNonce::from_bytes([2; 32]),
+                deadline: 1_900_000_000,
+                signature: ports::EvmSignature::from_bytes([0; 65]),
+            })
+            .await
+            .unwrap();
+        let env_err = ports::BlobStore::get_envelope_set(&client, &access.envelope_set_cid)
+            .await
+            .err();
+        assert_eq!(env_err, Some(ports::StorageError::SizeLimitExceeded));
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn cli_command_dispatcher_validates_arguments_and_requires_explicit_login_output() {
+        assert!(run(vec![]).await.is_err());
+        assert!(run(vec!["unknown-cmd".into()]).await.is_err());
+        assert!(run(vec!["--help".into()]).await.is_ok());
+        assert!(
+            run(vec![
+                "download".into(),
+                "not-hex".into(),
+                "1".into(),
+                "out".into()
+            ])
+            .await
+            .is_err()
+        );
+        assert!(run(vec!["history".into(), "not-hex".into()]).await.is_err());
+        assert!(run(vec!["share".into(), "not-hex".into()]).await.is_err());
+        // `login` with neither --session-file nor --print-token (and no RRDS_SESSION_FILE) fails closed.
+        if env::var("RRDS_SESSION_FILE").is_err() {
+            let err = run(vec!["login".into()]).await.unwrap_err();
+            assert!(err.contains("--session-file"));
+        }
     }
 }

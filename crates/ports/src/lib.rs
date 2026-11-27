@@ -5,7 +5,7 @@ pub mod clock;
 pub mod ledger;
 pub mod scanner;
 
-use std::{fmt, future::Future, pin::Pin};
+use std::{fmt, future::Future, pin::Pin, sync::Arc};
 
 use crypto::{HpkeRecipientPublicKey, KeyEnvelope, TypedDigest, WrapContext};
 use domain::{EvmAddress, KeyVersion, MemberId};
@@ -145,4 +145,31 @@ pub trait KeyCustodyProvider: Send + Sync {
     ) -> CustodyFuture<'a, Zeroizing<[u8; 32]>>;
 
     fn health_check(&self) -> CustodyFuture<'_, CustodyHealth>;
+}
+
+impl<T: KeyCustodyProvider + ?Sized> KeyCustodyProvider for Arc<T> {
+    fn public_identity(&self) -> CustodyFuture<'_, PublicIdentityKeys> {
+        (**self).public_identity()
+    }
+
+    fn sign_typed_digest<'a>(
+        &'a self,
+        key_id: &'a KeyId,
+        digest: &'a TypedDigest,
+    ) -> CustodyFuture<'a, EvmSignature> {
+        (**self).sign_typed_digest(key_id, digest)
+    }
+
+    fn unwrap_dek<'a>(
+        &'a self,
+        key_id: &'a KeyId,
+        envelope: &'a KeyEnvelope,
+        context: WrapContext,
+    ) -> CustodyFuture<'a, Zeroizing<[u8; 32]>> {
+        (**self).unwrap_dek(key_id, envelope, context)
+    }
+
+    fn health_check(&self) -> CustodyFuture<'_, CustodyHealth> {
+        (**self).health_check()
+    }
 }

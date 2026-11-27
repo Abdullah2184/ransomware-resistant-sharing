@@ -1,0 +1,6 @@
+{
+  "RrdsDeployment": {
+    "consortiumSafeAddress": "0x0000000000000000000000000000000000000001",
+    "emergencySafeAddress": "0x0000000000000000000000000000000000000002"
+  }
+}

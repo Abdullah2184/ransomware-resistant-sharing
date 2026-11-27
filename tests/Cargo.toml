@@ -25,6 +25,7 @@ application = { path = "../crates/application" }
 chain-adapter = { path = "../crates/chain_adapter" }
 crypto = { path = "../crates/crypto" }
 domain = { path = "../crates/domain" }
+ipfs-adapter = { path = "../crates/ipfs_adapter" }
 key-custody = { path = "../crates/key_custody" }
 ports = { path = "../crates/ports" }
 scanner = { path = "../crates/scanner" }

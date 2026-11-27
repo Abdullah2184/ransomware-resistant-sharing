@@ -1,0 +1,33 @@
+{
+  "schema": "rrds.hpke-test-vectors.v1",
+  "suite": {
+    "mode": 0,
+    "kemId": 32,
+    "kdfId": 1,
+    "aeadId": 2,
+    "description": "RFC 9180 Base mode DHKEM(X25519, HKDF-SHA256) / HKDF-SHA256 / AES-256-GCM"
+  },
+  "rfc9180BaseVector": {
+    "ikmR": "dac33b0e9db1b59dbbea58d59a14e7b5896e9bdf98fad6891e99d1686492b9ee",
+    "pkRm": "430f4b9859665145a6b1ba274024487bd66f03a2dd577d7753c68d7d7d00c00c",
+    "ikmE": "2cd7c601cefb3d42a62b04b7a9041494c06c7843818e0ce28a8f704ae7ab20f9",
+    "enc": "6c93e09869df3402d7bf231bf540fadd35cd56be14f97178f0954db94b7fc256",
+    "info": "Ode on a Grecian Urn",
+    "aad": "Count-0",
+    "plaintext": "Beauty is truth, truth beauty",
+    "ciphertext": "e5d84cd531cfb583096e7cfa9641bd3079cf3a91cda813c52deb5f512be9931980a41de125a925cdad859d5b7a"
+  },
+  "rrdsDekWrapCrossImplVector": {
+    "ikmR": "4444444444444444444444444444444444444444444444444444444444444444",
+    "pkRm": "86e76b8dd088dabf46d94d4820a251861376de69c3a36f2e53f8bffcdb519e00",
+    "ikmE": "5555555555555555555555555555555555555555555555555555555555555555",
+    "fileIdByte": 17,
+    "versionNumber": 3,
+    "epochIdByte": 34,
+    "memberIdByte": 51,
+    "keyVersion": 2,
+    "dekByte": 66,
+    "enc": "79d32518232dd78292aac6c8e228dadc854a35124bbcb410c24105bb8d4b522f",
+    "ciphertext": "df8b1b5a0bcdcfe99a795d21c72c3157f9f81cc8eee7f35b853c05ba8af5dec0b6630720dd546cc4b9047ff889995f00"
+  }
+}
