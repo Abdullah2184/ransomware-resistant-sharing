@@ -12,7 +12,9 @@ and administrative domains (`TECHNICAL_SPECIFICATION.md` §§1.1, 15.4 #13,
 
 | Template | Target Host / Domain | Services |
 | --- | --- | --- |
-| [`database.yaml`](database.yaml) | Organization Database Host | PostgreSQL `18.6` (bound to internal/loopback interface; apply [`infra/postgres/init-roles.sql`](../postgres/init-roles.sql)) |
+| [`database.yaml`](database.yaml) | Organization Database Host | PostgreSQL `18.6` (bound to internal/loopback interface; run `rrds-migrate run` as `rrfs_migrator` and apply [`infra/postgres/init-roles.sql`](../postgres/init-roles.sql)) |
+| [`gateway.yaml`](gateway.yaml) | Organization Gateway Host | RRDS Gateway (`RRDS_ENV=production`, `rrfs_gateway` least-privilege role, `DATABASE_MIGRATION_MODE=verify`) behind Caddy TLS termination ([`Caddyfile.example`](Caddyfile.example)) |
+| [`indexer.yaml`](indexer.yaml) | Organization Indexer Host | RRDS Indexer (`RRDS_ENV=production`, `rrfs_indexer` least-privilege role, `DATABASE_MIGRATION_MODE=verify`) |
 | [`ipfs-peer.yaml`](ipfs-peer.yaml) | Consortium Member Storage Host (1 per org) | Single Kubo `0.43.1` + IPFS Cluster `1.1.6` peer in private swarm |
 | [`besu-validator.yaml`](besu-validator.yaml) | Consortium Validator Host (4+ independent orgs) | Single Besu `26.11.0` QBFT validator (no JSON-RPC exposed) |
 | [`besu-rpc.yaml`](besu-rpc.yaml) | Organization RPC Host | Single non-validator Besu `26.11.0` RPC node serving `gateway` and `indexer` |

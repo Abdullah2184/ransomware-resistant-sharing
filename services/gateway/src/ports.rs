@@ -10,7 +10,10 @@ use domain::EvmAddress;
 
 use crate::{
     auth::LoginChallenge,
-    store::{AuditEventRecord, FileListingResult, GatewayStore, VersionHistoryResult},
+    store::{
+        AuditEventRecord, FileListingResult, GatewayStore, OrphanBlobCandidate,
+        RelayedTransactionRecord, VersionHistoryResult,
+    },
 };
 
 pub type ChainFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, ChainError>> + Send + 'a>>;
@@ -355,7 +358,53 @@ pub trait GatewayStorePort: Send + Sync {
         block_number: Option<u64>,
         outcome: &'static str,
         reason_code: Option<&'static str>,
+        restored_from_version: Option<u64>,
     ) -> StoreFuture<'a, ()>;
+
+    fn member_organization_id<'a>(&'a self, member_id: &'a str) -> StoreFuture<'a, Option<String>>;
+
+    fn record_relayed_transaction<'a>(
+        &'a self,
+        record: &'a RelayedTransactionRecord,
+    ) -> StoreFuture<'a, ()>;
+
+    fn get_relayed_transaction<'a>(
+        &'a self,
+        tx_hash: &'a str,
+    ) -> StoreFuture<'a, Option<RelayedTransactionRecord>>;
+
+    fn update_relayed_transaction_status<'a>(
+        &'a self,
+        tx_hash: &'a str,
+        status: &'a str,
+        block_number: Option<u64>,
+        block_hash: Option<&'a str>,
+        gas_used: Option<u64>,
+    ) -> StoreFuture<'a, ()>;
+
+    #[allow(clippy::too_many_arguments)]
+    fn record_orphan_blob_candidate<'a>(
+        &'a self,
+        cid: &'a str,
+        blob_kind: &'a str,
+        uploader_member_id: &'a str,
+        file_id: Option<&'a str>,
+        version_number: Option<u64>,
+        tx_hash: Option<&'a str>,
+        reason: &'a str,
+    ) -> StoreFuture<'a, ()>;
+
+    fn mark_blob_referenced<'a>(&'a self, cid: &'a str) -> StoreFuture<'a, ()>;
+
+    fn is_cid_referenced_in_projections<'a>(&'a self, cid: &'a str) -> StoreFuture<'a, bool>;
+
+    fn list_eligible_orphan_candidates<'a>(
+        &'a self,
+        min_age_seconds: u64,
+        limit: u32,
+    ) -> StoreFuture<'a, Vec<OrphanBlobCandidate>>;
+
+    fn mark_orphan_blob_unpinned<'a>(&'a self, cid: &'a str) -> StoreFuture<'a, ()>;
 
     fn active_session_member<'a>(
         &'a self,
@@ -546,6 +595,7 @@ impl GatewayStorePort for GatewayStore {
         block_number: Option<u64>,
         outcome: &'static str,
         reason_code: Option<&'static str>,
+        restored_from_version: Option<u64>,
     ) -> StoreFuture<'a, ()> {
         Box::pin(self.record_write_attempt(
             action,
@@ -558,7 +608,84 @@ impl GatewayStorePort for GatewayStore {
             block_number,
             outcome,
             reason_code,
+            restored_from_version,
         ))
+    }
+
+    fn member_organization_id<'a>(&'a self, member_id: &'a str) -> StoreFuture<'a, Option<String>> {
+        Box::pin(self.member_organization_id(member_id))
+    }
+
+    fn record_relayed_transaction<'a>(
+        &'a self,
+        record: &'a RelayedTransactionRecord,
+    ) -> StoreFuture<'a, ()> {
+        Box::pin(self.record_relayed_transaction(record))
+    }
+
+    fn get_relayed_transaction<'a>(
+        &'a self,
+        tx_hash: &'a str,
+    ) -> StoreFuture<'a, Option<RelayedTransactionRecord>> {
+        Box::pin(self.get_relayed_transaction(tx_hash))
+    }
+
+    fn update_relayed_transaction_status<'a>(
+        &'a self,
+        tx_hash: &'a str,
+        status: &'a str,
+        block_number: Option<u64>,
+        block_hash: Option<&'a str>,
+        gas_used: Option<u64>,
+    ) -> StoreFuture<'a, ()> {
+        Box::pin(self.update_relayed_transaction_status(
+            tx_hash,
+            status,
+            block_number,
+            block_hash,
+            gas_used,
+        ))
+    }
+
+    fn record_orphan_blob_candidate<'a>(
+        &'a self,
+        cid: &'a str,
+        blob_kind: &'a str,
+        uploader_member_id: &'a str,
+        file_id: Option<&'a str>,
+        version_number: Option<u64>,
+        tx_hash: Option<&'a str>,
+        reason: &'a str,
+    ) -> StoreFuture<'a, ()> {
+        Box::pin(self.record_orphan_blob_candidate(
+            cid,
+            blob_kind,
+            uploader_member_id,
+            file_id,
+            version_number,
+            tx_hash,
+            reason,
+        ))
+    }
+
+    fn mark_blob_referenced<'a>(&'a self, cid: &'a str) -> StoreFuture<'a, ()> {
+        Box::pin(self.mark_blob_referenced(cid))
+    }
+
+    fn is_cid_referenced_in_projections<'a>(&'a self, cid: &'a str) -> StoreFuture<'a, bool> {
+        Box::pin(self.is_cid_referenced_in_projections(cid))
+    }
+
+    fn list_eligible_orphan_candidates<'a>(
+        &'a self,
+        min_age_seconds: u64,
+        limit: u32,
+    ) -> StoreFuture<'a, Vec<OrphanBlobCandidate>> {
+        Box::pin(self.list_eligible_orphan_candidates(min_age_seconds, limit))
+    }
+
+    fn mark_orphan_blob_unpinned<'a>(&'a self, cid: &'a str) -> StoreFuture<'a, ()> {
+        Box::pin(self.mark_orphan_blob_unpinned(cid))
     }
 
     fn active_session_member<'a>(

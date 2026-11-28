@@ -850,8 +850,9 @@ async fn cmd_restore(args: &[String]) -> Result<(), String> {
 
     let uploader = build_upload_service(custody, gateway, &config, file_registry);
     let receipt = uploader
-        .restore_version(
+        .restore_version_from(
             file_id,
+            source_version,
             None,
             decrypted.plaintext.as_slice(),
             decrypted.private_metadata.as_deref().map(Vec::as_slice),

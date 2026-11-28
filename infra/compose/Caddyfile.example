@@ -1,0 +1,24 @@
+# Example TLS termination configuration for `infra/compose/gateway.yaml`.
+# Copy to `infra/compose/Caddyfile` and substitute your organization hostname
+# and internal CA / mTLS policy before production rollout (§8.1, §10.4.3).
+
+gateway.org.example.internal {
+	tls internal {
+		# For production consortium PKI, replace `tls internal` with:
+		# tls /etc/caddy/certs/gateway.crt /etc/caddy/certs/gateway.key
+	}
+
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		Cache-Control "no-store"
+	}
+
+	request_body {
+		max_size 64MB
+	}
+
+	reverse_proxy 127.0.0.1:8080 {
+		flush_interval -1
+	}
+}

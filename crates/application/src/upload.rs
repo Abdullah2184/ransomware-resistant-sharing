@@ -287,6 +287,26 @@ where
         private_metadata: Option<&[u8]>,
         reader_member_ids: &[MemberId],
     ) -> Result<UploadReceipt, UploadError> {
+        self.append_version_with_source(
+            file_id,
+            expected_parent_head,
+            plaintext,
+            private_metadata,
+            reader_member_ids,
+            None,
+        )
+        .await
+    }
+
+    async fn append_version_with_source(
+        &self,
+        file_id: FileId,
+        expected_parent_head: Option<(VersionNumber, ManifestHash)>,
+        plaintext: &[u8],
+        private_metadata: Option<&[u8]>,
+        reader_member_ids: &[MemberId],
+        restored_from_version: Option<VersionNumber>,
+    ) -> Result<UploadReceipt, UploadError> {
         self.config.validate()?;
         if file_id.as_bytes() == &[0; 32] {
             return Err(DomainError::InvalidIdentifier.into());
@@ -359,6 +379,7 @@ where
             operation_nonce,
             deadline,
             signature,
+            restored_from_version,
         };
         let transaction = match self.ledger.append_version(&request).await {
             Ok(receipt) if receipt.finalized && receipt.succeeded => receipt,
@@ -407,12 +428,35 @@ where
         private_metadata: Option<&[u8]>,
         current_reader_member_ids: &[MemberId],
     ) -> Result<UploadReceipt, UploadError> {
-        self.append_version(
+        self.append_version_with_source(
             file_id,
             expected_current_head,
             recovered_plaintext,
             private_metadata,
             current_reader_member_ids,
+            None,
+        )
+        .await
+    }
+
+    /// Append-only restore recording the source historical version number in the
+    /// off-chain recovery audit record (§9.7 #6).
+    pub async fn restore_version_from(
+        &self,
+        file_id: FileId,
+        source_version: VersionNumber,
+        expected_current_head: Option<(VersionNumber, ManifestHash)>,
+        recovered_plaintext: &[u8],
+        private_metadata: Option<&[u8]>,
+        current_reader_member_ids: &[MemberId],
+    ) -> Result<UploadReceipt, UploadError> {
+        self.append_version_with_source(
+            file_id,
+            expected_current_head,
+            recovered_plaintext,
+            private_metadata,
+            current_reader_member_ids,
+            Some(source_version),
         )
         .await
     }

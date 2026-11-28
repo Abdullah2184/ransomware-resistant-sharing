@@ -73,6 +73,35 @@ pub struct AuditEventRecord {
     pub record_hash: String,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RelayedTransactionRecord {
+    pub tx_hash: String,
+    pub operation_kind: String,
+    pub operation_id: String,
+    pub actor_member_id: String,
+    pub file_id: String,
+    pub version_number: u64,
+    pub content_cid: Option<String>,
+    pub envelope_set_cid: String,
+    pub chain_id: u64,
+    pub status: String,
+    pub block_number: Option<u64>,
+    pub block_hash: Option<String>,
+    pub gas_used: Option<u64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OrphanBlobCandidate {
+    pub cid: String,
+    pub blob_kind: String,
+    pub uploader_member_id: String,
+    pub file_id: Option<String>,
+    pub version_number: Option<u64>,
+    pub tx_hash: Option<String>,
+    pub reason: String,
+}
+
 #[derive(Clone)]
 pub struct GatewayStore {
     pool: PgPool,
@@ -92,6 +121,24 @@ struct AuditRecord<'a> {
     resource_version: Option<u64>,
     chain_id: u64,
     block_number: Option<u64>,
+}
+
+#[derive(Serialize)]
+struct WriteAuditRecord<'a> {
+    occurred_at_unix_ms: u128,
+    action: &'a str,
+    actor_member_id: Option<&'a str>,
+    source_id: &'a str,
+    outcome: &'a str,
+    reason_code: Option<&'a str>,
+    operation_id: Option<&'a str>,
+    resource_type: Option<&'a str>,
+    resource_id: Option<&'a str>,
+    resource_version: Option<u64>,
+    chain_id: u64,
+    block_number: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    restored_from_version: Option<u64>,
 }
 
 impl GatewayStore {
@@ -482,10 +529,11 @@ impl GatewayStore {
         block_number: Option<u64>,
         outcome: &'static str,
         reason_code: Option<&'static str>,
+        restored_from_version: Option<u64>,
     ) -> Result<(), sqlx::Error> {
-        append_audit(
+        append_audit_entry(
             transaction,
-            AuditRecord {
+            &WriteAuditRecord {
                 occurred_at_unix_ms: unix_millis()?,
                 action,
                 actor_member_id: member_id,
@@ -498,7 +546,11 @@ impl GatewayStore {
                 resource_version: Some(version),
                 chain_id,
                 block_number,
+                restored_from_version,
             },
+            Some("file-version"),
+            Some(file_id),
+            Some(version),
         )
         .await
     }
@@ -516,6 +568,7 @@ impl GatewayStore {
         block_number: Option<u64>,
         outcome: &'static str,
         reason_code: Option<&'static str>,
+        restored_from_version: Option<u64>,
     ) -> Result<(), sqlx::Error> {
         let mut transaction = self.pool.begin().await?;
         self.record_write_attempt_in_transaction(
@@ -530,9 +583,238 @@ impl GatewayStore {
             block_number,
             outcome,
             reason_code,
+            restored_from_version,
         )
         .await?;
         transaction.commit().await
+    }
+
+    pub async fn member_organization_id(
+        &self,
+        member_id: &str,
+    ) -> Result<Option<String>, sqlx::Error> {
+        sqlx::query_scalar("SELECT organization_id FROM members_projection WHERE member_id = $1")
+            .bind(member_id)
+            .fetch_optional(&self.pool)
+            .await
+    }
+
+    pub async fn record_relayed_transaction(
+        &self,
+        record: &RelayedTransactionRecord,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "INSERT INTO gateway_relayed_transactions \
+             (tx_hash, operation_kind, operation_id, actor_member_id, file_id, version_number, \
+              content_cid, envelope_set_cid, chain_id, status, block_number, block_hash, gas_used, \
+              updated_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, now()) \
+             ON CONFLICT (tx_hash) DO UPDATE SET \
+               status = EXCLUDED.status, \
+               block_number = COALESCE(EXCLUDED.block_number, gateway_relayed_transactions.block_number), \
+               block_hash = COALESCE(EXCLUDED.block_hash, gateway_relayed_transactions.block_hash), \
+               gas_used = COALESCE(EXCLUDED.gas_used, gateway_relayed_transactions.gas_used), \
+               updated_at = now()",
+        )
+        .bind(&record.tx_hash)
+        .bind(&record.operation_kind)
+        .bind(&record.operation_id)
+        .bind(&record.actor_member_id)
+        .bind(&record.file_id)
+        .bind(record.version_number as i64)
+        .bind(record.content_cid.as_deref())
+        .bind(&record.envelope_set_cid)
+        .bind(record.chain_id as i64)
+        .bind(&record.status)
+        .bind(record.block_number.map(|value| value as i64))
+        .bind(record.block_hash.as_deref())
+        .bind(record.gas_used.map(|value| value as i64))
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn get_relayed_transaction(
+        &self,
+        tx_hash: &str,
+    ) -> Result<Option<RelayedTransactionRecord>, sqlx::Error> {
+        let row = sqlx::query(
+            "SELECT tx_hash, operation_kind, operation_id, actor_member_id, file_id, \
+                    version_number, content_cid, envelope_set_cid, chain_id, status, \
+                    block_number, block_hash, gas_used \
+             FROM gateway_relayed_transactions \
+             WHERE tx_hash = $1",
+        )
+        .bind(tx_hash)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(|row| {
+            Ok(RelayedTransactionRecord {
+                tx_hash: row.try_get("tx_hash")?,
+                operation_kind: row.try_get("operation_kind")?,
+                operation_id: row.try_get("operation_id")?,
+                actor_member_id: row.try_get("actor_member_id")?,
+                file_id: row.try_get("file_id")?,
+                version_number: u64::try_from(row.try_get::<i64, _>("version_number")?)
+                    .unwrap_or(0),
+                content_cid: row.try_get("content_cid")?,
+                envelope_set_cid: row.try_get("envelope_set_cid")?,
+                chain_id: u64::try_from(row.try_get::<i64, _>("chain_id")?).unwrap_or(0),
+                status: row.try_get("status")?,
+                block_number: row
+                    .try_get::<Option<i64>, _>("block_number")?
+                    .and_then(|v| u64::try_from(v).ok()),
+                block_hash: row.try_get("block_hash")?,
+                gas_used: row
+                    .try_get::<Option<i64>, _>("gas_used")?
+                    .and_then(|v| u64::try_from(v).ok()),
+            })
+        })
+        .transpose()
+    }
+
+    pub async fn update_relayed_transaction_status(
+        &self,
+        tx_hash: &str,
+        status: &str,
+        block_number: Option<u64>,
+        block_hash: Option<&str>,
+        gas_used: Option<u64>,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "UPDATE gateway_relayed_transactions \
+             SET status = $2, \
+                 block_number = COALESCE($3, block_number), \
+                 block_hash = COALESCE($4, block_hash), \
+                 gas_used = COALESCE($5, gas_used), \
+                 updated_at = now() \
+             WHERE tx_hash = $1",
+        )
+        .bind(tx_hash)
+        .bind(status)
+        .bind(block_number.map(|value| value as i64))
+        .bind(block_hash)
+        .bind(gas_used.map(|value| value as i64))
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn record_orphan_blob_candidate(
+        &self,
+        cid: &str,
+        blob_kind: &str,
+        uploader_member_id: &str,
+        file_id: Option<&str>,
+        version_number: Option<u64>,
+        tx_hash: Option<&str>,
+        reason: &str,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "INSERT INTO gateway_orphan_blobs \
+             (cid, blob_kind, uploader_member_id, file_id, version_number, tx_hash, reason, status, updated_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, 'candidate', now()) \
+             ON CONFLICT (cid) DO UPDATE SET \
+               file_id = COALESCE(EXCLUDED.file_id, gateway_orphan_blobs.file_id), \
+               version_number = COALESCE(EXCLUDED.version_number, gateway_orphan_blobs.version_number), \
+               tx_hash = COALESCE(EXCLUDED.tx_hash, gateway_orphan_blobs.tx_hash), \
+               reason = CASE \
+                 WHEN gateway_orphan_blobs.status = 'referenced' THEN gateway_orphan_blobs.reason \
+                 ELSE EXCLUDED.reason \
+               END, \
+               updated_at = now()",
+        )
+        .bind(cid)
+        .bind(blob_kind)
+        .bind(uploader_member_id)
+        .bind(file_id)
+        .bind(version_number.map(|v| v as i64))
+        .bind(tx_hash)
+        .bind(reason)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn mark_blob_referenced(&self, cid: &str) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "UPDATE gateway_orphan_blobs SET status = 'referenced', updated_at = now() \
+             WHERE cid = $1",
+        )
+        .bind(cid)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn is_cid_referenced_in_projections(&self, cid: &str) -> Result<bool, sqlx::Error> {
+        sqlx::query_scalar(
+            "SELECT EXISTS ( \
+                SELECT 1 FROM versions_projection \
+                WHERE content_cid = $1 OR initial_envelope_set_cid = $1 \
+             ) OR EXISTS ( \
+                SELECT 1 FROM envelope_sets_projection \
+                WHERE envelope_set_cid = $1 \
+             )",
+        )
+        .bind(cid)
+        .fetch_one(&self.pool)
+        .await
+    }
+
+    pub async fn list_eligible_orphan_candidates(
+        &self,
+        min_age_seconds: u64,
+        limit: u32,
+    ) -> Result<Vec<OrphanBlobCandidate>, sqlx::Error> {
+        let rows = sqlx::query(
+            "SELECT o.cid, o.blob_kind, o.uploader_member_id, o.file_id, o.version_number, \
+                    o.tx_hash, o.reason \
+             FROM gateway_orphan_blobs o \
+             WHERE o.status = 'candidate' \
+               AND o.created_at <= now() - make_interval(secs => $1::double precision) \
+               AND NOT EXISTS ( \
+                   SELECT 1 FROM versions_projection v \
+                   WHERE v.content_cid = o.cid OR v.initial_envelope_set_cid = o.cid \
+               ) \
+               AND NOT EXISTS ( \
+                   SELECT 1 FROM envelope_sets_projection e \
+                   WHERE e.envelope_set_cid = o.cid \
+               ) \
+             ORDER BY o.created_at ASC \
+             LIMIT $2",
+        )
+        .bind(min_age_seconds as f64)
+        .bind(i64::from(limit))
+        .fetch_all(&self.pool)
+        .await?;
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            out.push(OrphanBlobCandidate {
+                cid: row.try_get("cid")?,
+                blob_kind: row.try_get("blob_kind")?,
+                uploader_member_id: row.try_get("uploader_member_id")?,
+                file_id: row.try_get("file_id")?,
+                version_number: row
+                    .try_get::<Option<i64>, _>("version_number")?
+                    .and_then(|v| u64::try_from(v).ok()),
+                tx_hash: row.try_get("tx_hash")?,
+                reason: row.try_get("reason")?,
+            });
+        }
+        Ok(out)
+    }
+
+    pub async fn mark_orphan_blob_unpinned(&self, cid: &str) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "UPDATE gateway_orphan_blobs SET status = 'unpinned', updated_at = now() \
+             WHERE cid = $1 AND status = 'candidate'",
+        )
+        .bind(cid)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 
     pub async fn active_session_member(
@@ -900,8 +1182,25 @@ async fn append_audit(
     transaction: &mut Transaction<'_, Postgres>,
     record: AuditRecord<'_>,
 ) -> Result<(), sqlx::Error> {
+    append_audit_entry(
+        transaction,
+        &record,
+        record.resource_type,
+        record.resource_id,
+        record.resource_version,
+    )
+    .await
+}
+
+async fn append_audit_entry<T: Serialize>(
+    transaction: &mut Transaction<'_, Postgres>,
+    record: &T,
+    resource_type: Option<&str>,
+    resource_id: Option<&str>,
+    resource_version: Option<u64>,
+) -> Result<(), sqlx::Error> {
     let canonical =
-        serde_json::to_string(&record).map_err(|error| sqlx::Error::Protocol(error.to_string()))?;
+        serde_json::to_string(record).map_err(|error| sqlx::Error::Protocol(error.to_string()))?;
     let json: serde_json::Value = serde_json::from_str(&canonical)
         .map_err(|error| sqlx::Error::Protocol(error.to_string()))?;
     sqlx::query("SELECT pg_advisory_xact_lock($1)")
@@ -931,9 +1230,9 @@ async fn append_audit(
     )
     .bind(json)
     .bind(canonical)
-    .bind(record.resource_type)
-    .bind(record.resource_id)
-    .bind(record.resource_version.map(|version| version as i64))
+    .bind(resource_type)
+    .bind(resource_id)
+    .bind(resource_version.map(|version| version as i64))
     .bind(previous)
     .bind(&hash[..])
     .execute(&mut **transaction)
@@ -1095,6 +1394,7 @@ mod tests {
                 1337,
                 Some(42),
                 "committed",
+                None,
                 None,
             )
             .await
@@ -1674,5 +1974,152 @@ mod tests {
             .bind(chain_id as i64)
             .execute(pool)
             .await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires DATABASE_URL (PostgreSQL)"]
+    async fn gateway_store_persists_relayed_transactions_and_orphan_blob_lifecycle() {
+        let _guard = TEST_LOCK.lock().await;
+        let database_url = std::env::var("DATABASE_URL")
+            .expect("DATABASE_URL must be set when running ignored gateway PostgreSQL tests");
+        let metadata = PostgresStore::connect(&database_url)
+            .await
+            .expect("connect to PostgreSQL");
+        metadata.migrate().await.expect("run migrations");
+        let store = GatewayStore::new(metadata.pool().clone());
+
+        let tx_hash = format!("0x{}", "8c".repeat(32));
+        let op_id = format!("0x{}", "8d".repeat(32));
+        let actor = format!("0x{}", "8e".repeat(32));
+        let file_id = format!("0x{}", "8f".repeat(32));
+        let orphan_cid = "bafkreiab234567234567234567234567234567234567234567234567a";
+        let committed_cid = "bafkreiab234567234567234567234567234567234567234567234567b";
+
+        let pending = RelayedTransactionRecord {
+            tx_hash: tx_hash.clone(),
+            operation_kind: "file.version_restore".to_owned(),
+            operation_id: op_id.clone(),
+            actor_member_id: actor.clone(),
+            file_id: file_id.clone(),
+            version_number: 3,
+            content_cid: Some(committed_cid.to_owned()),
+            envelope_set_cid: orphan_cid.to_owned(),
+            chain_id: 1337,
+            status: "pending".to_owned(),
+            block_number: None,
+            block_hash: None,
+            gas_used: None,
+        };
+        store
+            .record_relayed_transaction(&pending)
+            .await
+            .expect("insert pending tx");
+        assert_eq!(
+            store
+                .get_relayed_transaction(&tx_hash)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            "pending"
+        );
+
+        store
+            .update_relayed_transaction_status(
+                &tx_hash,
+                "confirmed",
+                Some(901),
+                Some(&format!("0x{}", "9a".repeat(32))),
+                Some(111_000),
+            )
+            .await
+            .expect("confirm tx");
+        let confirmed = store
+            .get_relayed_transaction(&tx_hash)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(confirmed.status, "confirmed");
+        assert_eq!(confirmed.block_number, Some(901));
+        assert_eq!(confirmed.gas_used, Some(111_000));
+
+        // Record two orphan candidates, mark one referenced, verify only the other is eligible.
+        store
+            .record_orphan_blob_candidate(
+                orphan_cid,
+                "envelope",
+                &actor,
+                Some(&file_id),
+                Some(3),
+                Some(&tx_hash),
+                "contract_reverted",
+            )
+            .await
+            .unwrap();
+        store
+            .record_orphan_blob_candidate(
+                committed_cid,
+                "content",
+                &actor,
+                Some(&file_id),
+                Some(3),
+                Some(&tx_hash),
+                "staged_uncommitted",
+            )
+            .await
+            .unwrap();
+        store.mark_blob_referenced(committed_cid).await.unwrap();
+
+        let eligible = store.list_eligible_orphan_candidates(0, 50).await.unwrap();
+        assert!(eligible.iter().any(|c| c.cid == orphan_cid));
+        assert!(!eligible.iter().any(|c| c.cid == committed_cid));
+
+        store.mark_orphan_blob_unpinned(orphan_cid).await.unwrap();
+        let after_unpin = store.list_eligible_orphan_candidates(0, 50).await.unwrap();
+        assert!(!after_unpin.iter().any(|c| c.cid == orphan_cid));
+
+        // Verify restore source version is persisted in the hash-chained audit record.
+        store
+            .record_write_attempt(
+                "file.version_restore",
+                Some(&actor),
+                "restore-test-src",
+                &file_id,
+                3,
+                Some(&op_id),
+                1337,
+                Some(901),
+                "committed",
+                None,
+                Some(1),
+            )
+            .await
+            .unwrap();
+        let restore_events = store
+            .query_member_audit_events(
+                &actor,
+                "restore-test-src",
+                1337,
+                901,
+                Some("file.version_restore"),
+                5,
+            )
+            .await
+            .unwrap();
+        assert!(!restore_events.is_empty());
+        assert_eq!(restore_events[0].record["restored_from_version"], 1);
+
+        // Clean up temporary test rows.
+        sqlx::query("DELETE FROM gateway_relayed_transactions WHERE tx_hash = $1")
+            .bind(&tx_hash)
+            .execute(metadata.pool())
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM gateway_orphan_blobs WHERE cid IN ($1, $2)")
+            .bind(orphan_cid)
+            .bind(committed_cid)
+            .execute(metadata.pool())
+            .await
+            .unwrap();
     }
 }

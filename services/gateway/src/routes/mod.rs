@@ -49,6 +49,7 @@ pub struct AppState {
     pub(crate) blob_store: Arc<dyn BlobStore>,
     pub(crate) relayer: Option<Arc<dyn GatewayRelayerPort>>,
     pub(crate) config: Arc<GatewayConfig>,
+    pub(crate) stream_semaphore: Arc<tokio::sync::Semaphore>,
 }
 
 #[derive(Serialize)]
@@ -63,12 +64,14 @@ impl AppState {
         blob_store: impl BlobStore + 'static,
         config: GatewayConfig,
     ) -> Self {
+        let max_streams = config.max_concurrent_streams.max(1);
         Self {
             store: Arc::new(store),
             chain: Arc::new(chain),
             blob_store: Arc::new(blob_store),
             relayer: None,
             config: Arc::new(config),
+            stream_semaphore: Arc::new(tokio::sync::Semaphore::new(max_streams)),
         }
     }
 
@@ -112,6 +115,10 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/v1/files/{file_id}/versions/{version}/envelopes",
             post(writes::update_envelope_set),
+        )
+        .route(
+            "/v1/transactions/{tx_hash}",
+            get(writes::reconcile_transaction),
         )
         .route("/v1/audit", get(reads::query_audit))
         .layer(DefaultBodyLimit::max(8 * 1024))

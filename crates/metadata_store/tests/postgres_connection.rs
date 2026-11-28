@@ -48,6 +48,8 @@ async fn migrates_metadata_schema_and_verifies_all_tables_indexes_and_triggers()
         "gateway_used_access_nonces",
         "gateway_rate_buckets",
         "gateway_audit_events",
+        "gateway_relayed_transactions",
+        "gateway_orphan_blobs",
     ] {
         let exists: bool = sqlx::query_scalar("SELECT to_regclass($1) IS NOT NULL")
             .bind(table)
@@ -77,6 +79,9 @@ async fn migrates_metadata_schema_and_verifies_all_tables_indexes_and_triggers()
         "folders_projection_parent",
         "indexed_contract_events_replay_order",
         "gateway_sessions_expiry",
+        "gateway_relayed_transactions_status_created",
+        "gateway_relayed_transactions_actor_created",
+        "gateway_orphan_blobs_status_created",
     ] {
         let exists: bool = sqlx::query_scalar("SELECT to_regclass($1) IS NOT NULL")
             .bind(index)
@@ -261,6 +266,8 @@ async fn least_privilege_roles_enforce_gateway_and_indexer_trust_boundaries() {
         "gateway_used_access_nonces",
         "gateway_rate_buckets",
         "gateway_audit_events",
+        "gateway_relayed_transactions",
+        "gateway_orphan_blobs",
     ] {
         let query = format!("SELECT 1 FROM {gateway_table} LIMIT 1");
         assert!(

@@ -1,0 +1,27 @@
+# Organization Indexer Template (Production Per-Host Role)
+# Consumes finalized Besu QBFT events into rebuildable PostgreSQL projections.
+# Uses the least-privilege `rrfs_indexer` role (`DATABASE_MIGRATION_MODE=verify`).
+
+services:
+  indexer:
+    image: ${RRDS_INDEXER_IMAGE:-rrds-indexer:local}
+    restart: unless-stopped
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      RRDS_ENV: production
+      DATABASE_URL: ${DATABASE_INDEXER_URL:?set least-privilege rrfs_indexer DSN}
+      DATABASE_MIGRATION_MODE: verify
+      DATABASE_MAX_CONNECTIONS: ${DATABASE_MAX_CONNECTIONS:-10}
+      DATABASE_ACQUIRE_TIMEOUT_SECONDS: ${DATABASE_ACQUIRE_TIMEOUT_SECONDS:-5}
+      BESU_RPC_URL: ${BESU_RPC_URL:?set https:// or loopback Besu RPC URL}
+      BESU_CHAIN_ID: ${BESU_CHAIN_ID:?set consortium chain ID}
+      CONTRACT_TIMELOCK_ADDRESS: ${CONTRACT_TIMELOCK_ADDRESS:?set RrdsTimelockController address}
+      CONTRACT_ACCESS_GOVERNANCE_ADDRESS: ${CONTRACT_ACCESS_GOVERNANCE_ADDRESS:?set AccessGovernance address}
+      CONTRACT_FILE_REGISTRY_ADDRESS: ${CONTRACT_FILE_REGISTRY_ADDRESS:?set FileRegistry address}
+      INDEXER_START_BLOCK: ${INDEXER_START_BLOCK:?set contract deployment block}
+      INDEXER_BATCH_SIZE: ${INDEXER_BATCH_SIZE:-500}
+      FINALITY_CHECK_INTERVAL: ${FINALITY_CHECK_INTERVAL:-5}
+      INDEXER_CONFIRMATION_POLICY: finalized
+      INDEXER_RECONCILIATION_INTERVAL_SECONDS: ${INDEXER_RECONCILIATION_INTERVAL_SECONDS:-60}

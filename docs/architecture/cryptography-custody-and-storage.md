@@ -100,11 +100,19 @@ defined by [`TECHNICAL_SPECIFICATION.md`](../specifications/TECHNICAL_SPECIFICAT
     against its own registered identity inside `unwrap_dek` before decapsulation.
   - `apps/cli` wraps dev secret env vars and parsed secret byte arrays in
     `Zeroizing` and enforces HTTPS by default for non-loopback gateway URLs.
+- **MVP vs. Post-MVP HSM Status (`TECHNICAL_SPECIFICATION.md` §17 #1):**
+  - The current MVP operates with `DevelopmentKeyCustody` (CLI) and
+    `DevelopmentRelayerSigner` (gateway), explicitly gated by
+    `RRDS_ALLOW_UNSAFE_DEV_CUSTODY=true` / `GATEWAY_ALLOW_UNSAFE_DEV_RELAYER=true`
+    and refused whenever `RRDS_ENV=production` or `Production` startup policies
+    are active. Production hardware HSM / PKCS#11 adapters remain deferred
+    post-MVP behind the existing `KeyCustodyProvider` and `RelayerSigner` ports
+    (see [`docs/operations/consortium-policies.md`](../operations/consortium-policies.md)).
 - **Separate Relayer Key Custody (`crates/chain_adapter/src/relayer.rs`):**
   - Relayer keys live behind `RelayerSigner` on the gateway server, guarded by
     `RelayerStartupPolicy::Production` (rejecting `DevelopmentRelayerSigner`
-    unless explicitly opted into unsafe dev mode), isolated from member keys and
-    QBFT validator keys.
+    unless explicitly opted into unsafe dev mode in `development`), isolated
+    from member keys and QBFT validator keys.
 
 ## 4. End-to-End Upload, IPFS Replication, and Verified Download Pipeline
 
@@ -146,7 +154,13 @@ defined by [`TECHNICAL_SPECIFICATION.md`](../specifications/TECHNICAL_SPECIFICAT
      transactions via `TransactionRelayer`.
    - If ledger commit fails after pinning, `UploadService` / `ShareService`
      returns `OrphanedUpload` / `OrphanedEnvelopeUpload` carrying the pinned
-     CIDs instead of claiming success.
+     CIDs instead of claiming success. The gateway also persists staged/reverted
+     blobs in `gateway_orphan_blobs` and timed-out relayed transactions in
+     `gateway_relayed_transactions` (reconcilable across restarts via
+     `GET /v1/transactions/{txHash}`). Background `OrphanBlobCleaner` only
+     unpins expired candidates after verifying they are unreferenced in both
+     PostgreSQL projections and authoritative Besu on-chain state, while
+     `StorageHealthMonitor` continuously probes Kubo and Cluster peer health.
 
 ### Authorized Download & Verification (`DownloadService` + `crates/crypto/src/car.rs`)
 1. **Signed access lookup (`POST /v1/files/{id}/versions/{v}/access`):**

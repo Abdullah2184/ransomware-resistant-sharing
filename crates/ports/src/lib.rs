@@ -13,8 +13,8 @@ use zeroize::Zeroizing;
 
 pub use blob_store::{
     BlobStore, ContentChunk, ContentPackage, ReplicationReceipt, StorageCid, StorageError,
-    StorageFuture, StorageReader, StoredContent, StoredEnvelopeSet, decode_content_package_frame,
-    encode_content_package_frame,
+    StorageFuture, StorageHealthStatus, StorageReader, StoredContent, StoredEnvelopeSet,
+    decode_content_package_frame, encode_content_package_frame,
 };
 pub use clock::{Clock, SystemClock};
 pub use ledger::{

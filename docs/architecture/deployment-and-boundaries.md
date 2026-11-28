@@ -15,7 +15,7 @@ boundaries enforced across the RRDS workspace (see
 | `crates/key_custody` | `domain`, `crypto`, `ports` | `chain_adapter`, `ipfs_adapter`, `metadata_store`, network/SQL crates |
 | `crates/chain_adapter` | `domain` | `ipfs_adapter`, `metadata_store`, `key_custody`, `application`, plaintext encryption |
 | `crates/ipfs_adapter` | `domain`, `crypto` (canonical manifest/CID validation only), `ports` | `chain_adapter`, `metadata_store`, `key_custody`, `application` |
-| `crates/metadata_store` | None (owns `PostgresPoolConfig`, `MigrationMode` defaulting to `verify`, and SQLx migrations `0001`–`0006`) | `chain_adapter`, `ipfs_adapter`, `crypto`, `key_custody`, `application` |
+| `crates/metadata_store` | None (owns `PostgresPoolConfig`, `MigrationMode` defaulting to `verify`, standalone `rrds-migrate` runner, and SQLx migrations `0001`–`0007`) | `chain_adapter`, `ipfs_adapter`, `crypto`, `key_custody`, `application` |
 | `crates/scanner` | `domain`, `ports` (`DisabledScanner` default MVP adapter) | Network, storage, chain, DB, or key-custody crates |
 | `services/indexer` | `domain`, `chain_adapter`, `metadata_store` (runs under least-privilege `rrfs_indexer` DB role) | `ipfs_adapter`, `key_custody`, `crypto` decryption, `application` |
 | `services/gateway` | `domain`, `crypto` (EIP-712 digests, `keccak256`, raw CID & canonical envelope-set parsing only), `ports`, `chain_adapter`, `ipfs_adapter`, `metadata_store` (`key_custody` in `[dev-dependencies]` only; runs under least-privilege `rrfs_gateway` DB role) | `key_custody` (runtime), `application`, plaintext file encryption/decryption or HPKE unwrap |
@@ -83,11 +83,13 @@ boundaries enforced across the RRDS workspace (see
    - Encrypted `ContentPackage` HTTP staging framing (`RRDSPKG1`) lives once in
      `crates/ports::{encode_content_package_frame, decode_content_package_frame}`
      (reused by `apps/cli` and `services/gateway`).
-   - Gateway route handlers are cleanly separated into
-     `services/gateway/src/routes/{mod,middleware,auth,reads,writes,blobs}.rs`,
-     sharing `authenticate_bearer`, `authenticate_active_member`,
-     `authorize_version_read`, `read_bounded_envelope_set`, `WriteAuditContext`,
-     and `authorize_blob_staging`.
+   - Gateway route handlers and operational maintenance are cleanly separated
+     into `services/gateway/src/routes/{mod,middleware,auth,reads,writes,blobs}.rs`
+     and `services/gateway/src/maintenance.rs` (`OrphanBlobCleaner`,
+     `StorageHealthMonitor`), sharing `authenticate_bearer`,
+     `authenticate_active_member`, `authorize_version_read`,
+     `read_bounded_envelope_set`, `WriteAuditContext`, and
+     `authorize_blob_staging`.
 6. **Automated CI Enforcement:**
    - [`.github/workflows/ci.yml`](../../.github/workflows/ci.yml) verifies
      `cargo fmt`, strict Clippy (`-D warnings`), offline workspace unit/HTTP

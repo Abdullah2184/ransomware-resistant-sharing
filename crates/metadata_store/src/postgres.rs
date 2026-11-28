@@ -281,6 +281,6 @@ mod tests {
     #[test]
     fn embedded_migrator_contains_expected_sequential_versions() {
         let versions: Vec<i64> = MIGRATOR.iter().map(|m| m.version).collect();
-        assert_eq!(versions, vec![1, 2, 3, 4, 5, 6]);
+        assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7]);
     }
 }

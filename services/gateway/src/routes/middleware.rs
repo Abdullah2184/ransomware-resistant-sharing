@@ -43,6 +43,7 @@ pub(crate) fn rate_limit_action(method: &str, path: &str) -> Option<&'static str
         }
         ("POST", "/v1/blobs/content") => Some("blob.content_upload"),
         ("POST", "/v1/blobs/envelopes") => Some("blob.envelope_upload"),
+        ("GET", path) if path.starts_with("/v1/transactions/") => Some("transaction.reconcile"),
         ("GET", "/v1/audit") => Some("audit.query"),
         _ => None,
     }
@@ -174,6 +175,44 @@ pub(crate) async fn enforce_rate_limit(
                         )
                         .await;
                     }
+                    Err(_) => return error(StatusCode::SERVICE_UNAVAILABLE, "service_unavailable"),
+                }
+
+                // Independent per-organization budget when projected (§8, §8.2).
+                match state.store.member_organization_id(&member_id).await {
+                    Ok(Some(org_id)) => {
+                        let org_key = format!("org:{action}:{org_id}");
+                        match state
+                            .store
+                            .take_rate_limit_token(
+                                &org_key,
+                                f64::from(state.config.org_rate_limit_capacity),
+                                state.config.org_rate_limit_refill_per_second,
+                            )
+                            .await
+                        {
+                            Ok(true) => {}
+                            Ok(false) => {
+                                return failure(
+                                    &state,
+                                    action,
+                                    &source_id,
+                                    "org_rate_limited",
+                                    None,
+                                    StatusCode::TOO_MANY_REQUESTS,
+                                    "rate_limited",
+                                )
+                                .await;
+                            }
+                            Err(_) => {
+                                return error(
+                                    StatusCode::SERVICE_UNAVAILABLE,
+                                    "service_unavailable",
+                                );
+                            }
+                        }
+                    }
+                    Ok(None) => {}
                     Err(_) => return error(StatusCode::SERVICE_UNAVAILABLE, "service_unavailable"),
                 }
             }

@@ -1,0 +1,66 @@
+# Organization Gateway + TLS Reverse Proxy Template (Production Per-Host Role)
+# Deploy on an organization-owned application host behind private/consortium networking.
+# Prerequisites:
+#   1. Run `rrds-migrate run` as `rrfs_migrator` and apply `infra/postgres/init-roles.sql`.
+#   2. Mount TLS certificates or configure ACME/internal CA in Caddyfile.
+#   3. Supply secrets via host-managed secret files (never commit production secrets).
+
+services:
+  gateway:
+    image: ${RRDS_GATEWAY_IMAGE:-rrds-gateway:local}
+    restart: unless-stopped
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      RRDS_ENV: production
+      GATEWAY_BIND: 127.0.0.1:8080
+      GATEWAY_AUDIENCE: ${GATEWAY_AUDIENCE:?set organization gateway audience}
+      DATABASE_URL: ${DATABASE_GATEWAY_URL:?set least-privilege rrfs_gateway DSN}
+      DATABASE_MIGRATION_MODE: verify
+      DATABASE_MAX_CONNECTIONS: ${DATABASE_MAX_CONNECTIONS:-20}
+      DATABASE_ACQUIRE_TIMEOUT_SECONDS: ${DATABASE_ACQUIRE_TIMEOUT_SECONDS:-5}
+      BESU_RPC_URL: ${BESU_RPC_URL:?set https:// or loopback Besu RPC URL}
+      BESU_CHAIN_ID: ${BESU_CHAIN_ID:?set consortium chain ID}
+      CONTRACT_ACCESS_GOVERNANCE_ADDRESS: ${CONTRACT_ACCESS_GOVERNANCE_ADDRESS:?set AccessGovernance address}
+      CONTRACT_FILE_REGISTRY_ADDRESS: ${CONTRACT_FILE_REGISTRY_ADDRESS:?set FileRegistry address}
+      IPFS_API_URLS: ${IPFS_API_URLS:?set private/https Kubo API URLs}
+      IPFS_CLUSTER_API_URL: ${IPFS_CLUSTER_API_URL:?set private/https Cluster API URL}
+      IPFS_CLUSTER_USERNAME: ${IPFS_CLUSTER_USERNAME:?set Cluster basic-auth user}
+      IPFS_CLUSTER_PASSWORD_FILE: /run/secrets/ipfs_cluster_password
+      MIN_PIN_REPLICAS: ${MIN_PIN_REPLICAS:-3}
+      DEFAULT_TX_GAS_LIMIT: ${DEFAULT_TX_GAS_LIMIT:-2000000}
+      TRANSACTION_CONFIRMATION_TIMEOUT: ${TRANSACTION_CONFIRMATION_TIMEOUT:-30}
+      ORPHAN_RETENTION_SECONDS: ${ORPHAN_RETENTION_SECONDS:-3600}
+      GATEWAY_STORAGE_HEALTH_INTERVAL_SECONDS: ${GATEWAY_STORAGE_HEALTH_INTERVAL_SECONDS:-30}
+      GATEWAY_MAX_CONCURRENT_STREAMS: ${GATEWAY_MAX_CONCURRENT_STREAMS:-32}
+      GATEWAY_MAX_BLOB_UPLOAD_BYTES: ${GATEWAY_MAX_BLOB_UPLOAD_BYTES:-67108864}
+      GATEWAY_RATE_LIMIT_CAPACITY: ${GATEWAY_RATE_LIMIT_CAPACITY:-30}
+      GATEWAY_RATE_LIMIT_REFILL_PER_SECOND: ${GATEWAY_RATE_LIMIT_REFILL_PER_SECOND:-0.5}
+      GATEWAY_MEMBER_RATE_LIMIT_CAPACITY: ${GATEWAY_MEMBER_RATE_LIMIT_CAPACITY:-60}
+      GATEWAY_MEMBER_RATE_LIMIT_REFILL_PER_SECOND: ${GATEWAY_MEMBER_RATE_LIMIT_REFILL_PER_SECOND:-1.0}
+      GATEWAY_ORG_RATE_LIMIT_CAPACITY: ${GATEWAY_ORG_RATE_LIMIT_CAPACITY:-300}
+      GATEWAY_ORG_RATE_LIMIT_REFILL_PER_SECOND: ${GATEWAY_ORG_RATE_LIMIT_REFILL_PER_SECOND:-5.0}
+    secrets:
+      - ipfs_cluster_password
+    network_mode: host
+
+  tls-proxy:
+    image: caddy:2.9.1-alpine
+    restart: unless-stopped
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    network_mode: host
+
+secrets:
+  ipfs_cluster_password:
+    file: ${IPFS_CLUSTER_PASSWORD_FILE:?path to host-managed Cluster password file}
+
+volumes:
+  caddy_data:
+  caddy_config:

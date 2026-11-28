@@ -272,9 +272,15 @@ relayer.
   "epochId": "0x<64 lowercase hex>",
   "operationNonce": "0x<64 lowercase hex>",
   "deadline": 1800000120,
-  "signature": "0x<65-byte recoverable secp256k1 signature>"
+  "signature": "0x<65-byte recoverable secp256k1 signature>",
+  "restoredFromVersion": 1
 }
 ```
+
+The optional `restoredFromVersion` field (when provided for append-only restore)
+must satisfy `1 <= restoredFromVersion < versionNumber` (`400 invalid_request`
+otherwise) and records the recovery source version in the hash-chained
+`file.version_restore` PostgreSQL audit record (§9.7 #6).
 
 The gateway checks active member identity, authoritative `hasWriteAccess`
 (`401 unauthorized`), active head continuity (`409 stale_head` if
@@ -309,6 +315,25 @@ envelope pointer continuity (`409 stale_head` if `oldEnvelopeSetCid` or
 contract role). Returns `200 OK` only on committed receipt. Envelope updates
 only advance the encrypted key-envelope pointer and never grant or modify ACL
 permissions (which remain strictly governed by the file's policy Safe).
+
+## Reconcile a relayed transaction
+
+`GET /v1/transactions/{txHash}` with a valid bearer session.
+
+Looks up `txHash` in `gateway_relayed_transactions` (surviving gateway restarts
+per §7.13 and §10.4.7). Returns `404 not_found` if the transaction does not
+exist or belongs to a different member (preventing cross-member probing). When
+the persisted status is `pending`, the gateway queries Besu via
+`reconcile_transaction(txHash)`:
+
+- On finalized commit: transitions status to `confirmed`, marks associated
+  `contentCid`/`envelopeSetCid` blobs as `referenced` in `gateway_orphan_blobs`,
+  writes a `transaction.reconcile` audit record, and returns `200 OK` with
+  `blockNumber`, `blockHash`, and `gasUsed`.
+- On finalized revert: transitions status to `reverted`, records associated
+  blobs as `candidate` orphans (`reason = "contract_reverted"`), writes an
+  audit record, and returns `200 OK` with `status: "reverted"`.
+- If still pending on Besu: returns `200 OK` with `status: "pending"`.
 
 All errors use a bounded JSON error code. Unauthorized session responses do
 not distinguish unknown, inactive, or mismatched identities.

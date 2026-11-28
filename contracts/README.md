@@ -59,18 +59,23 @@ until that operation completes. Never put private keys in the parameter file.
 
 `BESU_CHAIN_ID` defaults to the local development chain ID `1337` in the
 Hardhat configuration. The actual Besu genesis configuration is authoritative;
-configure the same chain ID there. Deployment, role activation, Option B
-relayed envelope updates, EIP-712 parity, and §7.9 gas bounds are covered by
-local Hardhat tests (`36` passing: `30` Solidity, `6` Node.js including
-`GasBounds.ts`).
+configure the same chain ID there. Deployment, role activation, audited Safe
+v1.4.1 `2-of-3` threshold governance, Option B relayed envelope updates,
+EIP-712 parity, and §7.9 gas bounds are covered by local Hardhat tests (`37`
+passing: `30` Solidity, `7` Node.js including `GasBounds.ts` and
+`SafeGovernance.ts`).
 
-## Local Dev Smoke-Test Bootstrap (`scripts/besu-bootstrap.mjs`)
+## Local Besu Bootstrap with Audited Safe v1.4.1 Proxies (`scripts/besu-bootstrap.mjs`)
 
-For single-host local development smoke tests prior to deploying real Safe
-multisig contracts on Besu, [`scripts/besu-bootstrap.mjs`](scripts/besu-bootstrap.mjs)
-provides a zero-gas-price workflow that keeps all dev keys inside git-ignored
-`contracts/secrets/besu-dev-accounts.json` (`0600`) and never prints private
-keys:
+[`scripts/besu-bootstrap.mjs`](scripts/besu-bootstrap.mjs) (backed by
+[`scripts/safe-helpers.mjs`](scripts/safe-helpers.mjs) and
+`@safe-global/safe-contracts` `1.4.1`) deploys real audited Safe v1.4.1
+infrastructure (`Safe` singleton, `SafeProxyFactory`,
+`CompatibilityFallbackHandler`) and three independent **`2-of-3` threshold Safe
+smart accounts** (`consortiumSafe`, `emergencySafe`, `organizationSafe`) using
+zero-gas-price Besu transactions. Local development owner keys stay inside
+git-ignored `contracts/secrets/besu-dev-accounts.json` (`0600`) and are never
+printed:
 
 ```shell
 node scripts/besu-bootstrap.mjs init-dev-accounts
@@ -79,27 +84,34 @@ node scripts/besu-bootstrap.mjs schedule
 node scripts/besu-bootstrap.mjs status
 # After the 24-hour (86,400s) RrdsTimelockController delay expires:
 node scripts/besu-bootstrap.mjs execute
-# Enroll the local demo member (signs EIP-712 MemberKeyProof; secrets in git-ignored contracts/secrets/besu-dev-member.json):
+# Enroll the local demo member through 2-of-3 organizationSafe execTransaction:
 node scripts/besu-bootstrap.mjs register-member
+# Grant / revoke Read ACL through 2-of-3 organizationSafe execTransaction:
+node scripts/besu-bootstrap.mjs grant-read <fileId> <memberId> [proposalSeed]
+node scripts/besu-bootstrap.mjs revoke-read <fileId> <memberId> [proposalSeed]
 ```
 
-> **Development smoke-test limitation:** `init-dev-accounts` generates local
-> EOA placeholders (`consortiumSafe`, `emergencySafe`, `organizationSafe`) to
-> stand in for Safe smart accounts during local smoke testing only. Per
-> [`docs/adr/governance-authority-and-timelock.md`](../docs/adr/governance-authority-and-timelock.md),
-> production and staging deployments **must** use audited Safe threshold
-> accounts and HSM/keystore custody, and real Safe proxy compatibility on Besu
-> must be validated before any production claim.
+> **Signer custody note:** While the on-chain governance authorities are real
+> audited Safe v1.4.1 `2-of-3` proxy contracts, local owner keys in
+> `contracts/secrets/besu-dev-accounts.json` are development-only software keys.
+> Production deployments must use hardware-backed / HSM Safe signers per
+> [`docs/operations/consortium-policies.md`](../docs/operations/consortium-policies.md).
 
-### Current Local Besu Smoke-Test Deployment Snapshot (28 November 2026 — Option B)
+### Current Local Besu Deployment Snapshot (28 November 2026 — Safe v1.4.1 + Option B)
 
 - **Network:** Local Besu QBFT (`http://127.0.0.1:8545`, `chainId = 1337`, zero gas price)
-- **Authority mode:** **Dev-only EOA placeholders** (stored in git-ignored `contracts/secrets/besu-dev-accounts.json`) — replace with real Safe multisigs later
-- **`RrdsTimelockController`:** `0xc4647d02e8ba1c922d5c4fc22e04b3d1bcd75568` (block `60843`, `minDelay = 86400s`)
-- **`AccessGovernance` (Option B):** `0x1efe4b8d6076a0ca115241346f8d7da516ce4055` (block `60845`, `17,475` runtime bytes)
-- **`FileRegistry`:** `0x7ba5ef0f4c923942554c8b5788578280f7451f2d` (block `60846`)
-- **Timelocked activation batch (`grantRole(FILE_REGISTRY_ROLE, FileRegistry)` + `registerOrganization(rrds-dev-org-1, orgSafe)`):**
-  - `operationId`: `0xdb2a6855389bb2fa922f3110e7af84deabdf798c6c86b2c63261e665c16f8c56`
-  - Scheduled at block `60850` (`delay = 86400s`); executable at **`2026-11-29T01:27:12.000Z`** via `node scripts/besu-bootstrap.mjs execute`
-  - Verified on-chain: `deployer` has no admin role on either contract, `RrdsTimelockController` is sole `DEFAULT_ADMIN_ROLE` on `AccessGovernance`, `emergencySafe` holds `EMERGENCY_SUSPENDER_ROLE`, and `FILE_REGISTRY_ROLE` remains inactive until execution.
-- **Previous snapshot (27 November 2026, pre-Option-B):** `RrdsTimelockController=0x18cd48bbff72acf29bd50f8e98397b1a07eba80f`, `AccessGovernance=0xe1304f22747114aafdd0c0c3f8e64b83c5326663`, `FileRegistry=0xf27d55447405f702299ed948325cfd9025fbe5cb` (timelock executed at block `59814`, demo member enrolled at block `59819`, full live `scripts/demo-local.sh` E2E verified through block `60745`; metadata archived under `contracts/ignition/deployments/chain-1337/pre-option-b/`).
+- **Authority mode:** **Audited Safe v1.4.1 `2-of-3` threshold proxy contracts** (`@safe-global/safe-contracts@1.4.1`)
+  - `Safe` singleton: `0xd18d97A3fcb1727Bd6d985ADAe904d8037F65922` (block `62877`)
+  - `SafeProxyFactory`: `0xCe4F7E2f1B578075f318bA3091E0dE0ea80F6E44` (block `62879`)
+  - `CompatibilityFallbackHandler`: `0xCF157029fC460D85c101360fbD73d90931249201` (block `62881`)
+  - `consortiumSafe` (`2-of-3`): `0xB22ABd007c759Ff1c8C02e88342AF9157a5bBd10` (block `62883`)
+  - `emergencySafe` (`2-of-3`): `0xc6cB8012bb50d454b2A40EDb860968a2829e70bc` (block `62885`)
+  - `organizationSafe` (`2-of-3`): `0xBB73518d8f0Fc9E99B7a590F3E2CA027b462b378` (block `62887`)
+- **`RrdsTimelockController`:** `0x5a51c4bd51709838764c185b490221855e37e64d` (block `62889`, `minDelay = 86400s`)
+- **`AccessGovernance` (Option B):** `0x04ec7bde5732ca6c5e04709641c53a564e1c5472` (block `62891`, `17,475` runtime bytes)
+- **`FileRegistry`:** `0xeae1730d50eb47b7573c682afa2ee4995ba1968d` (block `62894`)
+- **Timelocked activation batch (`grantRole(FILE_REGISTRY_ROLE, FileRegistry)` + `registerOrganization(rrds-dev-org-1, organizationSafe)`):**
+  - `operationId`: `0xc15d21e8e81b88eda9328e2a6cd6dfa2cc59d3505318c4ba209447f7752f5254`
+  - Scheduled via **`2-of-3` `consortiumSafe.execTransaction`** at block `62898` (`delay = 86400s`); executable at **`2026-11-29T03:19:33.000Z`** via `node scripts/besu-bootstrap.mjs execute`
+  - Verified on-chain: all 3 Safe proxies report `getThreshold() == 2`, `deployer` has no admin role on either contract, `RrdsTimelockController` is sole `DEFAULT_ADMIN_ROLE` on `AccessGovernance`, `emergencySafe` holds `EMERGENCY_SUSPENDER_ROLE`, and `FILE_REGISTRY_ROLE` remains inactive until execution.
+- **Archived prior snapshots:** Pre-Option-B E2E-verified snapshot (`0x18cd...`, `0xe130...`, `0xf27d...`) archived under `contracts/ignition/deployments/chain-1337/pre-option-b/`; Option B EOA-placeholder snapshot (`0xc464...`, `0x1efe...`, `0x7ba5...`) archived under `contracts/ignition/deployments/chain-1337/option-b-eoa-placeholder/`.

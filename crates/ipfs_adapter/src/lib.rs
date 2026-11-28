@@ -244,6 +244,72 @@ impl IpfsClusterStore {
         parse_add_output(&output, wrap_with_directory, expected_content)
     }
 
+    async fn delete_pin(&self, cid_text: &str) -> Result<(), StorageError> {
+        let mut last_err = StorageError::TransportUnavailable;
+        for base in &self.cluster_api_urls {
+            let url = base
+                .join(&format!("pins/{cid_text}"))
+                .map_err(|_| StorageError::InvalidCid)?;
+            let response = match self
+                .client
+                .delete(url)
+                .basic_auth(&self.credentials.username, Some(&self.credentials.password))
+                .send()
+                .await
+            {
+                Ok(response) => response,
+                Err(_) => {
+                    last_err = StorageError::TransportUnavailable;
+                    continue;
+                }
+            };
+            let status = response.status();
+            if status.is_success()
+                || status == StatusCode::ACCEPTED
+                || status == StatusCode::NOT_FOUND
+            {
+                return Ok(());
+            }
+            if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
+                return Err(StorageError::TransportUnavailable);
+            }
+            last_err = StorageError::TransportUnavailable;
+        }
+        Err(last_err)
+    }
+
+    async fn probe_storage_health(&self) -> ports::StorageHealthStatus {
+        let mut healthy_kubo_peers = 0usize;
+        for base in &self.kubo_api_urls {
+            if let Ok(url) = base.join("api/v0/id")
+                && let Ok(response) = self.probe_client.post(url).send().await
+                && response.status().is_success()
+            {
+                healthy_kubo_peers += 1;
+            }
+        }
+        let mut healthy_cluster_peers = 0usize;
+        for base in &self.cluster_api_urls {
+            if let Ok(url) = base.join("id")
+                && let Ok(response) = self
+                    .probe_client
+                    .get(url)
+                    .basic_auth(&self.credentials.username, Some(&self.credentials.password))
+                    .send()
+                    .await
+                && response.status().is_success()
+            {
+                healthy_cluster_peers += 1;
+            }
+        }
+        ports::StorageHealthStatus {
+            healthy_kubo_peers,
+            total_kubo_peers: self.kubo_api_urls.len(),
+            healthy_cluster_peers,
+            total_cluster_peers: self.cluster_api_urls.len(),
+        }
+    }
+
     async fn post_pin(&self, cid_text: &str, min_replicas: usize) -> Result<(), StorageError> {
         let mut last_err = StorageError::TransportUnavailable;
         for base in &self.cluster_api_urls {
@@ -619,6 +685,17 @@ impl BlobStore for IpfsClusterStore {
 
     fn verify_retrievable<'a>(&'a self, cid: StorageCid) -> StorageFuture<'a, ()> {
         Box::pin(async move { self.verify_cid_retrievable(&cid).await })
+    }
+
+    fn unpin<'a>(&'a self, cid: StorageCid) -> StorageFuture<'a, ()> {
+        Box::pin(async move {
+            let cid_text = storage_cid_string(&cid);
+            self.delete_pin(&cid_text).await
+        })
+    }
+
+    fn health_status<'a>(&'a self) -> StorageFuture<'a, ports::StorageHealthStatus> {
+        Box::pin(async move { Ok(self.probe_storage_health().await) })
     }
 }
 
@@ -1717,5 +1794,127 @@ mod tests {
             Err(StorageError::TransportUnavailable)
         );
         empty_server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn unpin_handles_success_idempotent_404_and_auth_failure() {
+        let cluster = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let cluster_addr = cluster.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            // 1. 200 OK
+            let (mut s1, _) = cluster.accept().await.unwrap();
+            let req1 = read_mock_http_request(&mut s1).await;
+            assert!(req1.starts_with("DELETE /pins/"));
+            s1.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .await
+                .unwrap();
+
+            // 2. 404 Not Found -> idempotent Ok
+            let (mut s2, _) = cluster.accept().await.unwrap();
+            let req2 = read_mock_http_request(&mut s2).await;
+            assert!(req2.starts_with("DELETE /pins/"));
+            s2.write_all(
+                b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .unwrap();
+
+            // 3. 401 Unauthorized -> TransportUnavailable
+            let (mut s3, _) = cluster.accept().await.unwrap();
+            let req3 = read_mock_http_request(&mut s3).await;
+            assert!(req3.starts_with("DELETE /pins/"));
+            s3.write_all(
+                b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        });
+
+        let store = IpfsClusterStore::new(IpfsConfig {
+            kubo_api_urls: vec!["http://127.0.0.1:15001".to_owned()],
+            cluster_api_urls: vec![format!("http://{cluster_addr}")],
+            cluster_credentials: ClusterCredentials::new("user", "password"),
+            request_timeout: Duration::from_secs(2),
+            replication_timeout: Duration::from_secs(1),
+            replication_poll_interval: Duration::from_millis(10),
+            max_upload_bytes: 1024,
+        })
+        .unwrap();
+        let cid = ContentCid::parse(&raw_chunk_cid(b"orphan-blob").unwrap()).unwrap();
+        store
+            .unpin(StorageCid::Content(cid.clone()))
+            .await
+            .expect("200 OK unpin");
+        store
+            .unpin(StorageCid::Content(cid.clone()))
+            .await
+            .expect("404 Not Found unpin should be idempotent");
+        assert_eq!(
+            store.unpin(StorageCid::Content(cid)).await,
+            Err(StorageError::TransportUnavailable)
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn health_status_reports_degraded_and_healthy_kubo_and_cluster_peers() {
+        let kubo_ok = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let kubo_ok_addr = kubo_ok.local_addr().unwrap();
+        let kubo_down = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let kubo_down_addr = kubo_down.local_addr().unwrap();
+        let cluster_ok = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let cluster_ok_addr = cluster_ok.local_addr().unwrap();
+
+        let s1 = tokio::spawn(async move {
+            let (mut s, _) = kubo_ok.accept().await.unwrap();
+            let req = read_mock_http_request(&mut s).await;
+            assert!(req.starts_with("POST /api/v0/id"));
+            s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}")
+                .await
+                .unwrap();
+        });
+        let s2 = tokio::spawn(async move {
+            let (mut s, _) = kubo_down.accept().await.unwrap();
+            let _ = read_mock_http_request(&mut s).await;
+            s.write_all(
+                b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        });
+        let s3 = tokio::spawn(async move {
+            let (mut s, _) = cluster_ok.accept().await.unwrap();
+            let req = read_mock_http_request(&mut s).await;
+            assert!(req.starts_with("GET /id"));
+            s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}")
+                .await
+                .unwrap();
+        });
+
+        let store = IpfsClusterStore::new(IpfsConfig {
+            kubo_api_urls: vec![
+                format!("http://{kubo_ok_addr}"),
+                format!("http://{kubo_down_addr}"),
+            ],
+            cluster_api_urls: vec![format!("http://{cluster_ok_addr}")],
+            cluster_credentials: ClusterCredentials::new("user", "password"),
+            request_timeout: Duration::from_secs(2),
+            replication_timeout: Duration::from_secs(1),
+            replication_poll_interval: Duration::from_millis(10),
+            max_upload_bytes: 1024,
+        })
+        .unwrap();
+
+        let health = store.health_status().await.unwrap();
+        assert_eq!(health.healthy_kubo_peers, 1);
+        assert_eq!(health.total_kubo_peers, 2);
+        assert_eq!(health.healthy_cluster_peers, 1);
+        assert_eq!(health.total_cluster_peers, 1);
+        assert!(health.is_healthy());
+        assert!(health.is_degraded());
+
+        s1.await.unwrap();
+        s2.await.unwrap();
+        s3.await.unwrap();
     }
 }

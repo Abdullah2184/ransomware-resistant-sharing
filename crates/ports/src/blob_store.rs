@@ -152,6 +152,25 @@ impl From<DomainError> for StorageError {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StorageHealthStatus {
+    pub healthy_kubo_peers: usize,
+    pub total_kubo_peers: usize,
+    pub healthy_cluster_peers: usize,
+    pub total_cluster_peers: usize,
+}
+
+impl StorageHealthStatus {
+    pub fn is_healthy(&self) -> bool {
+        self.healthy_kubo_peers > 0 && self.healthy_cluster_peers > 0
+    }
+
+    pub fn is_degraded(&self) -> bool {
+        self.healthy_kubo_peers < self.total_kubo_peers
+            || self.healthy_cluster_peers < self.total_cluster_peers
+    }
+}
+
 /// Storage operations accept encrypted package streams and return only after
 /// the requested Cluster replication quorum has been verified.
 pub trait BlobStore: Send + Sync {
@@ -179,6 +198,27 @@ pub trait BlobStore: Send + Sync {
     ) -> StorageFuture<'a, ReplicationReceipt>;
 
     fn verify_retrievable<'a>(&'a self, cid: StorageCid) -> StorageFuture<'a, ()>;
+
+    /// Unpins an unreferenced orphan object from IPFS Cluster (§7.13).
+    ///
+    /// Callers MUST verify both off-chain projections and authoritative
+    /// on-chain contract state confirm the CID is unreferenced before calling.
+    fn unpin<'a>(&'a self, _cid: StorageCid) -> StorageFuture<'a, ()> {
+        Box::pin(async { Err(StorageError::TransportUnavailable) })
+    }
+
+    /// Probes configured Kubo and IPFS Cluster endpoints for background
+    /// operational monitoring (§9.9 B).
+    fn health_status<'a>(&'a self) -> StorageFuture<'a, StorageHealthStatus> {
+        Box::pin(async {
+            Ok(StorageHealthStatus {
+                healthy_kubo_peers: 1,
+                total_kubo_peers: 1,
+                healthy_cluster_peers: 1,
+                total_cluster_peers: 1,
+            })
+        })
+    }
 }
 
 /// Serializes an encrypted [`ContentPackage`] into the canonical length-prefixed

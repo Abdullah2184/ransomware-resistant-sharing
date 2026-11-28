@@ -55,7 +55,9 @@ DECLARE
         'gateway_login_challenges',
         'gateway_sessions',
         'gateway_used_access_nonces',
-        'gateway_rate_buckets'
+        'gateway_rate_buckets',
+        'gateway_relayed_transactions',
+        'gateway_orphan_blobs'
     ];
     tbl text;
 BEGIN

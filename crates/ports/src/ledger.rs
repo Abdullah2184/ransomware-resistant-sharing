@@ -90,6 +90,8 @@ pub struct SignedAppendVersionRequest {
     pub operation_nonce: OperationNonce,
     pub deadline: u64,
     pub signature: EvmSignature,
+    /// Optional source historical version when performing an append-only restore (§9.7 #6).
+    pub restored_from_version: Option<VersionNumber>,
 }
 
 /// Signed request to authorize retrieval of a specific file version.

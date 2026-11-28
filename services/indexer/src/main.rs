@@ -290,6 +290,26 @@ async fn run() -> Result<(), IndexerError> {
     let config = Config::from_env()?;
     let rpc_endpoint = env::var("BESU_RPC_URL").map_err(|_| IndexerError::InvalidConfiguration)?;
     let database_url = env::var("DATABASE_URL").map_err(|_| IndexerError::InvalidConfiguration)?;
+    let runtime_env = env::var("RRDS_ENV").unwrap_or_else(|_| "development".to_owned());
+    if matches!(
+        runtime_env.trim().to_ascii_lowercase().as_str(),
+        "production" | "prod"
+    ) {
+        let lower_db = database_url.to_ascii_lowercase();
+        if lower_db.contains("replace-with-")
+            || lower_db.contains("changeme")
+            || lower_db.contains("placeholder")
+        {
+            return Err(IndexerError::InvalidConfiguration);
+        }
+        if !(rpc_endpoint.starts_with("https://")
+            || rpc_endpoint.starts_with("http://127.0.0.1")
+            || rpc_endpoint.starts_with("http://localhost")
+            || rpc_endpoint.starts_with("http://[::1]"))
+        {
+            return Err(IndexerError::InvalidConfiguration);
+        }
+    }
     let pool_config =
         PostgresPoolConfig::from_env().map_err(|_| IndexerError::InvalidConfiguration)?;
     let migration_mode =
@@ -1760,18 +1780,18 @@ mod tests {
         let expected_chain_id = parse_env_u64("BESU_CHAIN_ID", "1337").expect("valid chain ID");
         let access_governance = parse_nonzero_address(
             &env::var("CONTRACT_ACCESS_GOVERNANCE_ADDRESS")
-                .unwrap_or_else(|_| "0x1efe4b8d6076a0ca115241346f8d7da516ce4055".to_owned()),
+                .unwrap_or_else(|_| "0x04ec7bde5732ca6c5e04709641c53a564e1c5472".to_owned()),
         )
         .expect("valid AccessGovernance address");
         let timelock = parse_nonzero_address(
             &env::var("CONTRACT_TIMELOCK_ADDRESS")
-                .unwrap_or_else(|_| "0xc4647d02e8ba1c922d5c4fc22e04b3d1bcd75568".to_owned()),
+                .unwrap_or_else(|_| "0x5a51c4bd51709838764c185b490221855e37e64d".to_owned()),
         )
         .expect("valid RrdsTimelockController address");
-        let from_block = parse_env_u64("BESU_BOOTSTRAP_FROM_BLOCK", "60840")
+        let from_block = parse_env_u64("BESU_BOOTSTRAP_FROM_BLOCK", "62885")
             .expect("valid bootstrap from block");
         let to_block =
-            parse_env_u64("BESU_BOOTSTRAP_TO_BLOCK", "60855").expect("valid bootstrap to block");
+            parse_env_u64("BESU_BOOTSTRAP_TO_BLOCK", "62902").expect("valid bootstrap to block");
 
         let client = BesuClient::new(&rpc_url).expect("BesuClient");
         assert_eq!(

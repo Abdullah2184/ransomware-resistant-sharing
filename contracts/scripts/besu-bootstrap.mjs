@@ -1,14 +1,17 @@
 #!/usr/bin/env node
 /**
- * Local Besu QBFT development bootstrap helper (smoke-test ONLY).
+ * Local Besu QBFT bootstrap helper using audited Safe v1.4.1 (`2-of-3`)
+ * threshold smart accounts + 24-hour `RrdsTimelockController`.
  *
  * Security notes:
- * - Generates local development-only EOA keys strictly inside git-ignored
+ * - Stores local development owner/relayer keys strictly inside git-ignored
  *   `contracts/secrets/besu-dev-accounts.json` (mode 0600) and NEVER prints
  *   private keys to stdout/stderr.
- * - These EOA placeholders stand in for Safe multisig contracts ONLY for local
- *   single-host smoke testing. Production deployments MUST use audited Safe
- *   threshold accounts per `docs/adr/governance-authority-and-timelock.md`.
+ * - Deploys real audited `@safe-global/safe-contracts` v1.4.1 (`Safe`,
+ *   `SafeProxyFactory`, `CompatibilityFallbackHandler`) and three independent
+ *   `2-of-3` Safe proxy smart accounts (`consortiumSafe`, `emergencySafe`,
+ *   `organizationSafe`) so governance authorities are real multisig contracts,
+ *   not single-key EOA placeholders.
  * - Enforces the real 24-hour (`86400`s) `RrdsTimelockController` delay with
  *   no administrative bypass.
  */
@@ -28,6 +31,13 @@ import {
 } from "viem";
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
 
+import {
+  deploySafeInfrastructure,
+  deploySafeProxy,
+  execSafeTransaction,
+  loadSafeArtifact,
+} from "./safe-helpers.mjs";
+
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const contractsDir = path.resolve(__dirname, "..");
 const secretsDir = path.join(contractsDir, "secrets");
@@ -46,9 +56,10 @@ const deployedAddressesFile = path.join(deploymentsDir, "deployed_addresses.json
 const bootstrapStateFile = path.join(deploymentsDir, "bootstrap-state.json");
 
 const DEMO_ORG_ID = keccak256(stringToBytes("rrds-dev-org-1"));
-const ACTIVATION_SALT = keccak256(stringToBytes("rrds-local-bootstrap-v1"));
+const ACTIVATION_SALT = keccak256(stringToBytes("rrds-local-safe-bootstrap-v2"));
 const ZERO_BYTES32 = `0x${"00".repeat(32)}`;
 const CONSORTIUM_DELAY = 86_400n;
+const SAFE_THRESHOLD = 2;
 
 const besuLocalChain = defineChain({
   id: chainId,
@@ -71,13 +82,54 @@ function loadArtifact(contractPath, contractName) {
   return JSON.parse(fs.readFileSync(artifactFile, "utf8"));
 }
 
+function generateOwnerSet(count) {
+  const owners = [];
+  for (let i = 0; i < count; i++) {
+    const privateKey = generatePrivateKey();
+    const account = privateKeyToAccount(privateKey);
+    owners.push({ address: account.address, privateKey });
+  }
+  return owners;
+}
+
+function ensureSafeOwners(payload) {
+  let mutated = false;
+  if (!payload.safeOwners) {
+    payload.safeOwners = {};
+    mutated = true;
+  }
+  for (const group of ["consortium", "emergency", "organization"]) {
+    if (!Array.isArray(payload.safeOwners[group]) || payload.safeOwners[group].length < 3) {
+      payload.safeOwners[group] = generateOwnerSet(3);
+      mutated = true;
+    }
+  }
+  if (mutated) {
+    fs.writeFileSync(accountsFile, `${JSON.stringify(payload, null, 2)}\n`, {
+      mode: 0o600,
+    });
+    fs.chmodSync(accountsFile, 0o600);
+  }
+  return payload;
+}
+
 function loadDevAccounts() {
   if (!fs.existsSync(accountsFile)) {
     throw new Error(
       `Dev accounts file not found (${accountsFile}). Run 'node scripts/besu-bootstrap.mjs init-dev-accounts' first.`
     );
   }
-  return JSON.parse(fs.readFileSync(accountsFile, "utf8"));
+  const parsed = JSON.parse(fs.readFileSync(accountsFile, "utf8"));
+  return ensureSafeOwners(parsed);
+}
+
+function loadBootstrapState() {
+  if (!fs.existsSync(bootstrapStateFile)) {
+    throw new Error(
+      `Bootstrap state not found (${bootstrapStateFile}). Run 'node scripts/besu-bootstrap.mjs deploy' first.`
+    );
+  }
+  return JSON.parse(fs.readFileSync(bootstrapStateFile, "utf8"));
 }
 
 function loadDeployedAddresses() {
@@ -116,37 +168,33 @@ function makeClients(privateKey) {
 
 function initDevAccounts() {
   if (fs.existsSync(accountsFile)) {
-    const existing = loadDevAccounts();
-    console.log("Local dev accounts already exist (refusing to overwrite):");
+    const existing = ensureSafeOwners(JSON.parse(fs.readFileSync(accountsFile, "utf8")));
+    console.log("Local dev accounts & Safe owner keysets ready (existing keys preserved):");
     printPublicSummary(existing);
     return;
   }
 
   fs.mkdirSync(secretsDir, { recursive: true, mode: 0o700 });
-  const roles = [
-    "deployer",
-    "consortiumSafe",
-    "emergencySafe",
-    "organizationSafe",
-    "relayer",
-  ];
+  const roles = ["deployer", "relayer"];
   const accounts = {};
   for (const role of roles) {
     const privateKey = generatePrivateKey();
     const account = privateKeyToAccount(privateKey);
-    accounts[role] = {
-      address: account.address,
-      privateKey,
-    };
+    accounts[role] = { address: account.address, privateKey };
   }
 
   const payload = {
     warning:
-      "DEVELOPMENT SMOKE-TEST ONLY. Never use these keys in staging or production. Replace with real Safe multisig accounts and HSM/keystore custody.",
+      "DEVELOPMENT KEYSTORE ONLY. Never use these local owner keys in production; use hardware-backed Safe signers.",
     createdAt: new Date().toISOString(),
     chainId,
     demoOrganizationId: DEMO_ORG_ID,
     accounts,
+    safeOwners: {
+      consortium: generateOwnerSet(3),
+      emergency: generateOwnerSet(3),
+      organization: generateOwnerSet(3),
+    },
   };
 
   fs.writeFileSync(accountsFile, `${JSON.stringify(payload, null, 2)}\n`, {
@@ -154,26 +202,22 @@ function initDevAccounts() {
   });
   fs.chmodSync(accountsFile, 0o600);
 
-  const ignitionParams = {
-    RrdsDeployment: {
-      consortiumSafeAddress: accounts.consortiumSafe.address,
-      emergencySafeAddress: accounts.emergencySafe.address,
-    },
-  };
-  fs.writeFileSync(paramsFile, `${JSON.stringify(ignitionParams, null, 2)}\n`, {
-    mode: 0o644,
-  });
-
-  console.log("Generated git-ignored local dev-only authority accounts:");
+  console.log("Generated git-ignored local deployer/relayer and 2-of-3 Safe owner keysets:");
   printPublicSummary(payload);
-  console.log(`Wrote git-ignored Ignition parameters: ${paramsFile}`);
 }
 
 function printPublicSummary(payload) {
-  console.log(`  mode: dev-only EOA placeholders (NOT real Safe multisigs)`);
+  console.log("  authority mode: audited Safe v1.4.1 2-of-3 threshold proxies");
   console.log(`  demoOrganizationId: ${payload.demoOrganizationId}`);
   for (const [role, entry] of Object.entries(payload.accounts)) {
     console.log(`  ${role}: ${entry.address}`);
+  }
+  for (const [group, owners] of Object.entries(payload.safeOwners ?? {})) {
+    console.log(
+      `  ${group}Safe owners (${SAFE_THRESHOLD}-of-${owners.length}): ${owners
+        .map((o) => o.address)
+        .join(", ")}`
+    );
   }
 }
 
@@ -191,6 +235,53 @@ async function deployContracts() {
   if (liveChainId !== chainId) {
     throw new Error(`Expected chainId ${chainId}, got ${liveChainId}`);
   }
+
+  console.log("Deploying audited Safe v1.4.1 infrastructure & 2-of-3 threshold proxies...");
+  const safeInfra = await deploySafeInfrastructure(publicClient, walletClient);
+  console.log(
+    `Deployed Safe singleton at ${safeInfra.singleton.address} (block ${safeInfra.singleton.blockNumber})`
+  );
+  console.log(
+    `Deployed SafeProxyFactory at ${safeInfra.factory.address} (block ${safeInfra.factory.blockNumber})`
+  );
+  console.log(
+    `Deployed CompatibilityFallbackHandler at ${safeInfra.fallbackHandler.address} (block ${safeInfra.fallbackHandler.blockNumber})`
+  );
+
+  const saltBase = BigInt(Date.now());
+  const consortiumSafe = await deploySafeProxy(
+    publicClient,
+    walletClient,
+    safeInfra,
+    dev.safeOwners.consortium.map((o) => o.address),
+    SAFE_THRESHOLD,
+    saltBase + 1n
+  );
+  const emergencySafe = await deploySafeProxy(
+    publicClient,
+    walletClient,
+    safeInfra,
+    dev.safeOwners.emergency.map((o) => o.address),
+    SAFE_THRESHOLD,
+    saltBase + 2n
+  );
+  const organizationSafe = await deploySafeProxy(
+    publicClient,
+    walletClient,
+    safeInfra,
+    dev.safeOwners.organization.map((o) => o.address),
+    SAFE_THRESHOLD,
+    saltBase + 3n
+  );
+  console.log(
+    `Deployed consortiumSafe (2-of-3 Safe proxy) at ${consortiumSafe.address} (block ${consortiumSafe.blockNumber})`
+  );
+  console.log(
+    `Deployed emergencySafe (2-of-3 Safe proxy) at ${emergencySafe.address} (block ${emergencySafe.blockNumber})`
+  );
+  console.log(
+    `Deployed organizationSafe (2-of-3 Safe proxy) at ${organizationSafe.address} (block ${organizationSafe.blockNumber})`
+  );
 
   const timelockArt = loadArtifact("RrdsTimelockController.sol", "RrdsTimelockController");
   const govArt = loadArtifact("AccessGovernance.sol", "AccessGovernance");
@@ -211,15 +302,19 @@ async function deployContracts() {
     console.log(
       `Deployed ${name} at ${receipt.contractAddress} (block ${receipt.blockNumber}, tx ${hash})`
     );
-    return { address: receipt.contractAddress, txHash: hash, blockNumber: Number(receipt.blockNumber) };
+    return {
+      address: receipt.contractAddress,
+      txHash: hash,
+      blockNumber: Number(receipt.blockNumber),
+    };
   };
 
   const timelock = await deployOne("RrdsTimelockController", timelockArt, [
-    dev.accounts.consortiumSafe.address,
+    consortiumSafe.address,
   ]);
   const accessGovernance = await deployOne("AccessGovernance", govArt, [
     timelock.address,
-    dev.accounts.emergencySafe.address,
+    emergencySafe.address,
   ]);
   const fileRegistry = await deployOne("FileRegistry", regArt, [
     accessGovernance.address,
@@ -231,21 +326,41 @@ async function deployContracts() {
     "RrdsDeployment#RrdsTimelockController": timelock.address,
     "RrdsDeployment#AccessGovernance": accessGovernance.address,
     "RrdsDeployment#FileRegistry": fileRegistry.address,
+    "SafeInfrastructure#SafeSingleton": safeInfra.singleton.address,
+    "SafeInfrastructure#SafeProxyFactory": safeInfra.factory.address,
+    "SafeInfrastructure#CompatibilityFallbackHandler": safeInfra.fallbackHandler.address,
+    "SafeAuthorities#ConsortiumSafe": consortiumSafe.address,
+    "SafeAuthorities#EmergencySafe": emergencySafe.address,
+    "SafeAuthorities#OrganizationSafe": organizationSafe.address,
   };
-  fs.writeFileSync(
-    deployedAddressesFile,
-    `${JSON.stringify(deployedMap, null, 2)}\n`
-  );
+  fs.writeFileSync(deployedAddressesFile, `${JSON.stringify(deployedMap, null, 2)}\n`);
+
+  const ignitionParams = {
+    RrdsDeployment: {
+      consortiumSafeAddress: consortiumSafe.address,
+      emergencySafeAddress: emergencySafe.address,
+    },
+  };
+  fs.writeFileSync(paramsFile, `${JSON.stringify(ignitionParams, null, 2)}\n`, {
+    mode: 0o644,
+  });
+
   fs.writeFileSync(
     bootstrapStateFile,
     `${JSON.stringify(
       {
         chainId,
         deployedAt: new Date().toISOString(),
-        authorityMode: "dev-only-eoa-smoke-test",
-        consortiumSafeAddress: dev.accounts.consortiumSafe.address,
-        emergencySafeAddress: dev.accounts.emergencySafe.address,
-        organizationSafeAddress: dev.accounts.organizationSafe.address,
+        authorityMode: "safe-v1.4.1-2-of-3-proxies",
+        safeInfrastructure: safeInfra,
+        consortiumSafeAddress: consortiumSafe.address,
+        emergencySafeAddress: emergencySafe.address,
+        organizationSafeAddress: organizationSafe.address,
+        safeProxies: {
+          consortiumSafe,
+          emergencySafe,
+          organizationSafe,
+        },
         demoOrganizationId: DEMO_ORG_ID,
         contracts: { timelock, accessGovernance, fileRegistry },
       },
@@ -280,30 +395,19 @@ function buildActivationBatch(addresses, orgSafeAddress, govAbi) {
 
 async function scheduleActivation() {
   const dev = loadDevAccounts();
+  const state = loadBootstrapState();
   const addresses = loadDeployedAddresses();
   const timelockArt = loadArtifact("RrdsTimelockController.sol", "RrdsTimelockController");
   const govArt = loadArtifact("AccessGovernance.sol", "AccessGovernance");
-  const { publicClient, walletClient } = makeClients(
-    dev.accounts.consortiumSafe.privateKey
-  );
+  const { publicClient, walletClient } = makeClients(dev.accounts.deployer.privateKey);
 
-  const batch = buildActivationBatch(
-    addresses,
-    dev.accounts.organizationSafe.address,
-    govArt.abi
-  );
+  const batch = buildActivationBatch(addresses, state.organizationSafeAddress, govArt.abi);
 
   const opId = await publicClient.readContract({
     address: addresses.timelock,
     abi: timelockArt.abi,
     functionName: "hashOperationBatch",
-    args: [
-      batch.targets,
-      batch.values,
-      batch.payloads,
-      batch.predecessor,
-      batch.salt,
-    ],
+    args: [batch.targets, batch.values, batch.payloads, batch.predecessor, batch.salt],
   });
 
   const alreadyRegistered = await publicClient.readContract({
@@ -318,8 +422,7 @@ async function scheduleActivation() {
     return;
   }
 
-  const hash = await walletClient.writeContract({
-    address: addresses.timelock,
+  const scheduleData = encodeFunctionData({
     abi: timelockArt.abi,
     functionName: "scheduleBatch",
     args: [
@@ -330,13 +433,17 @@ async function scheduleActivation() {
       batch.salt,
       CONSORTIUM_DELAY,
     ],
-    maxFeePerGas: 0n,
-    maxPriorityFeePerGas: 0n,
   });
-  const receipt = await publicClient.waitForTransactionReceipt({ hash });
-  if (receipt.status !== "success") {
-    throw new Error(`scheduleBatch reverted (tx ${hash})`);
-  }
+
+  const receipt = await execSafeTransaction({
+    publicClient,
+    walletClient,
+    chainId,
+    safeAddress: state.consortiumSafeAddress,
+    ownerPrivateKeys: dev.safeOwners.consortium.map((o) => o.privateKey),
+    to: addresses.timelock,
+    data: scheduleData,
+  });
 
   const readyTimestamp = await publicClient.readContract({
     address: addresses.timelock,
@@ -346,51 +453,39 @@ async function scheduleActivation() {
   });
   const readyAtIso = new Date(Number(readyTimestamp) * 1000).toISOString();
 
-  if (fs.existsSync(bootstrapStateFile)) {
-    const state = JSON.parse(fs.readFileSync(bootstrapStateFile, "utf8"));
-    state.activationBatch = {
-      operationId: opId,
-      salt: ACTIVATION_SALT,
-      scheduleTxHash: hash,
-      scheduleBlockNumber: Number(receipt.blockNumber),
-      readyTimestamp: Number(readyTimestamp),
-      readyAtUtc: readyAtIso,
-    };
-    fs.writeFileSync(bootstrapStateFile, `${JSON.stringify(state, null, 2)}\n`);
-  }
+  state.activationBatch = {
+    operationId: opId,
+    salt: ACTIVATION_SALT,
+    scheduleTxHash: receipt.transactionHash,
+    scheduleBlockNumber: Number(receipt.blockNumber),
+    readyTimestamp: Number(readyTimestamp),
+    readyAtUtc: readyAtIso,
+  };
+  fs.writeFileSync(bootstrapStateFile, `${JSON.stringify(state, null, 2)}\n`);
 
-  console.log(`Scheduled timelock activation batch:`);
+  console.log("Scheduled timelock activation batch via 2-of-3 consortiumSafe execTransaction:");
   console.log(`  operationId: ${opId}`);
-  console.log(`  txHash:      ${hash} (block ${receipt.blockNumber})`);
+  console.log(`  txHash:      ${receipt.transactionHash} (block ${receipt.blockNumber})`);
   console.log(`  delay:       ${CONSORTIUM_DELAY}s (24 hours)`);
   console.log(`  readyAtUtc:  ${readyAtIso}`);
 }
 
 async function executeActivation() {
   const dev = loadDevAccounts();
+  const state = loadBootstrapState();
   const addresses = loadDeployedAddresses();
   const timelockArt = loadArtifact("RrdsTimelockController.sol", "RrdsTimelockController");
   const govArt = loadArtifact("AccessGovernance.sol", "AccessGovernance");
   // EXECUTOR_ROLE is open (address(0)), so any account may execute once ready.
   const { publicClient, walletClient } = makeClients(dev.accounts.deployer.privateKey);
 
-  const batch = buildActivationBatch(
-    addresses,
-    dev.accounts.organizationSafe.address,
-    govArt.abi
-  );
+  const batch = buildActivationBatch(addresses, state.organizationSafeAddress, govArt.abi);
 
   const opId = await publicClient.readContract({
     address: addresses.timelock,
     abi: timelockArt.abi,
     functionName: "hashOperationBatch",
-    args: [
-      batch.targets,
-      batch.values,
-      batch.payloads,
-      batch.predecessor,
-      batch.salt,
-    ],
+    args: [batch.targets, batch.values, batch.payloads, batch.predecessor, batch.salt],
   });
 
   const isDone = await publicClient.readContract({
@@ -426,13 +521,7 @@ async function executeActivation() {
     address: addresses.timelock,
     abi: timelockArt.abi,
     functionName: "executeBatch",
-    args: [
-      batch.targets,
-      batch.values,
-      batch.payloads,
-      batch.predecessor,
-      batch.salt,
-    ],
+    args: [batch.targets, batch.values, batch.payloads, batch.predecessor, batch.salt],
     maxFeePerGas: 0n,
     maxPriorityFeePerGas: 0n,
   });
@@ -447,71 +536,90 @@ async function executeActivation() {
 
 async function printStatus() {
   const dev = loadDevAccounts();
+  const state = loadBootstrapState();
   const addresses = loadDeployedAddresses();
   const timelockArt = loadArtifact("RrdsTimelockController.sol", "RrdsTimelockController");
   const govArt = loadArtifact("AccessGovernance.sol", "AccessGovernance");
+  const safeArt = loadSafeArtifact("Safe.sol/Safe.json");
   const publicClient = createPublicClient({
     chain: besuLocalChain,
     transport: http(rpcUrl),
   });
 
-  const [liveChainId, block, minDelay, proposerRole, cancellerRole, executorRole, defaultAdminRole, emergencyRole, fileRegistryRole] =
-    await Promise.all([
-      publicClient.getChainId(),
-      publicClient.getBlock({ blockTag: "latest" }),
-      publicClient.readContract({
-        address: addresses.timelock,
-        abi: timelockArt.abi,
-        functionName: "getMinDelay",
-      }),
-      publicClient.readContract({
-        address: addresses.timelock,
-        abi: timelockArt.abi,
-        functionName: "PROPOSER_ROLE",
-      }),
-      publicClient.readContract({
-        address: addresses.timelock,
-        abi: timelockArt.abi,
-        functionName: "CANCELLER_ROLE",
-      }),
-      publicClient.readContract({
-        address: addresses.timelock,
-        abi: timelockArt.abi,
-        functionName: "EXECUTOR_ROLE",
-      }),
-      publicClient.readContract({
-        address: addresses.accessGovernance,
-        abi: govArt.abi,
-        functionName: "DEFAULT_ADMIN_ROLE",
-      }),
-      publicClient.readContract({
-        address: addresses.accessGovernance,
-        abi: govArt.abi,
-        functionName: "EMERGENCY_SUSPENDER_ROLE",
-      }),
-      publicClient.readContract({
-        address: addresses.accessGovernance,
-        abi: govArt.abi,
-        functionName: "FILE_REGISTRY_ROLE",
-      }),
-    ]);
+  const [
+    liveChainId,
+    block,
+    minDelay,
+    proposerRole,
+    cancellerRole,
+    executorRole,
+    defaultAdminRole,
+    emergencyRole,
+    fileRegistryRole,
+    consortiumThreshold,
+    emergencyThreshold,
+    orgThreshold,
+  ] = await Promise.all([
+    publicClient.getChainId(),
+    publicClient.getBlock({ blockTag: "latest" }),
+    publicClient.readContract({
+      address: addresses.timelock,
+      abi: timelockArt.abi,
+      functionName: "getMinDelay",
+    }),
+    publicClient.readContract({
+      address: addresses.timelock,
+      abi: timelockArt.abi,
+      functionName: "PROPOSER_ROLE",
+    }),
+    publicClient.readContract({
+      address: addresses.timelock,
+      abi: timelockArt.abi,
+      functionName: "CANCELLER_ROLE",
+    }),
+    publicClient.readContract({
+      address: addresses.timelock,
+      abi: timelockArt.abi,
+      functionName: "EXECUTOR_ROLE",
+    }),
+    publicClient.readContract({
+      address: addresses.accessGovernance,
+      abi: govArt.abi,
+      functionName: "DEFAULT_ADMIN_ROLE",
+    }),
+    publicClient.readContract({
+      address: addresses.accessGovernance,
+      abi: govArt.abi,
+      functionName: "EMERGENCY_SUSPENDER_ROLE",
+    }),
+    publicClient.readContract({
+      address: addresses.accessGovernance,
+      abi: govArt.abi,
+      functionName: "FILE_REGISTRY_ROLE",
+    }),
+    publicClient.readContract({
+      address: state.consortiumSafeAddress,
+      abi: safeArt.abi,
+      functionName: "getThreshold",
+    }),
+    publicClient.readContract({
+      address: state.emergencySafeAddress,
+      abi: safeArt.abi,
+      functionName: "getThreshold",
+    }),
+    publicClient.readContract({
+      address: state.organizationSafeAddress,
+      abi: safeArt.abi,
+      functionName: "getThreshold",
+    }),
+  ]);
 
-  const batch = buildActivationBatch(
-    addresses,
-    dev.accounts.organizationSafe.address,
-    govArt.abi
-  );
+  const batch = buildActivationBatch(addresses, state.organizationSafeAddress, govArt.abi);
   const opId = await publicClient.readContract({
     address: addresses.timelock,
     abi: timelockArt.abi,
     functionName: "hashOperationBatch",
-    args: [
-      batch.targets,
-      batch.values,
-      batch.payloads,
-      batch.predecessor,
-      batch.salt,
-    ],
+    args: [batch.targets, batch.values, batch.payloads, batch.predecessor, batch.salt],
   });
 
   const [
@@ -533,13 +641,13 @@ async function printStatus() {
       address: addresses.timelock,
       abi: timelockArt.abi,
       functionName: "hasRole",
-      args: [proposerRole, dev.accounts.consortiumSafe.address],
+      args: [proposerRole, state.consortiumSafeAddress],
     }),
     publicClient.readContract({
       address: addresses.timelock,
       abi: timelockArt.abi,
       functionName: "hasRole",
-      args: [cancellerRole, dev.accounts.consortiumSafe.address],
+      args: [cancellerRole, state.consortiumSafeAddress],
     }),
     publicClient.readContract({
       address: addresses.timelock,
@@ -569,7 +677,7 @@ async function printStatus() {
       address: addresses.accessGovernance,
       abi: govArt.abi,
       functionName: "hasRole",
-      args: [emergencyRole, dev.accounts.emergencySafe.address],
+      args: [emergencyRole, state.emergencySafeAddress],
     }),
     publicClient.readContract({
       address: addresses.accessGovernance,
@@ -609,16 +717,31 @@ async function printStatus() {
     }),
   ]);
 
-  console.log("=== Besu RRDS On-Chain Status ===");
+  console.log("=== Besu RRDS On-Chain Status (Safe v1.4.1 Multisig) ===");
   console.log(`chainId:                  ${liveChainId}`);
-  console.log(`latestBlock:              ${block.number} (${new Date(Number(block.timestamp) * 1000).toISOString()})`);
+  console.log(
+    `latestBlock:              ${block.number} (${new Date(Number(block.timestamp) * 1000).toISOString()})`
+  );
+  console.log(
+    `consortiumSafe (Safe):    ${state.consortiumSafeAddress} (threshold=${consortiumThreshold})`
+  );
+  console.log(
+    `emergencySafe (Safe):     ${state.emergencySafeAddress} (threshold=${emergencyThreshold})`
+  );
+  console.log(
+    `organizationSafe (Safe):  ${state.organizationSafeAddress} (threshold=${orgThreshold})`
+  );
   console.log(`RrdsTimelockController:   ${addresses.timelock}`);
   console.log(`AccessGovernance:         ${addresses.accessGovernance}`);
   console.log(`FileRegistry:             ${addresses.fileRegistry}`);
   console.log(`timelock.minDelay:        ${minDelay}s`);
-  console.log(`consortiumSafe proposer:  ${consortiumIsProposer} (canceller: ${consortiumIsCanceller})`);
+  console.log(
+    `consortiumSafe proposer:  ${consortiumIsProposer} (canceller: ${consortiumIsCanceller})`
+  );
   console.log(`openExecutor (address 0): ${openExecutor}`);
-  console.log(`deployer admin bypass:    timelock=${deployerHasTimelockAdmin}, governance=${deployerHasGovAdmin}`);
+  console.log(
+    `deployer admin bypass:    timelock=${deployerHasTimelockAdmin}, governance=${deployerHasGovAdmin}`
+  );
   console.log(`timelock is gov admin:    ${timelockHasGovAdmin}`);
   console.log(`emergencySafe suspender:  ${emergencyHasSuspender}`);
   console.log(`FILE_REGISTRY_ROLE live:  ${registryActive}`);
@@ -679,11 +802,10 @@ function deriveHpkeX25519PublicKeyHex(seedHex) {
 
 async function registerDemoMember() {
   const dev = loadDevAccounts();
+  const state = loadBootstrapState();
   const addresses = loadDeployedAddresses();
   const govArt = loadArtifact("AccessGovernance.sol", "AccessGovernance");
-  const { publicClient, walletClient } = makeClients(
-    dev.accounts.organizationSafe.privateKey
-  );
+  const { publicClient, walletClient } = makeClients(dev.accounts.deployer.privateKey);
 
   let member;
   if (fs.existsSync(demoMemberFile)) {
@@ -696,8 +818,7 @@ async function registerDemoMember() {
     const encryptionSeed = `0x${crypto.randomBytes(32).toString("hex")}`;
     const encryptionPublicKey = deriveHpkeX25519PublicKeyHex(encryptionSeed);
     member = {
-      warning:
-        "DEVELOPMENT SMOKE-TEST ONLY. Never use these member keys in production.",
+      warning: "DEVELOPMENT MEMBER KEYSTORE ONLY. Never use in production.",
       memberId,
       organizationId: DEMO_ORG_ID,
       signingAddress: signingAccount.address,
@@ -732,7 +853,7 @@ async function registerDemoMember() {
     functionName: "organizationAuthority",
     args: [DEMO_ORG_ID],
   });
-  if (orgAuth.toLowerCase() !== dev.accounts.organizationSafe.address.toLowerCase()) {
+  if (orgAuth.toLowerCase() !== state.organizationSafeAddress.toLowerCase()) {
     throw new Error(
       `Organization ${DEMO_ORG_ID} is not yet registered (authority=${orgAuth}). Run 'node scripts/besu-bootstrap.mjs execute' after the 24h timelock delay first.`
     );
@@ -774,8 +895,7 @@ async function registerDemoMember() {
     },
   });
 
-  const hash = await walletClient.writeContract({
-    address: addresses.accessGovernance,
+  const regCalldata = encodeFunctionData({
     abi: govArt.abi,
     functionName: "registerMember",
     args: [
@@ -789,19 +909,53 @@ async function registerDemoMember() {
       deadline,
       signature,
     ],
-    maxFeePerGas: 0n,
-    maxPriorityFeePerGas: 0n,
   });
-  const receipt = await publicClient.waitForTransactionReceipt({ hash });
-  if (receipt.status !== "success") {
-    throw new Error(`registerMember reverted (tx ${hash})`);
-  }
-  console.log(`Registered demo member on-chain (tx ${hash}, block ${receipt.blockNumber}):`);
+
+  const receipt = await execSafeTransaction({
+    publicClient,
+    walletClient,
+    chainId,
+    safeAddress: state.organizationSafeAddress,
+    ownerPrivateKeys: dev.safeOwners.organization.map((o) => o.privateKey),
+    to: addresses.accessGovernance,
+    data: regCalldata,
+  });
+
+  console.log(
+    `Registered demo member via 2-of-3 organizationSafe (tx ${receipt.transactionHash}, block ${receipt.blockNumber}):`
+  );
   console.log(`  memberId:            ${member.memberId}`);
   console.log(`  organizationId:      ${member.organizationId}`);
   console.log(`  signingAddress:      ${member.signingAddress}`);
   console.log(`  encryptionPublicKey: ${member.encryptionPublicKey}`);
   console.log(`  dev secrets file:    ${demoMemberFile} (0600, git-ignored)`);
+}
+
+async function setFilePermissionViaSafe(fileId, memberId, permissionCode, granted, proposalSeed) {
+  const dev = loadDevAccounts();
+  const state = loadBootstrapState();
+  const addresses = loadDeployedAddresses();
+  const govArt = loadArtifact("AccessGovernance.sol", "AccessGovernance");
+  const { publicClient, walletClient } = makeClients(dev.accounts.deployer.privateKey);
+
+  const proposalId = keccak256(stringToBytes(proposalSeed ?? `safe-acl-${Date.now()}`));
+  const data = encodeFunctionData({
+    abi: govArt.abi,
+    functionName: "setFilePermission",
+    args: [fileId, memberId, Number(permissionCode), granted, proposalId],
+  });
+  const receipt = await execSafeTransaction({
+    publicClient,
+    walletClient,
+    chainId,
+    safeAddress: state.organizationSafeAddress,
+    ownerPrivateKeys: dev.safeOwners.organization.map((o) => o.privateKey),
+    to: addresses.accessGovernance,
+    data,
+  });
+  console.log(
+    `Executed setFilePermission(granted=${granted}) via 2-of-3 organizationSafe (tx ${receipt.transactionHash}, block ${receipt.blockNumber}, proposalId=${proposalId})`
+  );
 }
 
 const command = process.argv[2];
@@ -821,12 +975,18 @@ switch (command) {
   case "register-member":
     await registerDemoMember();
     break;
+  case "grant-read":
+    await setFilePermissionViaSafe(process.argv[3], process.argv[4], 0, true, process.argv[5]);
+    break;
+  case "revoke-read":
+    await setFilePermissionViaSafe(process.argv[3], process.argv[4], 0, false, process.argv[5]);
+    break;
   case "status":
     await printStatus();
     break;
   default:
     console.error(
-      "Usage: node scripts/besu-bootstrap.mjs <init-dev-accounts|deploy|schedule|execute|register-member|status>"
+      "Usage: node scripts/besu-bootstrap.mjs <init-dev-accounts|deploy|schedule|execute|register-member|grant-read|revoke-read|status>"
     );
     process.exit(1);
 }

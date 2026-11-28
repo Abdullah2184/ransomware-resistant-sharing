@@ -208,12 +208,31 @@ async fn finalize_blob_upload(
             audit.block_number,
             "pinned",
             None,
+            None,
         )
         .await
         .is_err()
     {
         return error(StatusCode::SERVICE_UNAVAILABLE, "service_unavailable");
     }
+    let blob_kind = if audit.action == "blob.content_upload" {
+        "content"
+    } else {
+        "envelope"
+    };
+    let _ = audit
+        .state
+        .store
+        .record_orphan_blob_candidate(
+            &cid,
+            blob_kind,
+            audit.member_id,
+            Some(&audit.file_id.to_string()),
+            Some(audit.version),
+            None,
+            "staged_uncommitted",
+        )
+        .await;
     (
         StatusCode::CREATED,
         Json(BlobUploadResponse {
@@ -286,12 +305,24 @@ pub(crate) async fn upload_content_blob(
         version: package.manifest().version_number().get(),
         operation_id: None,
         block_number: Some(ctx.finalized.number),
+        restored_from_version: None,
     };
     if let Err(response) =
         authorize_blob_staging(&audit, ctx.member_id, BlobStagingMode::CreateOrAppend).await
     {
         return *response;
     }
+
+    let Ok(_stream_permit) = state.stream_semaphore.clone().try_acquire_owned() else {
+        return audit
+            .fail(
+                "denied",
+                "stream_concurrency_limited",
+                StatusCode::TOO_MANY_REQUESTS,
+                "rate_limited",
+            )
+            .await;
+    };
 
     let stored = state
         .blob_store
@@ -367,6 +398,7 @@ pub(crate) async fn upload_envelope_blob(
         version: parsed.version_number().get(),
         operation_id: None,
         block_number: Some(ctx.finalized.number),
+        restored_from_version: None,
     };
     let mode = if parsed.revision() == 1 {
         BlobStagingMode::CreateOrAppend
@@ -376,6 +408,17 @@ pub(crate) async fn upload_envelope_blob(
     if let Err(response) = authorize_blob_staging(&audit, ctx.member_id, mode).await {
         return *response;
     }
+
+    let Ok(_stream_permit) = state.stream_semaphore.clone().try_acquire_owned() else {
+        return audit
+            .fail(
+                "denied",
+                "stream_concurrency_limited",
+                StatusCode::TOO_MANY_REQUESTS,
+                "rate_limited",
+            )
+            .await;
+    };
 
     let Ok(byte_length) = u64::try_from(body.len()) else {
         return error(StatusCode::BAD_REQUEST, "invalid_request");

@@ -24,9 +24,16 @@ The system provides:
   independent per-file Read and Write permissions. File-level Read covers the
   current head and future versions; accessing older versions requires an explicit
   version-scoped historical grant (invalidated automatically upon Read revocation).
-- **Multisignature governance:** Organization Safes, an Emergency Safe (suspend
-  only), and a 24-hour Consortium Safe `TimelockController` govern membership,
-  key rotation, and policy changes.
+- **Multisignature governance:** Audited Safe v1.4.1 (`2-of-3`) threshold proxy
+  contracts (`@safe-global/safe-contracts` `1.4.1`) for Organization Safes, an
+  Emergency Safe (suspend only), and a 24-hour Consortium Safe
+  `RrdsTimelockController` govern membership, key rotation, and policy changes.
+- **Key custody (MVP baseline):** The MVP operates with `DevelopmentKeyCustody`
+  (CLI) and `DevelopmentRelayerSigner` (gateway), explicitly gated by
+  `RRDS_ALLOW_UNSAFE_DEV_CUSTODY=true` / `GATEWAY_ALLOW_UNSAFE_DEV_RELAYER=true`
+  and refused whenever `RRDS_ENV=production` or `Production` startup policies are
+  enforced. Hardware HSM / PKCS#11 adapters remain post-MVP behind the existing
+  `KeyCustodyProvider` and `RelayerSigner` ports.
 
 ## Documentation Map
 
@@ -44,7 +51,9 @@ The system provides:
 - **Design Decisions & MVP Limitations:** [`docs/decisions/README.md`](docs/decisions/README.md)
 - **Cross-Component Coupling & Development Notes:** [`docs/development-notes.md`](docs/development-notes.md)
 - **Incident Recovery & Operations Runbook:** [`docs/runbooks/ransomware-recovery.md`](docs/runbooks/ransomware-recovery.md)
+- **Consortium Operational & Governance Policies (§17):** [`docs/operations/consortium-policies.md`](docs/operations/consortium-policies.md)
 - **Production-Separated Per-Role Compose Templates:** [`infra/compose/README.md`](infra/compose/README.md)
+- **Step-by-Step MVP Demonstration Guide:** [`demo.md`](demo.md)
 - **Scripted Local Demo:** [`scripts/demo-local.sh`](scripts/demo-local.sh)
 - **Detailed Progress & Historical Log:** [`progress_report.md`](progress_report.md)
 - **Living Engineering Review:** [`agentic_review.md`](agentic_review.md)
@@ -109,86 +118,74 @@ Docker Compose co-locates services for development convenience only):
    DATABASE_URL="${DATABASE_URL%/*}/rrfs_indexer_test" cargo test -p metadata-store -p indexer -p gateway --locked
    ```
 
-## Current Implementation & Verification Status (26 November 2026)
+## Current Implementation & Verification Status (28 November 2026)
 
-- **Implemented and unit/integration tested (P0–P5, CI & P7):**
+- **Implemented and verified across the full stack:**
   - **CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)):** Automated
     Rust fmt/Clippy/tests, crate-boundary verification, live PostgreSQL 18.6
     integration tests (`metadata-store`, `indexer`, `gateway`), Hardhat
-    contract tests, and Compose (dev + per-role) / diff hygiene checks.
-  - `crates/domain`, `crates/crypto`, `crates/ports` (including shared `RRDSPKG1`
-    encrypted-package framing and `PreUploadScanner` port), `crates/key_custody`
-    (with `CustodyStartupPolicy` production guard), `crates/scanner`
-    (`DisabledScanner`, disabled by default), and `crates/application`
-    (`AuthService`, `UploadService`, `DownloadService`, `ShareService`).
-  - Solidity `AccessGovernance`, `FileRegistry`, `RrdsTimelockController`, and
-    EIP-712/CID libraries (`35` Hardhat tests passing: 29 Solidity, 6 Node.js
-    including §7.9 gas-bound verification in `GasBounds.ts`).
-  - `crates/ipfs_adapter` (1 MiB chunk profile with multi-peer upload &
-    retrieval failover per
-    [`docs/adr/content-package-unixfs-profile.md`](docs/adr/content-package-unixfs-profile.md)):
-    verified live against two local Kubo `0.43.1` + Cluster `1.1.6` peers
-    (`sh infra/ipfs-cluster/verify.sh` and `cluster_integration` passed).
-  - `crates/metadata_store` (migrations `0001`–`0006`, configurable
-    `DATABASE_MIGRATION_MODE` defaulting to read-only `verify`, `build.rs`
-    migration-change tracking, and schema-aware least-privilege role separation
-    in [`infra/postgres/init-roles.sql`](infra/postgres/init-roles.sql))
-    and `services/indexer`: verified live on host against PostgreSQL
-    `rrfs_indexer_test` including real `rrfs_gateway` & `rrfs_indexer` RBAC
-    enforcement (`28` passed).
-  - `crates/chain_adapter`: QBFT finalized-head queries, ABI calldata encoders
-    for `createFile` / `appendVersion` / `updateEnvelopeSet`, canonical RLP &
-    EIP-2718 Type-2 zero-gas-price transaction relayer with sequential nonces
-    and timeout reconciliation ([`docs/adr/chain-adapter-rpc-and-relayer.md`](docs/adr/chain-adapter-rpc-and-relayer.md)).
-  - `services/gateway`: challenge-response auth + `DELETE /v1/auth/session`
-    revocation, `X-Request-Id` correlation & structured JSON logs, multi-budget
-    rate limiting (`src:*`, `member:*`, separate `invalid_sig_src:*`), public
-    identity lookup, signed access lookup, ciphertext streaming, canonical
-    envelope retrieval, indexer-backed file listing & version history,
-    self-audited audit queries, authenticated ciphertext-only blob staging
-    (`POST /v1/blobs/{content,envelopes}`), and relayed write routes
-    (`POST /v1/files`, `POST /v1/files/{fileId}/versions`,
-    `POST /v1/files/{fileId}/versions/{version}/envelopes`) with pin-before-commit
-    quorum enforcement, verified by real-HTTP Axum integration tests and live
-    PostgreSQL tests on `rrfs_indexer_test`.
-  - `apps/cli`: thin CLI commands (`health`, `login`, `logout`, `whoami`,
-    `identity`, `ls`, `history`, `upload`, `modify`, `download`, `share`,
-    `restore`, `audit`) wired to `crates/application`, default-disabled
-    `PreUploadScanner`, and `GatewayHttpClient` (with regular-file/size input
-    validation, CARv1 raw-block CID verification, atomic `0600` + `fsync` +
-    `rename` output writes, and `CustodyStartupPolicy` enforcement), verified
-    end-to-end over HTTP.
-  - **P7 & Spec Hardening (`tests/`, `schemas/`, runbook, demo, Compose templates & docs):**
-    cross-component `rrds-tests` workspace suite (`tests/end_to_end/acceptance.rs`,
-    `tests/security/invariants.rs`, `tests/integration/cross_component.rs`),
-    cross-implementation RFC 9180 HPKE test vectors ([`tests/fixtures/hpke-rfc9180-v1.json`](tests/fixtures/hpke-rfc9180-v1.json)),
-    complete JSON schemas under [`schemas/`](schemas/),
-    incident recovery runbook ([`docs/runbooks/ransomware-recovery.md`](docs/runbooks/ransomware-recovery.md)),
-    threat model ([`docs/threat-model.md`](docs/threat-model.md)),
-    contract API & gas reference ([`docs/contract-api.md`](docs/contract-api.md)),
-    scripted local demo ([`scripts/demo-local.sh`](scripts/demo-local.sh)),
-    production-separated per-role Compose templates ([`infra/compose/`](infra/compose/README.md)),
-    design justifications ([`docs/decisions/README.md`](docs/decisions/README.md)),
-    and cross-component development notes ([`docs/development-notes.md`](docs/development-notes.md)).
-  - Full offline Rust workspace suite: **124 passed, 0 failed** (115 executed
-    offline; 9 PostgreSQL tests return early when `DATABASE_URL` is unset and
-    were separately verified live on host against `rrfs_indexer_test` with
-    `28` passed across `metadata-store`/`indexer`/`gateway`; 1 live two-peer
-    Cluster test is ignored by default and separately verified on host), strict
-    Clippy (`-D warnings`), `cargo fmt --check`, and `git diff --check` passing.
+    contract tests, and Compose / diff hygiene checks.
+  - **Smart contracts & Audited Safe v1.4.1 (`contracts/`):** `AccessGovernance`
+    (Option B member-signed relayed `updateEnvelopeSet` with strictly
+    Safe-governed ACL mutations, `17,475` runtime bytes), `FileRegistry`,
+    `RrdsTimelockController` (`86,400`s delay), EIP-712/CID libraries, and
+    real audited `@safe-global/safe-contracts@1.4.1` `2-of-3` threshold Safe
+    proxies (`37` Hardhat tests passing: 30 Solidity, 7 Node.js including
+    `GasBounds.ts` and `SafeGovernance.ts`).
+  - **Core Rust crates (`domain`, `crypto`, `ports`, `key_custody`, `scanner`, `application`):**
+    1 MiB AES-256-GCM chunks, official RFC 9180 + OpenSSL HPKE vectors
+    ([`tests/fixtures/hpke-rfc9180-v1.json`](tests/fixtures/hpke-rfc9180-v1.json)),
+    EIP-712 cross-language parity, `RRDSPKG1` framing, `PreUploadScanner`
+    (`DisabledScanner` default), `CustodyStartupPolicy` production guard, and
+    `AuthService` / `UploadService` (with `restore_version_from`) /
+    `DownloadService` / `ShareService`.
+  - **Storage (`crates/ipfs_adapter`):** Kubo `0.43.1` + Cluster `1.1.6`
+    multi-peer upload/retrieval failover, pin quorum verification, Cluster
+    `unpin`, and `health_status` probing — verified live against two local
+    Kubo/Cluster peers.
+  - **Database & Indexer (`crates/metadata_store`, `services/indexer`):**
+    Migrations `0001`–`0007` (including `gateway_relayed_transactions` &
+    `gateway_orphan_blobs`), standalone `rrds-migrate` binary (`run`/`verify`),
+    least-privilege roles ([`infra/postgres/init-roles.sql`](infra/postgres/init-roles.sql)),
+    `RRDS_ENV=production` startup guards, and full governance/timelock event
+    decoding (`RoleGranted`, `CallScheduled`, `CallExecuted`, etc.).
+  - **Gateway & Relayer (`crates/chain_adapter`, `services/gateway`):**
+    Challenge-response auth + `DELETE /v1/auth/session`, multi-budget
+    PostgreSQL token-bucket rate limits (`src:*`, `member:*`, `org:*`,
+    `invalid_sig_src:*`), bounded concurrent-stream semaphore
+    (`GATEWAY_MAX_CONCURRENT_STREAMS`), `file.version_restore` source-version
+    audit tracking, Type-2 zero-gas-price relayer with gas estimation & nonce
+    resync, persistent transaction reconciliation (`GET /v1/transactions/{txHash}`
+    with cross-member `404` isolation), safe background `OrphanBlobCleaner`
+    (verifying both Postgres projections and Besu on-chain state before
+    unpinning), background `StorageHealthMonitor`, and `RRDS_ENV=production`
+    refusal guards.
+  - **Thin CLI (`apps/cli`):** 13 commands (`health`, `login`, `logout`,
+    `whoami`, `identity`, `ls`, `history`, `upload`, `modify`, `download`,
+    `share`, `restore`, `audit`) with regular-file/size bounds, CARv1 CID
+    verification, and atomic `0600` output writes.
+  - **Operations & Policies:** Complete per-role Compose templates
+    ([`infra/compose/`](infra/compose/README.md): `database`, `gateway` + Caddy
+    TLS, `indexer`, `ipfs-peer`, `besu-validator`, `besu-rpc`), consortium
+    operational policies ([`docs/operations/consortium-policies.md`](docs/operations/consortium-policies.md)),
+    incident recovery runbook, and scripted demo ([`scripts/demo-local.sh`](scripts/demo-local.sh)).
 
-- **Remaining before MVP acceptance (§15.4):**
-  - **P6 (In progress — local Besu smoke-test deployed 27 Nov 2026):**
-    `RrdsTimelockController`, `AccessGovernance`, and `FileRegistry` are deployed
-    on local Besu (`chainId=1337`) using **dev-only EOA placeholders** (to be
-    replaced with real Safe multisigs later; see
-    [`contracts/README.md`](contracts/README.md)), and the 24-hour timelocked
-    activation batch (`FILE_REGISTRY_ROLE` + demo org) is scheduled (ready at
-    `2026-11-27T20:26:20.000Z`). Remaining: execute the ready timelock batch,
-    enroll demo member(s), configure contract addresses in local `.env`, run
-    live end-to-end verification (`indexer` + `gateway` + `scripts/demo-local.sh`),
-    inspect `rrfs_dev` migration 3 (`VersionMismatch(3)`), and later validate
-    real Safe smart-account proxies on Besu before any production claim.
+- **Live Besu QBFT Verification & Current Activation Window:**
+  - Full live end-to-end demo (`scripts/demo-local.sh`: login -> V1 upload with
+    2-peer Cluster pin -> live indexer sync -> byte-for-byte verified download
+    -> V2 append -> contiguous hash-chained audit trail) verified on the initial
+    Besu deployment (`blocks 59814..60745`).
+  - **Current active deployment (Safe v1.4.1 `2-of-3` + Option B):** Deployed
+    at blocks `62877`–`62894` (`consortiumSafe`, `emergencySafe`,
+    `organizationSafe` all verified `threshold=2`); 24-hour timelock activation
+    batch scheduled via **`2-of-3` `consortiumSafe.execTransaction`** at block
+    `62898`, executable at **`2026-11-29T03:19:33.000Z`** (see
+    [`contracts/README.md`](contracts/README.md)). Once executed, run
+    `register-member`, update `.env`, and exercise live Safe-governed ACL grant
+    + Option B relayed `cli share`.
+  - **Post-MVP deferred:** Hardware HSM / PKCS#11 implementations of
+    `KeyCustodyProvider` and `RelayerSigner` (MVP uses explicitly gated
+    dev software custody).
 
 See [`progress_report.md`](progress_report.md) for the complete chronological
-record and maintainer decisions.
+record and verification matrix.

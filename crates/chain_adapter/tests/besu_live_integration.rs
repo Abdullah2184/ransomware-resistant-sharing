@@ -10,11 +10,11 @@ use domain::EvmAddress;
 
 const DEFAULT_BESU_RPC_URL: &str = "http://127.0.0.1:8545";
 const DEFAULT_CHAIN_ID: u64 = 1337;
-const DEFAULT_TIMELOCK: &str = "0xc4647d02e8ba1c922d5c4fc22e04b3d1bcd75568";
-const DEFAULT_ACCESS_GOVERNANCE: &str = "0x1efe4b8d6076a0ca115241346f8d7da516ce4055";
-const DEFAULT_FILE_REGISTRY: &str = "0x7ba5ef0f4c923942554c8b5788578280f7451f2d";
-const DEFAULT_BOOTSTRAP_FROM_BLOCK: u64 = 60_840;
-const DEFAULT_BOOTSTRAP_TO_BLOCK: u64 = 60_855;
+const DEFAULT_TIMELOCK: &str = "0x5a51c4bd51709838764c185b490221855e37e64d";
+const DEFAULT_ACCESS_GOVERNANCE: &str = "0x04ec7bde5732ca6c5e04709641c53a564e1c5472";
+const DEFAULT_FILE_REGISTRY: &str = "0xeae1730d50eb47b7573c682afa2ee4995ba1968d";
+const DEFAULT_BOOTSTRAP_FROM_BLOCK: u64 = 62_885;
+const DEFAULT_BOOTSTRAP_TO_BLOCK: u64 = 62_902;
 
 fn parse_env_address(name: &str, default: &str) -> EvmAddress {
     let raw = env::var(name).unwrap_or_else(|_| default.to_owned());

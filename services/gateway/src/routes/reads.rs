@@ -1,4 +1,8 @@
-use std::net::SocketAddr;
+use std::{
+    net::SocketAddr,
+    pin::Pin,
+    task::{Context, Poll},
+};
 
 use axum::{
     Json,
@@ -9,8 +13,28 @@ use axum::{
 };
 use crypto::{AccessLookup, ChainId, Eip712Domain, KeyEnvelopeSet, UnixDeadline};
 use domain::{ContentCid, EnvelopeSetCid, EpochId, KeyVersion, OperationNonce, VersionNumber};
+use ports::StorageReader;
 use serde::{Deserialize, Serialize};
+use tokio::{
+    io::{AsyncRead, ReadBuf},
+    sync::OwnedSemaphorePermit,
+};
 use tokio_util::io::ReaderStream;
+
+struct PermittedReader {
+    inner: StorageReader,
+    _permit: OwnedSemaphorePermit,
+}
+
+impl AsyncRead for PermittedReader {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
 
 use super::{
     ActiveMemberError, AppState, BearerError, DEFAULT_AUDIT_LIMIT, EnvelopeReadError,
@@ -578,6 +602,16 @@ pub(crate) async fn retrieve_version_content(
             )
             .await;
     };
+    let Ok(stream_permit) = state.stream_semaphore.clone().try_acquire_owned() else {
+        return audit
+            .fail(
+                Some(block),
+                "denied",
+                "stream_concurrency_limited",
+                StatusCode::TOO_MANY_REQUESTS,
+            )
+            .await;
+    };
     let Ok(reader) = state.blob_store.get_content(&content_cid).await else {
         return audit
             .fail(
@@ -606,7 +640,11 @@ pub(crate) async fn retrieve_version_content(
         return error(StatusCode::SERVICE_UNAVAILABLE, "service_unavailable");
     }
 
-    let mut response = Response::new(Body::from_stream(ReaderStream::new(reader)));
+    let permitted_reader = PermittedReader {
+        inner: reader,
+        _permit: stream_permit,
+    };
+    let mut response = Response::new(Body::from_stream(ReaderStream::new(permitted_reader)));
     response.headers_mut().insert(
         axum::http::header::CONTENT_TYPE,
         axum::http::HeaderValue::from_static("application/vnd.ipld.car"),

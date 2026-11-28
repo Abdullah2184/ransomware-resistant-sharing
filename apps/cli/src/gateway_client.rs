@@ -468,21 +468,25 @@ impl LedgerPort for GatewayHttpClient {
     ) -> PortFuture<'a, TransactionReceipt> {
         Box::pin(async move {
             let bearer = self.require_bearer()?;
+            let mut payload = serde_json::json!({
+                "versionNumber": request.version_number.get(),
+                "parentManifestHash": request.parent_manifest_hash.to_string(),
+                "manifestHash": request.manifest_hash.to_string(),
+                "contentCid": request.content_cid.to_string(),
+                "envelopeSetCid": request.envelope_set_cid.to_string(),
+                "epochId": request.epoch_id.to_string(),
+                "operationNonce": request.operation_nonce.to_string(),
+                "deadline": request.deadline,
+                "signature": encode_hex(request.signature.as_bytes()),
+            });
+            if let Some(source_version) = request.restored_from_version {
+                payload["restoredFromVersion"] = serde_json::json!(source_version.get());
+            }
             let response = self
                 .client
                 .post(self.endpoint_url(&format!("/v1/files/{}/versions", request.file_id)))
                 .bearer_auth(&*bearer)
-                .json(&serde_json::json!({
-                    "versionNumber": request.version_number.get(),
-                    "parentManifestHash": request.parent_manifest_hash.to_string(),
-                    "manifestHash": request.manifest_hash.to_string(),
-                    "contentCid": request.content_cid.to_string(),
-                    "envelopeSetCid": request.envelope_set_cid.to_string(),
-                    "epochId": request.epoch_id.to_string(),
-                    "operationNonce": request.operation_nonce.to_string(),
-                    "deadline": request.deadline,
-                    "signature": encode_hex(request.signature.as_bytes()),
-                }))
+                .json(&payload)
                 .send()
                 .await
                 .map_err(|_| DomainError::Internal)?;

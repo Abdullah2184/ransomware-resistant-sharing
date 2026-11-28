@@ -298,12 +298,17 @@ mod http_tests {
         sessions: HashMap<[u8; 32], String>,
         used_access_nonces: HashSet<(String, [u8; 32])>,
         audit_actions: Vec<(Option<String>, String, String, Option<String>)>,
+        restore_audit_sources: Vec<Option<u64>>,
         fail_audit: bool,
         rate_limit_remaining: Option<u32>,
         bucket_limits: HashMap<String, u32>,
         listing_folders: Vec<ProjectedFolder>,
         listing_files: Vec<ProjectedFile>,
         history_versions: Vec<ProjectedVersion>,
+        member_orgs: HashMap<String, String>,
+        relayed_txs: HashMap<String, crate::store::RelayedTransactionRecord>,
+        orphan_blobs: HashMap<String, (crate::store::OrphanBlobCandidate, String)>,
+        referenced_projection_cids: HashSet<String>,
     }
 
     impl GatewayStorePort for MockStore {
@@ -527,6 +532,7 @@ mod http_tests {
             _block_number: Option<u64>,
             outcome: &'static str,
             reason_code: Option<&'static str>,
+            restored_from_version: Option<u64>,
         ) -> StoreFuture<'a, ()> {
             let mut state = self.state.lock().unwrap();
             if state.fail_audit {
@@ -538,6 +544,144 @@ mod http_tests {
                 outcome.to_owned(),
                 reason_code.map(str::to_owned),
             ));
+            if action == "file.version_restore" {
+                state.restore_audit_sources.push(restored_from_version);
+            }
+            Box::pin(async { Ok(()) })
+        }
+
+        fn member_organization_id<'a>(
+            &'a self,
+            member_id: &'a str,
+        ) -> StoreFuture<'a, Option<String>> {
+            let org = self
+                .state
+                .lock()
+                .unwrap()
+                .member_orgs
+                .get(member_id)
+                .cloned();
+            Box::pin(async move { Ok(org) })
+        }
+
+        fn record_relayed_transaction<'a>(
+            &'a self,
+            record: &'a crate::store::RelayedTransactionRecord,
+        ) -> StoreFuture<'a, ()> {
+            self.state
+                .lock()
+                .unwrap()
+                .relayed_txs
+                .insert(record.tx_hash.clone(), record.clone());
+            Box::pin(async { Ok(()) })
+        }
+
+        fn get_relayed_transaction<'a>(
+            &'a self,
+            tx_hash: &'a str,
+        ) -> StoreFuture<'a, Option<crate::store::RelayedTransactionRecord>> {
+            let record = self.state.lock().unwrap().relayed_txs.get(tx_hash).cloned();
+            Box::pin(async move { Ok(record) })
+        }
+
+        fn update_relayed_transaction_status<'a>(
+            &'a self,
+            tx_hash: &'a str,
+            status: &'a str,
+            block_number: Option<u64>,
+            block_hash: Option<&'a str>,
+            gas_used: Option<u64>,
+        ) -> StoreFuture<'a, ()> {
+            if let Some(entry) = self.state.lock().unwrap().relayed_txs.get_mut(tx_hash) {
+                entry.status = status.to_owned();
+                if block_number.is_some() {
+                    entry.block_number = block_number;
+                }
+                if let Some(hash) = block_hash {
+                    entry.block_hash = Some(hash.to_owned());
+                }
+                if gas_used.is_some() {
+                    entry.gas_used = gas_used;
+                }
+            }
+            Box::pin(async { Ok(()) })
+        }
+
+        fn record_orphan_blob_candidate<'a>(
+            &'a self,
+            cid: &'a str,
+            blob_kind: &'a str,
+            uploader_member_id: &'a str,
+            file_id: Option<&'a str>,
+            version_number: Option<u64>,
+            tx_hash: Option<&'a str>,
+            reason: &'a str,
+        ) -> StoreFuture<'a, ()> {
+            let mut state = self.state.lock().unwrap();
+            let entry = state.orphan_blobs.entry(cid.to_owned()).or_insert_with(|| {
+                (
+                    crate::store::OrphanBlobCandidate {
+                        cid: cid.to_owned(),
+                        blob_kind: blob_kind.to_owned(),
+                        uploader_member_id: uploader_member_id.to_owned(),
+                        file_id: file_id.map(str::to_owned),
+                        version_number,
+                        tx_hash: tx_hash.map(str::to_owned),
+                        reason: reason.to_owned(),
+                    },
+                    "candidate".to_owned(),
+                )
+            });
+            if entry.1 != "referenced" {
+                entry.0.file_id = file_id.map(str::to_owned).or(entry.0.file_id.clone());
+                entry.0.version_number = version_number.or(entry.0.version_number);
+                entry.0.tx_hash = tx_hash.map(str::to_owned).or(entry.0.tx_hash.clone());
+                entry.0.reason = reason.to_owned();
+            }
+            Box::pin(async { Ok(()) })
+        }
+
+        fn mark_blob_referenced<'a>(&'a self, cid: &'a str) -> StoreFuture<'a, ()> {
+            if let Some(entry) = self.state.lock().unwrap().orphan_blobs.get_mut(cid) {
+                entry.1 = "referenced".to_owned();
+            }
+            Box::pin(async { Ok(()) })
+        }
+
+        fn is_cid_referenced_in_projections<'a>(&'a self, cid: &'a str) -> StoreFuture<'a, bool> {
+            let referenced = self
+                .state
+                .lock()
+                .unwrap()
+                .referenced_projection_cids
+                .contains(cid);
+            Box::pin(async move { Ok(referenced) })
+        }
+
+        fn list_eligible_orphan_candidates<'a>(
+            &'a self,
+            _min_age_seconds: u64,
+            limit: u32,
+        ) -> StoreFuture<'a, Vec<crate::store::OrphanBlobCandidate>> {
+            let state = self.state.lock().unwrap();
+            let list = state
+                .orphan_blobs
+                .values()
+                .filter(|(c, status)| {
+                    status == "candidate" && !state.referenced_projection_cids.contains(&c.cid)
+                })
+                .take(limit as usize)
+                .map(|(c, _)| c.clone())
+                .collect();
+            Box::pin(async move { Ok(list) })
+        }
+
+        fn mark_orphan_blob_unpinned<'a>(&'a self, cid: &'a str) -> StoreFuture<'a, ()> {
+            if let Some(entry) = self.state.lock().unwrap().orphan_blobs.get_mut(cid)
+                && entry.1 == "candidate"
+            {
+                entry.1 = "unpinned".to_owned();
+            }
             Box::pin(async { Ok(()) })
         }
 
@@ -658,6 +802,7 @@ mod http_tests {
         envelopes: Arc<Mutex<HashMap<String, Vec<u8>>>>,
         replicas: Arc<Mutex<HashMap<String, Vec<String>>>>,
         events: Arc<Mutex<Vec<String>>>,
+        unpinned_cids: Arc<Mutex<Vec<String>>>,
         fail_replication: Arc<Mutex<bool>>,
     }
 
@@ -818,6 +963,15 @@ mod http_tests {
         fn verify_retrievable<'a>(&'a self, _cid: StorageCid) -> StorageFuture<'a, ()> {
             Box::pin(async { Ok(()) })
         }
+
+        fn unpin<'a>(&'a self, cid: StorageCid) -> StorageFuture<'a, ()> {
+            let cid_string = match cid {
+                StorageCid::Content(value) => value.to_string(),
+                StorageCid::EnvelopeSet(value) => value.to_string(),
+            };
+            self.unpinned_cids.lock().unwrap().push(cid_string);
+            Box::pin(async { Ok(()) })
+        }
     }
 
     #[derive(Clone)]
@@ -906,8 +1060,20 @@ mod http_tests {
             &self,
             _tx_hash: [u8; 32],
         ) -> RelayFuture<'_, Option<RelayOutcome>> {
-            let result = self.execute("reconcileTransaction").map(Some);
-            Box::pin(async move { result })
+            let behavior = self.behavior.lock().unwrap().clone();
+            match behavior {
+                MockRelayBehavior::Timeout(_) => {
+                    self.calls
+                        .lock()
+                        .unwrap()
+                        .push("reconcileTransaction".to_owned());
+                    Box::pin(async { Ok(None) })
+                }
+                _ => {
+                    let result = self.execute("reconcileTransaction").map(Some);
+                    Box::pin(async move { result })
+                }
+            }
         }
     }
 
@@ -931,6 +1097,7 @@ mod http_tests {
         let store = MockStore::default();
         let blobs = MockBlobStore::default();
         let config = GatewayConfig {
+            environment: crate::config::RuntimeEnvironment::Development,
             database_url: "postgres://unused".to_owned(),
             besu_rpc_url: "http://127.0.0.1:8545".to_owned(),
             chain_id: 1337,
@@ -944,11 +1111,16 @@ mod http_tests {
             rate_limit_refill_per_second: 10.0,
             member_rate_limit_capacity: 100,
             member_rate_limit_refill_per_second: 10.0,
+            org_rate_limit_capacity: 300,
+            org_rate_limit_refill_per_second: 10.0,
             invalid_sig_limit_capacity: 5,
             invalid_sig_limit_refill_per_second: 0.1,
+            max_concurrent_streams: 32,
             min_pin_replicas: 2,
             default_tx_gas_limit: 2_000_000,
             transaction_confirmation_timeout_seconds: 30,
+            orphan_retention_seconds: 3600,
+            storage_health_interval_seconds: 30,
             max_blob_upload_bytes: 8 * 1024 * 1024,
         };
         let mut state = AppState::new(store.clone(), chain.clone(), blobs.clone(), config);
@@ -2756,6 +2928,7 @@ mod http_tests {
         let chain_id = 1337u64;
         let access_governance = EvmAddress::from_bytes([0x33; 20]);
         let config = GatewayConfig {
+            environment: crate::config::RuntimeEnvironment::Development,
             bind: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
             database_url,
             besu_rpc_url: "http://127.0.0.1:8545".to_owned(),
@@ -2769,11 +2942,16 @@ mod http_tests {
             rate_limit_refill_per_second: 10.0,
             member_rate_limit_capacity: 100,
             member_rate_limit_refill_per_second: 10.0,
+            org_rate_limit_capacity: 300,
+            org_rate_limit_refill_per_second: 10.0,
             invalid_sig_limit_capacity: 20,
             invalid_sig_limit_refill_per_second: 5.0,
+            max_concurrent_streams: 32,
             min_pin_replicas: 2,
             default_tx_gas_limit: 500_000,
             transaction_confirmation_timeout_seconds: 30,
+            orphan_retention_seconds: 3600,
+            storage_health_interval_seconds: 30,
             max_blob_upload_bytes: 64 * 1024 * 1024,
         };
         let state = AppState::new(store, chain, MockBlobStore::default(), config);
@@ -3250,14 +3428,14 @@ mod http_tests {
         let access_governance = EvmAddress::from_bytes(
             domain::hex::parse_fixed_hex::<20>(
                 &std::env::var("CONTRACT_ACCESS_GOVERNANCE_ADDRESS")
-                    .unwrap_or_else(|_| "0x1efe4b8d6076a0ca115241346f8d7da516ce4055".to_owned()),
+                    .unwrap_or_else(|_| "0x04ec7bde5732ca6c5e04709641c53a564e1c5472".to_owned()),
             )
             .expect("valid AccessGovernance address"),
         );
         let file_registry = EvmAddress::from_bytes(
             domain::hex::parse_fixed_hex::<20>(
                 &std::env::var("CONTRACT_FILE_REGISTRY_ADDRESS")
-                    .unwrap_or_else(|_| "0x7ba5ef0f4c923942554c8b5788578280f7451f2d".to_owned()),
+                    .unwrap_or_else(|_| "0xeae1730d50eb47b7573c682afa2ee4995ba1968d".to_owned()),
             )
             .expect("valid FileRegistry address"),
         );
@@ -3265,6 +3443,7 @@ mod http_tests {
         let chain = chain_adapter::BesuClient::new(&rpc_url).expect("BesuClient");
         let store = MockStore::default();
         let config = GatewayConfig {
+            environment: crate::config::RuntimeEnvironment::Development,
             database_url: "postgres://unused".to_owned(),
             besu_rpc_url: rpc_url,
             chain_id: 1337,
@@ -3278,36 +3457,20 @@ mod http_tests {
             rate_limit_refill_per_second: 10.0,
             member_rate_limit_capacity: 100,
             member_rate_limit_refill_per_second: 10.0,
+            org_rate_limit_capacity: 300,
+            org_rate_limit_refill_per_second: 10.0,
             invalid_sig_limit_capacity: 10,
             invalid_sig_limit_refill_per_second: 1.0,
+            max_concurrent_streams: 32,
             min_pin_replicas: 2,
             default_tx_gas_limit: 2_000_000,
             transaction_confirmation_timeout_seconds: 30,
+            orphan_retention_seconds: 3600,
+            storage_health_interval_seconds: 30,
             max_blob_upload_bytes: 8 * 1024 * 1024,
         };
-        let config_arc = Arc::new(GatewayConfig {
-            database_url: config.database_url.clone(),
-            besu_rpc_url: config.besu_rpc_url.clone(),
-            chain_id: config.chain_id,
-            access_governance: config.access_governance,
-            file_registry: config.file_registry,
-            audience: config.audience.clone(),
-            bind: config.bind,
-            challenge_ttl_seconds: config.challenge_ttl_seconds,
-            session_ttl_seconds: config.session_ttl_seconds,
-            rate_limit_capacity: config.rate_limit_capacity,
-            rate_limit_refill_per_second: config.rate_limit_refill_per_second,
-            member_rate_limit_capacity: config.member_rate_limit_capacity,
-            member_rate_limit_refill_per_second: config.member_rate_limit_refill_per_second,
-            invalid_sig_limit_capacity: config.invalid_sig_limit_capacity,
-            invalid_sig_limit_refill_per_second: config.invalid_sig_limit_refill_per_second,
-            min_pin_replicas: config.min_pin_replicas,
-            default_tx_gas_limit: config.default_tx_gas_limit,
-            transaction_confirmation_timeout_seconds: config
-                .transaction_confirmation_timeout_seconds,
-            max_blob_upload_bytes: config.max_blob_upload_bytes,
-        });
         let state = AppState::new(store, chain, MockBlobStore::default(), config);
+        let config_arc = state.config.clone();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let server_task = tokio::spawn(async move {
@@ -3378,5 +3541,1322 @@ mod http_tests {
         assert_eq!(login_resp.status(), reqwest::StatusCode::UNAUTHORIZED);
 
         server_task.abort();
+    }
+
+    async fn register_test_member(
+        server: &TestServer,
+        member_id: MemberId,
+        enc_key_version: u32,
+    ) -> DevelopmentKeyCustody {
+        let custody = DevelopmentKeyCustody::generate(
+            member_id,
+            KeyVersion::new(1).unwrap(),
+            KeyVersion::new(enc_key_version).unwrap(),
+        )
+        .unwrap();
+        let pub_id = custody.public_identity().await.unwrap();
+        let mut enc_key = [0u8; 32];
+        enc_key.copy_from_slice(&pub_id.encryption_public_key.to_bytes());
+        server.chain.state.lock().unwrap().members.insert(
+            *member_id.as_bytes(),
+            MemberIdentityState {
+                organization_id: [0x10; 32],
+                signing_address: pub_id.signing_address,
+                encryption_public_key: enc_key,
+                signing_key_version: 1,
+                encryption_key_version: enc_key_version,
+                status: 1,
+            },
+        );
+        custody
+    }
+
+    async fn build_test_envelope_set(
+        file_id: FileId,
+        version: u64,
+        epoch_id: EpochId,
+        revision: u32,
+        member_id: MemberId,
+        custody: &DevelopmentKeyCustody,
+    ) -> Vec<u8> {
+        let pub_id = custody.public_identity().await.unwrap();
+        let dek = DataEncryptionKey::generate().unwrap();
+        let wrapped = KeyEnvelope::wrap(
+            &dek,
+            &pub_id.encryption_public_key,
+            WrapContext::new(
+                file_id,
+                VersionNumber::new(version).unwrap(),
+                epoch_id,
+                member_id,
+                pub_id.encryption_key_version,
+            ),
+        )
+        .unwrap();
+        KeyEnvelopeSet::new(
+            file_id,
+            VersionNumber::new(version).unwrap(),
+            epoch_id,
+            revision,
+            vec![KeyEnvelopeEntry::new(
+                member_id,
+                pub_id.encryption_key_version,
+                wrapped,
+            )],
+        )
+        .unwrap()
+        .canonical_bytes()
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn gateway_persists_timed_out_tx_reconciles_and_isolates_members() {
+        let server = spawn_server_with_relayer(true).await;
+        let client = reqwest::Client::new();
+        let relayer = server.relayer.clone().unwrap();
+        let alice = MemberId::from_bytes([0x51; 32]);
+        let bob = MemberId::from_bytes([0x52; 32]);
+        let alice_custody = register_test_member(&server, alice, 1).await;
+        let bob_custody = register_test_member(&server, bob, 1).await;
+        let (_, _, alice_token) = login_member(&client, &server, &alice_custody).await;
+        let (_, _, bob_token) = login_member(&client, &server, &bob_custody).await;
+
+        let file_id = FileId::from_bytes([0x61; 32]);
+        let epoch_id = EpochId::from_bytes([0x62; 32]);
+        let content_cid = raw_sha256_cid(b"timed-out-content").unwrap();
+        let envelope_bytes =
+            build_test_envelope_set(file_id, 1, epoch_id, 1, alice, &alice_custody).await;
+        let envelope_cid =
+            EnvelopeSetCid::parse(&raw_sha256_cid(&envelope_bytes).unwrap().to_string()).unwrap();
+        {
+            let mut replicas = server.blobs.replicas.lock().unwrap();
+            replicas.insert(
+                content_cid.to_string(),
+                vec!["peer-1".to_owned(), "peer-2".to_owned()],
+            );
+            replicas.insert(
+                envelope_cid.to_string(),
+                vec!["peer-1".to_owned(), "peer-2".to_owned()],
+            );
+        }
+        server
+            .blobs
+            .envelopes
+            .lock()
+            .unwrap()
+            .insert(envelope_cid.to_string(), envelope_bytes);
+
+        let pending_tx_hash = [0x77; 32];
+        let pending_tx_hex = encode_hex(&pending_tx_hash);
+        *relayer.behavior.lock().unwrap() = MockRelayBehavior::Timeout(pending_tx_hash);
+
+        let nonce = OperationNonce::from_bytes([0x63; 32]);
+        let deadline = unix_seconds().unwrap() + 120;
+        let manifest_hash = ManifestHash::from_bytes([0x64; 32]);
+        let pub_id = alice_custody.public_identity().await.unwrap();
+        let typed = VersionAppend::new(
+            file_id,
+            VersionNumber::new(1).unwrap(),
+            ManifestHash::from_bytes([0; 32]),
+            manifest_hash,
+            content_cid.clone(),
+            envelope_cid.clone(),
+            epoch_id,
+            alice,
+            pub_id.signing_address,
+            nonce,
+            UnixDeadline::from_unix_seconds(deadline).unwrap(),
+        )
+        .unwrap();
+        let digest = typed
+            .digest(&Eip712Domain::file_registry(
+                ChainId::from_u64(server.config.chain_id),
+                server.config.file_registry,
+            ))
+            .unwrap();
+        let sig = alice_custody
+            .sign_typed_digest(&pub_id.signing_key_id, &digest)
+            .await
+            .unwrap();
+
+        let create_resp = client
+            .post(format!("{}/v1/files", server.base_url))
+            .bearer_auth(&alice_token)
+            .json(&json!({
+                "fileId": file_id.to_string(),
+                "displayName": "pending.txt",
+                "parentFolderId": format!("0x{}", "00".repeat(32)),
+                "versionNumber": 1,
+                "parentManifestHash": format!("0x{}", "00".repeat(32)),
+                "manifestHash": manifest_hash.to_string(),
+                "contentCid": content_cid.to_string(),
+                "envelopeSetCid": envelope_cid.to_string(),
+                "epochId": epoch_id.to_string(),
+                "operationNonce": nonce.to_string(),
+                "deadline": deadline,
+                "signature": encode_hex(sig.as_bytes()),
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(create_resp.status(), reqwest::StatusCode::GATEWAY_TIMEOUT);
+        let timeout_body: serde_json::Value = create_resp.json().await.unwrap();
+        assert_eq!(timeout_body["transactionHash"], pending_tx_hex);
+
+        // Cross-member isolation: Bob must get 404 probing Alice's tx hash.
+        let bob_probe = client
+            .get(format!(
+                "{}/v1/transactions/{pending_tx_hex}",
+                server.base_url
+            ))
+            .bearer_auth(&bob_token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(bob_probe.status(), reqwest::StatusCode::NOT_FOUND);
+
+        // While still pending on Besu, Alice sees `status: "pending"`.
+        let still_pending = client
+            .get(format!(
+                "{}/v1/transactions/{pending_tx_hex}",
+                server.base_url
+            ))
+            .bearer_auth(&alice_token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(still_pending.status(), reqwest::StatusCode::OK);
+        let body: serde_json::Value = still_pending.json().await.unwrap();
+        assert_eq!(body["status"], "pending");
+
+        // Once Besu finalizes the transaction, reconciliation transitions it to `confirmed`
+        // and marks associated blobs referenced.
+        *relayer.behavior.lock().unwrap() = MockRelayBehavior::Commit(55);
+        let confirmed = client
+            .get(format!(
+                "{}/v1/transactions/{pending_tx_hex}",
+                server.base_url
+            ))
+            .bearer_auth(&alice_token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(confirmed.status(), reqwest::StatusCode::OK);
+        let confirmed_body: serde_json::Value = confirmed.json().await.unwrap();
+        assert_eq!(confirmed_body["status"], "confirmed");
+        assert_eq!(confirmed_body["blockNumber"], 55);
+        assert_eq!(confirmed_body["gasUsed"], 120_000);
+        assert_eq!(
+            server
+                .store
+                .state
+                .lock()
+                .unwrap()
+                .relayed_txs
+                .get(&pending_tx_hex)
+                .unwrap()
+                .status,
+            "confirmed"
+        );
+    }
+
+    #[tokio::test]
+    async fn orphan_blob_cleaner_refuses_referenced_blobs_and_unpins_true_orphans() {
+        let server = spawn_server_with_relayer(false).await;
+        let file_id = FileId::from_bytes([0x81; 32]);
+        let onchain_cid = raw_sha256_cid(b"referenced-on-chain").unwrap().to_string();
+        let projected_cid = raw_sha256_cid(b"referenced-in-projection")
+            .unwrap()
+            .to_string();
+        let true_orphan_cid = raw_sha256_cid(b"true-unreferenced-orphan")
+            .unwrap()
+            .to_string();
+
+        // Record version 1 on-chain referencing `onchain_cid`.
+        server.chain.state.lock().unwrap().versions.insert(
+            (*file_id.as_bytes(), 1),
+            FileVersionState {
+                manifest_hash: [0x11; 32],
+                content_cid: onchain_cid.clone(),
+            },
+        );
+        // Mark `projected_cid` referenced in projections.
+        server
+            .store
+            .state
+            .lock()
+            .unwrap()
+            .referenced_projection_cids
+            .insert(projected_cid.clone());
+
+        let member = format!("0x{}", "55".repeat(32));
+        for (cid, version) in [
+            (&onchain_cid, 1u64),
+            (&projected_cid, 2u64),
+            (&true_orphan_cid, 3u64),
+        ] {
+            server
+                .store
+                .record_orphan_blob_candidate(
+                    cid,
+                    "content",
+                    &member,
+                    Some(&file_id.to_string()),
+                    Some(version),
+                    None,
+                    "contract_reverted",
+                )
+                .await
+                .unwrap();
+        }
+
+        let state = AppState::new(
+            server.store.clone(),
+            server.chain.clone(),
+            server.blobs.clone(),
+            GatewayConfig {
+                environment: crate::config::RuntimeEnvironment::Development,
+                database_url: "postgres://unused".to_owned(),
+                besu_rpc_url: "http://127.0.0.1:8545".to_owned(),
+                chain_id: 1337,
+                access_governance: server.config.access_governance,
+                file_registry: server.config.file_registry,
+                audience: "rrds-local".to_owned(),
+                bind: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+                challenge_ttl_seconds: 120,
+                session_ttl_seconds: 900,
+                rate_limit_capacity: 100,
+                rate_limit_refill_per_second: 10.0,
+                member_rate_limit_capacity: 100,
+                member_rate_limit_refill_per_second: 10.0,
+                org_rate_limit_capacity: 300,
+                org_rate_limit_refill_per_second: 10.0,
+                invalid_sig_limit_capacity: 5,
+                invalid_sig_limit_refill_per_second: 0.1,
+                max_concurrent_streams: 32,
+                min_pin_replicas: 2,
+                default_tx_gas_limit: 2_000_000,
+                transaction_confirmation_timeout_seconds: 30,
+                orphan_retention_seconds: 3600,
+                storage_health_interval_seconds: 30,
+                max_blob_upload_bytes: 8 * 1024 * 1024,
+            },
+        );
+
+        let summary = crate::maintenance::cleanup_orphan_blobs_once(&state, 0, 50)
+            .await
+            .unwrap();
+        assert_eq!(summary.unpinned, 1);
+        assert_eq!(summary.marked_referenced, 1);
+        assert_eq!(summary.skipped_due_to_error, 0);
+        assert_eq!(
+            server.blobs.unpinned_cids.lock().unwrap().as_slice(),
+            std::slice::from_ref(&true_orphan_cid)
+        );
+        // Verify on-chain referenced CID transitioned to `referenced` and was NEVER unpinned.
+        assert_eq!(
+            server
+                .store
+                .state
+                .lock()
+                .unwrap()
+                .orphan_blobs
+                .get(&onchain_cid)
+                .unwrap()
+                .1,
+            "referenced"
+        );
+    }
+
+    #[tokio::test]
+    async fn gateway_validates_restore_source_and_enforces_org_rate_limit() {
+        let server = spawn_server_with_relayer(true).await;
+        let client = reqwest::Client::new();
+        let alice = MemberId::from_bytes([0x91; 32]);
+        let alice_custody = register_test_member(&server, alice, 1).await;
+        let (_, _, alice_token) = login_member(&client, &server, &alice_custody).await;
+
+        let file_id = FileId::from_bytes([0x92; 32]);
+        let parent_hash = ManifestHash::from_bytes([0x93; 32]);
+        let new_manifest = ManifestHash::from_bytes([0x94; 32]);
+        let epoch_id = EpochId::from_bytes([0x95; 32]);
+        let content_cid = raw_sha256_cid(b"restored-v2-content").unwrap();
+        let envelope_bytes =
+            build_test_envelope_set(file_id, 2, epoch_id, 1, alice, &alice_custody).await;
+        let envelope_cid =
+            EnvelopeSetCid::parse(&raw_sha256_cid(&envelope_bytes).unwrap().to_string()).unwrap();
+
+        {
+            let mut chain = server.chain.state.lock().unwrap();
+            chain
+                .write_acl
+                .insert((*alice.as_bytes(), *file_id.as_bytes()));
+            chain.heads.insert(
+                *file_id.as_bytes(),
+                FileHeadState {
+                    version_number: 1,
+                    manifest_hash: parent_hash.to_string(),
+                    status: 1,
+                },
+            );
+        }
+        {
+            let mut replicas = server.blobs.replicas.lock().unwrap();
+            replicas.insert(
+                content_cid.to_string(),
+                vec!["peer-1".to_owned(), "peer-2".to_owned()],
+            );
+            replicas.insert(
+                envelope_cid.to_string(),
+                vec!["peer-1".to_owned(), "peer-2".to_owned()],
+            );
+        }
+        server
+            .blobs
+            .envelopes
+            .lock()
+            .unwrap()
+            .insert(envelope_cid.to_string(), envelope_bytes);
+
+        let nonce = OperationNonce::from_bytes([0x96; 32]);
+        let deadline = unix_seconds().unwrap() + 120;
+        let pub_id = alice_custody.public_identity().await.unwrap();
+        let typed = VersionAppend::new(
+            file_id,
+            VersionNumber::new(2).unwrap(),
+            parent_hash,
+            new_manifest,
+            content_cid.clone(),
+            envelope_cid.clone(),
+            epoch_id,
+            alice,
+            pub_id.signing_address,
+            nonce,
+            UnixDeadline::from_unix_seconds(deadline).unwrap(),
+        )
+        .unwrap();
+        let digest = typed
+            .digest(&Eip712Domain::file_registry(
+                ChainId::from_u64(server.config.chain_id),
+                server.config.file_registry,
+            ))
+            .unwrap();
+        let sig = alice_custody
+            .sign_typed_digest(&pub_id.signing_key_id, &digest)
+            .await
+            .unwrap();
+
+        // Invalid restoredFromVersion (must be >= 1 and < versionNumber) -> 400 Bad Request.
+        for bad_source in [0u64, 2u64] {
+            let bad_resp = client
+                .post(format!("{}/v1/files/{file_id}/versions", server.base_url))
+                .bearer_auth(&alice_token)
+                .json(&json!({
+                    "versionNumber": 2,
+                    "parentManifestHash": parent_hash.to_string(),
+                    "manifestHash": new_manifest.to_string(),
+                    "contentCid": content_cid.to_string(),
+                    "envelopeSetCid": envelope_cid.to_string(),
+                    "epochId": epoch_id.to_string(),
+                    "operationNonce": nonce.to_string(),
+                    "deadline": deadline,
+                    "signature": encode_hex(sig.as_bytes()),
+                    "restoredFromVersion": bad_source,
+                }))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(bad_resp.status(), reqwest::StatusCode::BAD_REQUEST);
+        }
+
+        // Valid restoredFromVersion=1 -> 201 Created and audited as `file.version_restore`.
+        let ok_resp = client
+            .post(format!("{}/v1/files/{file_id}/versions", server.base_url))
+            .bearer_auth(&alice_token)
+            .json(&json!({
+                "versionNumber": 2,
+                "parentManifestHash": parent_hash.to_string(),
+                "manifestHash": new_manifest.to_string(),
+                "contentCid": content_cid.to_string(),
+                "envelopeSetCid": envelope_cid.to_string(),
+                "epochId": epoch_id.to_string(),
+                "operationNonce": nonce.to_string(),
+                "deadline": deadline,
+                "signature": encode_hex(sig.as_bytes()),
+                "restoredFromVersion": 1,
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(ok_resp.status(), reqwest::StatusCode::CREATED);
+        assert_eq!(
+            server.store.state.lock().unwrap().restore_audit_sources,
+            vec![Some(0), Some(2), Some(1)]
+        );
+
+        // Per-organization rate-limit bucket exhaustion -> 429 Too Many Requests.
+        let org_id = format!("0x{}", "a1".repeat(32));
+        {
+            let mut st = server.store.state.lock().unwrap();
+            st.member_orgs.insert(alice.to_string(), org_id.clone());
+            st.bucket_limits
+                .insert(format!("org:file.list:{org_id}"), 0);
+        }
+        let limited = client
+            .get(format!("{}/v1/files", server.base_url))
+            .bearer_auth(&alice_token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(limited.status(), reqwest::StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires live dual-node Kubo + IPFS Cluster and compiled cli binary"]
+    async fn cli_binary_through_real_gateway_to_live_dual_node_ipfs_cluster_end_to_end() {
+        use ipfs_adapter::{ClusterCredentials, IpfsClusterStore, IpfsConfig};
+        use std::path::PathBuf;
+        use std::time::Duration;
+
+        // 1. Resolve workspace root, compiled `cli` binary, and live dual-node IPFS Cluster config.
+        let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|p| p.parent())
+            .expect("workspace root")
+            .to_path_buf();
+        let cli_bin = workspace_root.join("target/debug/cli");
+        assert!(
+            cli_bin.is_file(),
+            "compiled CLI binary not found at {}; build with `cargo build -p cli`",
+            cli_bin.display()
+        );
+
+        let kubo_urls: Vec<String> = std::env::var("IPFS_API_URLS")
+            .unwrap_or_else(|_| "http://127.0.0.1:15001,http://127.0.0.1:15002".to_owned())
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+            .collect();
+        assert!(kubo_urls.len() >= 2, "requires >= 2 live Kubo peers");
+        let cluster_urls: Vec<String> = std::env::var("IPFS_CLUSTER_API_URL")
+            .unwrap_or_else(|_| "http://127.0.0.1:9094".to_owned())
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+            .collect();
+        let cluster_user =
+            std::env::var("IPFS_CLUSTER_USERNAME").unwrap_or_else(|_| "rrfs-admin".to_owned());
+        let raw_pw_file = std::env::var("IPFS_CLUSTER_PASSWORD_FILE")
+            .unwrap_or_else(|_| "infra/ipfs-cluster/secrets/cluster-api-password".to_owned());
+        let pw_path = if PathBuf::from(&raw_pw_file).is_file() {
+            PathBuf::from(&raw_pw_file)
+        } else {
+            workspace_root.join(&raw_pw_file)
+        };
+        let cluster_password = std::fs::read_to_string(&pw_path)
+            .expect("read local IPFS Cluster password file")
+            .trim()
+            .to_owned();
+
+        let live_ipfs = IpfsClusterStore::new(IpfsConfig {
+            kubo_api_urls: kubo_urls.clone(),
+            cluster_api_urls: cluster_urls.clone(),
+            cluster_credentials: ClusterCredentials::new(
+                cluster_user.clone(),
+                cluster_password.clone(),
+            ),
+            request_timeout: Duration::from_secs(30),
+            replication_timeout: Duration::from_secs(20),
+            replication_poll_interval: Duration::from_millis(250),
+            max_upload_bytes: 32 * 1024 * 1024,
+        })
+        .expect("build live IpfsClusterStore");
+
+        // Verify live Kubo + Cluster health monitor sees both peers healthy.
+        let health = crate::maintenance::check_storage_health_once(&live_ipfs)
+            .await
+            .expect("live storage health probe");
+        assert!(
+            health.healthy_kubo_peers >= 2 && health.healthy_cluster_peers >= 1,
+            "expected >=2 healthy Kubo and >=1 healthy Cluster peers, got {health:?}"
+        );
+        assert!(!health.is_degraded());
+
+        // 2. Stateful chain/relayer backing a REAL Axum gateway router + REAL IpfsClusterStore.
+        #[derive(Clone)]
+        struct StatefulRelayer {
+            chain: MockChain,
+            force_revert: Arc<Mutex<bool>>,
+        }
+        impl GatewayRelayerPort for StatefulRelayer {
+            fn relay_create_file(
+                &self,
+                call: VersionAppendCall,
+                _display_name: String,
+                _parent_folder_id: [u8; 32],
+                _signature: Vec<u8>,
+            ) -> RelayFuture<'_, RelayOutcome> {
+                let chain = self.chain.clone();
+                let revert = *self.force_revert.lock().unwrap();
+                Box::pin(async move {
+                    let mut st = chain.state.lock().unwrap();
+                    st.block_number += 1;
+                    let block = st.block_number;
+                    if revert {
+                        return Ok(RelayOutcome::Reverted(EvmTransactionReceipt {
+                            transaction_hash: [0xee; 32],
+                            block_number: block,
+                            block_hash: st.block_hash.clone(),
+                            status: false,
+                            gas_used: 90_000,
+                        }));
+                    }
+                    st.heads.insert(
+                        call.file_id,
+                        FileHeadState {
+                            version_number: 1,
+                            manifest_hash: encode_hex(&call.manifest_hash),
+                            status: 1,
+                        },
+                    );
+                    st.versions.insert(
+                        (call.file_id, 1),
+                        FileVersionState {
+                            manifest_hash: call.manifest_hash,
+                            content_cid: call.content_cid,
+                        },
+                    );
+                    st.envelopes.insert(
+                        (call.file_id, 1),
+                        EnvelopeSetState {
+                            cid: call.envelope_set_cid,
+                            epoch_id: call.epoch_id,
+                            revision: 1,
+                        },
+                    );
+                    st.read_acl.insert((call.member_id, call.file_id));
+                    st.write_acl.insert((call.member_id, call.file_id));
+                    Ok(RelayOutcome::Committed(EvmTransactionReceipt {
+                        transaction_hash: [0xa1; 32],
+                        block_number: block,
+                        block_hash: st.block_hash.clone(),
+                        status: true,
+                        gas_used: 180_000,
+                    }))
+                })
+            }
+
+            fn relay_append_version(
+                &self,
+                call: VersionAppendCall,
+                _signature: Vec<u8>,
+            ) -> RelayFuture<'_, RelayOutcome> {
+                let chain = self.chain.clone();
+                let revert = *self.force_revert.lock().unwrap();
+                Box::pin(async move {
+                    let mut st = chain.state.lock().unwrap();
+                    st.block_number += 1;
+                    let block = st.block_number;
+                    if revert {
+                        return Ok(RelayOutcome::Reverted(EvmTransactionReceipt {
+                            transaction_hash: [0xef; 32],
+                            block_number: block,
+                            block_hash: st.block_hash.clone(),
+                            status: false,
+                            gas_used: 95_000,
+                        }));
+                    }
+                    st.heads.insert(
+                        call.file_id,
+                        FileHeadState {
+                            version_number: call.version_number,
+                            manifest_hash: encode_hex(&call.manifest_hash),
+                            status: 1,
+                        },
+                    );
+                    st.versions.insert(
+                        (call.file_id, call.version_number),
+                        FileVersionState {
+                            manifest_hash: call.manifest_hash,
+                            content_cid: call.content_cid,
+                        },
+                    );
+                    st.envelopes.insert(
+                        (call.file_id, call.version_number),
+                        EnvelopeSetState {
+                            cid: call.envelope_set_cid,
+                            epoch_id: call.epoch_id,
+                            revision: 1,
+                        },
+                    );
+                    Ok(RelayOutcome::Committed(EvmTransactionReceipt {
+                        transaction_hash: [0xa2; 32],
+                        block_number: block,
+                        block_hash: st.block_hash.clone(),
+                        status: true,
+                        gas_used: 150_000,
+                    }))
+                })
+            }
+
+            fn relay_update_envelope_set(
+                &self,
+                call: EnvelopeSetUpdateCall,
+                _signature: Vec<u8>,
+            ) -> RelayFuture<'_, RelayOutcome> {
+                let chain = self.chain.clone();
+                let revert = *self.force_revert.lock().unwrap();
+                Box::pin(async move {
+                    let mut st = chain.state.lock().unwrap();
+                    st.block_number += 1;
+                    let block = st.block_number;
+                    if revert {
+                        return Ok(RelayOutcome::Reverted(EvmTransactionReceipt {
+                            transaction_hash: [0xed; 32],
+                            block_number: block,
+                            block_hash: st.block_hash.clone(),
+                            status: false,
+                            gas_used: 70_000,
+                        }));
+                    }
+                    let next_rev = st
+                        .envelopes
+                        .get(&(call.file_id, call.version_number))
+                        .map(|e| e.revision + 1)
+                        .unwrap_or(2);
+                    st.envelopes.insert(
+                        (call.file_id, call.version_number),
+                        EnvelopeSetState {
+                            cid: call.new_envelope_set_cid,
+                            epoch_id: call.epoch_id,
+                            revision: next_rev,
+                        },
+                    );
+                    Ok(RelayOutcome::Committed(EvmTransactionReceipt {
+                        transaction_hash: [0xa3; 32],
+                        block_number: block,
+                        block_hash: st.block_hash.clone(),
+                        status: true,
+                        gas_used: 110_000,
+                    }))
+                })
+            }
+
+            fn reconcile_transaction(
+                &self,
+                _tx_hash: [u8; 32],
+            ) -> RelayFuture<'_, Option<RelayOutcome>> {
+                Box::pin(async { Ok(None) })
+            }
+        }
+
+        let chain = MockChain::default();
+        {
+            let mut st = chain.state.lock().unwrap();
+            st.block_number = 100;
+            st.block_hash = format!("0x{}", "cd".repeat(32));
+        }
+        let store = MockStore::default();
+        let force_revert = Arc::new(Mutex::new(false));
+        let relayer = StatefulRelayer {
+            chain: chain.clone(),
+            force_revert: force_revert.clone(),
+        };
+
+        let access_gov = EvmAddress::from_bytes([0x22; 20]);
+        let file_reg = EvmAddress::from_bytes([0x11; 20]);
+        let gateway_config = GatewayConfig {
+            environment: crate::config::RuntimeEnvironment::Development,
+            database_url: "postgres://unused".to_owned(),
+            besu_rpc_url: "http://127.0.0.1:8545".to_owned(),
+            chain_id: 1337,
+            access_governance: access_gov,
+            file_registry: file_reg,
+            audience: "rrds-live-cli-e2e".to_owned(),
+            bind: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+            challenge_ttl_seconds: 120,
+            session_ttl_seconds: 900,
+            rate_limit_capacity: 500,
+            rate_limit_refill_per_second: 50.0,
+            member_rate_limit_capacity: 500,
+            member_rate_limit_refill_per_second: 50.0,
+            org_rate_limit_capacity: 500,
+            org_rate_limit_refill_per_second: 50.0,
+            invalid_sig_limit_capacity: 50,
+            invalid_sig_limit_refill_per_second: 5.0,
+            max_concurrent_streams: 32,
+            min_pin_replicas: 2,
+            default_tx_gas_limit: 2_000_000,
+            transaction_confirmation_timeout_seconds: 30,
+            orphan_retention_seconds: 3600,
+            storage_health_interval_seconds: 30,
+            max_blob_upload_bytes: 32 * 1024 * 1024,
+        };
+
+        let app_state = AppState::new(store.clone(), chain.clone(), live_ipfs, gateway_config)
+            .with_relayer(relayer);
+        let cleanup_state = app_state.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let gw_addr = listener.local_addr().unwrap();
+        let gw_url = format!("http://{gw_addr}");
+        let gw_handle = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                router(app_state).into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .unwrap();
+        });
+
+        // Register deterministic Alice and Bob identities on MockChain.
+        let alice_id = MemberId::from_bytes([0x31; 32]);
+        let alice_sign_sk = [0x41; 32];
+        let alice_enc_seed = [0x51; 32];
+        let bob_id = MemberId::from_bytes([0x32; 32]);
+        let bob_sign_sk = [0x42; 32];
+        let bob_enc_seed = [0x52; 32];
+        for (mid, sign_sk, enc_seed) in [
+            (alice_id, alice_sign_sk, alice_enc_seed),
+            (bob_id, bob_sign_sk, bob_enc_seed),
+        ] {
+            let custody = DevelopmentKeyCustody::from_dev_secrets(
+                mid,
+                KeyVersion::new(1).unwrap(),
+                KeyVersion::new(1).unwrap(),
+                sign_sk,
+                enc_seed,
+            )
+            .unwrap();
+            let pub_id = custody.public_identity().await.unwrap();
+            let mut enc_pub = [0u8; 32];
+            enc_pub.copy_from_slice(&pub_id.encryption_public_key.to_bytes());
+            chain.state.lock().unwrap().members.insert(
+                *mid.as_bytes(),
+                MemberIdentityState {
+                    organization_id: [0x10; 32],
+                    signing_address: pub_id.signing_address,
+                    encryption_public_key: enc_pub,
+                    signing_key_version: 1,
+                    encryption_key_version: 1,
+                    status: 1,
+                },
+            );
+        }
+
+        // Helper to invoke the REAL compiled `cli` binary with isolated env.
+        let tmp_dir =
+            std::env::temp_dir().join(format!("rrds-live-cli-gw-ipfs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        let alice_session_file = tmp_dir.join("alice.session");
+        let bob_session_file = tmp_dir.join("bob.session");
+
+        let run_cli = |gateway: &str,
+                       member: MemberId,
+                       sign_sk: [u8; 32],
+                       enc_seed: [u8; 32],
+                       session_file: &std::path::Path,
+                       min_replicas: &str,
+                       args: &[&str]| {
+            let cli_bin = cli_bin.clone();
+            let gateway = gateway.to_owned();
+            let session_file = session_file.to_path_buf();
+            let min_replicas = min_replicas.to_owned();
+            let owned_args: Vec<String> = args.iter().map(|s| (*s).to_owned()).collect();
+            async move {
+                tokio::task::spawn_blocking(move || {
+                    std::process::Command::new(&cli_bin)
+                        .args(&owned_args)
+                        .env_clear()
+                        .env("GATEWAY_URL", gateway)
+                        .env("GATEWAY_AUDIENCE", "rrds-live-cli-e2e")
+                        .env("BESU_CHAIN_ID", "1337")
+                        .env("CONTRACT_ACCESS_GOVERNANCE_ADDRESS", access_gov.to_string())
+                        .env("CONTRACT_FILE_REGISTRY_ADDRESS", file_reg.to_string())
+                        .env("MIN_PIN_REPLICAS", min_replicas)
+                        .env("RRDS_ALLOW_UNSAFE_DEV_CUSTODY", "true")
+                        .env("RRDS_DEV_MEMBER_ID", member.to_string())
+                        .env("RRDS_DEV_SIGNING_KEY", encode_hex(&sign_sk))
+                        .env("RRDS_DEV_ENCRYPTION_SEED", encode_hex(&enc_seed))
+                        .env("RRDS_DEV_SIGNING_KEY_VERSION", "1")
+                        .env("RRDS_DEV_ENCRYPTION_KEY_VERSION", "1")
+                        .env("RRDS_SESSION_FILE", &session_file)
+                        .output()
+                        .expect("spawn cli binary")
+                })
+                .await
+                .expect("cli blocking task")
+            }
+        };
+
+        let parse_kv = |stdout: &str, key: &str| -> String {
+            stdout
+                .split_whitespace()
+                .find_map(|tok| tok.strip_prefix(&format!("{key}=")))
+                .unwrap_or_else(|| panic!("missing `{key}=` in CLI output:\n{stdout}"))
+                .to_owned()
+        };
+
+        // Track all pinned CIDs to verify replication and cleanly unpin at teardown.
+        let mut committed_cids: Vec<StorageCid> = Vec::new();
+        let file_id = FileId::from_bytes([0xab; 32]);
+        let file_id_str = file_id.to_string();
+
+        // 3. Alice logs in via real CLI binary -> real Gateway.
+        let health_out = run_cli(
+            &gw_url,
+            alice_id,
+            alice_sign_sk,
+            alice_enc_seed,
+            &alice_session_file,
+            "2",
+            &["health"],
+        )
+        .await;
+        assert!(
+            health_out.status.success(),
+            "cli health failed: {}",
+            String::from_utf8_lossy(&health_out.stderr)
+        );
+        let login_out = run_cli(
+            &gw_url,
+            alice_id,
+            alice_sign_sk,
+            alice_enc_seed,
+            &alice_session_file,
+            "2",
+            &[
+                "login",
+                "--session-file",
+                alice_session_file.to_str().unwrap(),
+            ],
+        )
+        .await;
+        assert!(
+            login_out.status.success(),
+            "cli login failed: {}",
+            String::from_utf8_lossy(&login_out.stderr)
+        );
+        let whoami_out = run_cli(
+            &gw_url,
+            alice_id,
+            alice_sign_sk,
+            alice_enc_seed,
+            &alice_session_file,
+            "2",
+            &["whoami"],
+        )
+        .await;
+        assert!(whoami_out.status.success());
+        assert!(String::from_utf8_lossy(&whoami_out.stdout).contains(&alice_id.to_string()));
+
+        // 4. Multi-chunk (>1 MiB -> 2 AES-256-GCM chunks) upload via real CLI -> Gateway -> live 2-peer IPFS Cluster!
+        let mut v1_plaintext = vec![0u8; 1_150_000];
+        for (i, byte) in v1_plaintext.iter_mut().enumerate() {
+            *byte = ((i * 31 + 17) % 251) as u8;
+        }
+        let v1_input = tmp_dir.join("v1-multi-chunk.bin");
+        std::fs::write(&v1_input, &v1_plaintext).unwrap();
+        let upload_out = run_cli(
+            &gw_url,
+            alice_id,
+            alice_sign_sk,
+            alice_enc_seed,
+            &alice_session_file,
+            "2",
+            &[
+                "upload",
+                v1_input.to_str().unwrap(),
+                "--name",
+                "v1-multi-chunk.bin",
+                "--file-id",
+                &file_id_str,
+            ],
+        )
+        .await;
+        assert!(
+            upload_out.status.success(),
+            "cli upload V1 failed: {}",
+            String::from_utf8_lossy(&upload_out.stderr)
+        );
+        let upload_stdout = String::from_utf8_lossy(&upload_out.stdout);
+        assert_eq!(parse_kv(&upload_stdout, "contentReplicas"), "2");
+        assert_eq!(parse_kv(&upload_stdout, "envelopeReplicas"), "2");
+        let v1_content_cid = ContentCid::parse(&parse_kv(&upload_stdout, "contentCid")).unwrap();
+        let v1_env_cid =
+            EnvelopeSetCid::parse(&parse_kv(&upload_stdout, "envelopeSetCid")).unwrap();
+        committed_cids.push(StorageCid::Content(v1_content_cid.clone()));
+        committed_cids.push(StorageCid::EnvelopeSet(v1_env_cid.clone()));
+
+        // Verify live 2-peer Cluster pinning directly through IpfsClusterStore.
+        let v1_pin = cleanup_state
+            .blob_store
+            .ensure_replication(StorageCid::Content(v1_content_cid.clone()), 2)
+            .await
+            .expect("V1 content must be pinned on >= 2 live Cluster peers");
+        assert!(v1_pin.pinned_peers.len() >= 2);
+
+        // 5. Alice downloads V1 via real CLI -> real Gateway -> live Kubo and verifies byte-for-byte!
+        let v1_downloaded = tmp_dir.join("v1-downloaded.bin");
+        let dl_out = run_cli(
+            &gw_url,
+            alice_id,
+            alice_sign_sk,
+            alice_enc_seed,
+            &alice_session_file,
+            "2",
+            &[
+                "download",
+                &file_id_str,
+                "1",
+                v1_downloaded.to_str().unwrap(),
+            ],
+        )
+        .await;
+        assert!(
+            dl_out.status.success(),
+            "cli download V1 failed: {}",
+            String::from_utf8_lossy(&dl_out.stderr)
+        );
+        assert_eq!(std::fs::read(&v1_downloaded).unwrap(), v1_plaintext);
+
+        // 6. Alice modifies V1 -> simulated ransomware V2 via real CLI -> live 2-peer Cluster!
+        let v2_input = tmp_dir.join("v2-corrupted.bin");
+        std::fs::write(&v2_input, b"RANSOMWARE_ENCRYPTED_CORRUPT_V2").unwrap();
+        let mod_out = run_cli(
+            &gw_url,
+            alice_id,
+            alice_sign_sk,
+            alice_enc_seed,
+            &alice_session_file,
+            "2",
+            &["modify", &file_id_str, v2_input.to_str().unwrap()],
+        )
+        .await;
+        assert!(
+            mod_out.status.success(),
+            "cli modify V2 failed: {}",
+            String::from_utf8_lossy(&mod_out.stderr)
+        );
+        let mod_stdout = String::from_utf8_lossy(&mod_out.stdout);
+        assert_eq!(parse_kv(&mod_stdout, "version"), "2");
+        let v2_content_cid = ContentCid::parse(&parse_kv(&mod_stdout, "contentCid")).unwrap();
+        let v2_env_cid = EnvelopeSetCid::parse(&parse_kv(&mod_stdout, "envelopeSetCid")).unwrap();
+        assert_ne!(v2_content_cid, v1_content_cid);
+        committed_cids.push(StorageCid::Content(v2_content_cid));
+        committed_cids.push(StorageCid::EnvelopeSet(v2_env_cid));
+
+        // 7. Historical access invariant: once V2 is current head, V1 is historical and
+        //    even Alice cannot access V1 for share/restore until Safe grants historical read!
+        let denied_share = run_cli(
+            &gw_url,
+            alice_id,
+            alice_sign_sk,
+            alice_enc_seed,
+            &alice_session_file,
+            "2",
+            &["share", &file_id_str, "1", &bob_id.to_string()],
+        )
+        .await;
+        assert!(
+            !denied_share.status.success(),
+            "historical V1 share must fail closed before explicit historical read grant"
+        );
+
+        // Safe grants Read + Historical Read (V1) for Bob and Historical Read (V1) for Alice,
+        // then Alice runs `cli share` (Option B) and Bob downloads V1 byte-for-byte!
+        {
+            let mut st = chain.state.lock().unwrap();
+            st.read_acl
+                .insert((*bob_id.as_bytes(), *file_id.as_bytes()));
+            st.historical_read
+                .insert((*alice_id.as_bytes(), *file_id.as_bytes(), 1));
+            st.historical_read
+                .insert((*bob_id.as_bytes(), *file_id.as_bytes(), 1));
+        }
+        let share_out = run_cli(
+            &gw_url,
+            alice_id,
+            alice_sign_sk,
+            alice_enc_seed,
+            &alice_session_file,
+            "2",
+            &["share", &file_id_str, "1", &bob_id.to_string()],
+        )
+        .await;
+        assert!(
+            share_out.status.success(),
+            "cli share V1 to Bob failed: {}",
+            String::from_utf8_lossy(&share_out.stderr)
+        );
+        let share_stdout = String::from_utf8_lossy(&share_out.stdout);
+        let v1_env_rev2_cid =
+            EnvelopeSetCid::parse(&parse_kv(&share_stdout, "newEnvelopeCid")).unwrap();
+        committed_cids.push(StorageCid::EnvelopeSet(v1_env_rev2_cid));
+
+        let bob_login = run_cli(
+            &gw_url,
+            bob_id,
+            bob_sign_sk,
+            bob_enc_seed,
+            &bob_session_file,
+            "2",
+            &[
+                "login",
+                "--session-file",
+                bob_session_file.to_str().unwrap(),
+            ],
+        )
+        .await;
+        assert!(bob_login.status.success());
+        let bob_v1_out = tmp_dir.join("bob-v1.bin");
+        let bob_dl = run_cli(
+            &gw_url,
+            bob_id,
+            bob_sign_sk,
+            bob_enc_seed,
+            &bob_session_file,
+            "2",
+            &["download", &file_id_str, "1", bob_v1_out.to_str().unwrap()],
+        )
+        .await;
+        assert!(
+            bob_dl.status.success(),
+            "Bob cli download V1 failed: {}",
+            String::from_utf8_lossy(&bob_dl.stderr)
+        );
+        assert_eq!(std::fs::read(&bob_v1_out).unwrap(), v1_plaintext);
+
+        // 8. Alice runs `cli restore <id> 1 --reader <bob>` -> appends V3 (fresh DEK, 2 live Cluster replicas)
+        //    and records `restored_from_version = Some(1)` in gateway audit; Bob downloads V3!
+        let restore_out = run_cli(
+            &gw_url,
+            alice_id,
+            alice_sign_sk,
+            alice_enc_seed,
+            &alice_session_file,
+            "2",
+            &[
+                "restore",
+                &file_id_str,
+                "1",
+                "--reader",
+                &bob_id.to_string(),
+            ],
+        )
+        .await;
+        assert!(
+            restore_out.status.success(),
+            "cli restore V1->V3 failed: {}",
+            String::from_utf8_lossy(&restore_out.stderr)
+        );
+        let restore_stdout = String::from_utf8_lossy(&restore_out.stdout);
+        let v3_content_cid = ContentCid::parse(&parse_kv(&restore_stdout, "contentCid")).unwrap();
+        let v3_env_cid =
+            EnvelopeSetCid::parse(&parse_kv(&restore_stdout, "envelopeSetCid")).unwrap();
+        assert_ne!(v3_content_cid, v1_content_cid);
+        committed_cids.push(StorageCid::Content(v3_content_cid));
+        committed_cids.push(StorageCid::EnvelopeSet(v3_env_cid));
+        assert_eq!(
+            store.state.lock().unwrap().restore_audit_sources,
+            vec![Some(1)],
+            "restore must record source version 1 in file.version_restore audit"
+        );
+
+        let bob_v3_out = tmp_dir.join("bob-v3.bin");
+        let bob_dl_v3 = run_cli(
+            &gw_url,
+            bob_id,
+            bob_sign_sk,
+            bob_enc_seed,
+            &bob_session_file,
+            "2",
+            &["download", &file_id_str, "3", bob_v3_out.to_str().unwrap()],
+        )
+        .await;
+        assert!(bob_dl_v3.status.success());
+        assert_eq!(std::fs::read(&bob_v3_out).unwrap(), v1_plaintext);
+
+        // 9. BAD CASE A: Raw plaintext posted to /v1/blobs/content -> 400 Bad Request (rejected before IPFS).
+        let alice_bearer = std::fs::read_to_string(&alice_session_file)
+            .unwrap()
+            .trim()
+            .to_owned();
+        let http = reqwest::Client::new();
+        let plaintext_resp = http
+            .post(format!("{gw_url}/v1/blobs/content"))
+            .bearer_auth(&alice_bearer)
+            .body(b"UNENCRYPTED PLAINTEXT MUST BE REJECTED".to_vec())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(plaintext_resp.status(), reqwest::StatusCode::BAD_REQUEST);
+
+        // 10. BAD CASE B: Bob (Read-only, NOT in Write ACL) runs `cli modify` -> rejected BEFORE pinning!
+        let bob_bad_mod = run_cli(
+            &gw_url,
+            bob_id,
+            bob_sign_sk,
+            bob_enc_seed,
+            &bob_session_file,
+            "2",
+            &["modify", &file_id_str, v2_input.to_str().unwrap()],
+        )
+        .await;
+        assert!(
+            !bob_bad_mod.status.success(),
+            "read-only Bob must NOT be allowed to modify or pin blobs"
+        );
+
+        // 11. BAD CASE C: Impossible MIN_PIN_REPLICAS=5 against 2-peer Cluster fails closed!
+        let strict_ipfs = IpfsClusterStore::new(IpfsConfig {
+            kubo_api_urls: kubo_urls,
+            cluster_api_urls: cluster_urls,
+            cluster_credentials: ClusterCredentials::new(cluster_user, cluster_password),
+            request_timeout: Duration::from_secs(10),
+            replication_timeout: Duration::from_secs(3),
+            replication_poll_interval: Duration::from_millis(250),
+            max_upload_bytes: 32 * 1024 * 1024,
+        })
+        .unwrap();
+        let strict_state = AppState::new(
+            store.clone(),
+            chain.clone(),
+            strict_ipfs,
+            GatewayConfig {
+                environment: crate::config::RuntimeEnvironment::Development,
+                database_url: "postgres://unused".to_owned(),
+                besu_rpc_url: "http://127.0.0.1:8545".to_owned(),
+                chain_id: 1337,
+                access_governance: access_gov,
+                file_registry: file_reg,
+                audience: "rrds-live-cli-e2e".to_owned(),
+                bind: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+                challenge_ttl_seconds: 120,
+                session_ttl_seconds: 900,
+                rate_limit_capacity: 500,
+                rate_limit_refill_per_second: 50.0,
+                member_rate_limit_capacity: 500,
+                member_rate_limit_refill_per_second: 50.0,
+                org_rate_limit_capacity: 500,
+                org_rate_limit_refill_per_second: 50.0,
+                invalid_sig_limit_capacity: 50,
+                invalid_sig_limit_refill_per_second: 5.0,
+                max_concurrent_streams: 32,
+                min_pin_replicas: 5,
+                default_tx_gas_limit: 2_000_000,
+                transaction_confirmation_timeout_seconds: 30,
+                orphan_retention_seconds: 3600,
+                storage_health_interval_seconds: 30,
+                max_blob_upload_bytes: 32 * 1024 * 1024,
+            },
+        );
+        let strict_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let strict_url = format!("http://{}", strict_listener.local_addr().unwrap());
+        let strict_handle = tokio::spawn(async move {
+            axum::serve(
+                strict_listener,
+                router(strict_state).into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .unwrap();
+        });
+        let strict_upload = run_cli(
+            &strict_url,
+            alice_id,
+            alice_sign_sk,
+            alice_enc_seed,
+            &alice_session_file,
+            "5",
+            &[
+                "upload",
+                v2_input.to_str().unwrap(),
+                "--name",
+                "impossible-quorum.bin",
+                "--file-id",
+                &FileId::from_bytes([0xac; 32]).to_string(),
+            ],
+        )
+        .await;
+        assert!(
+            !strict_upload.status.success(),
+            "MIN_PIN_REPLICAS=5 against 2 live Cluster peers must fail closed"
+        );
+        strict_handle.abort();
+
+        // 12. BAD CASE D: Reverted V4 write -> OrphanBlobCleaner live DELETE /pins/{cid} on Cluster!
+        //     Committed V1/V2/V3 CIDs MUST remain pinned on 2 peers; reverted V4 CIDs MUST be unpinned.
+        *force_revert.lock().unwrap() = true;
+        let v4_input = tmp_dir.join("v4-reverted.bin");
+        std::fs::write(&v4_input, b"V4_REVERTED_ORPHAN_CLEANUP_PAYLOAD").unwrap();
+        let reverted_mod = run_cli(
+            &gw_url,
+            alice_id,
+            alice_sign_sk,
+            alice_enc_seed,
+            &alice_session_file,
+            "2",
+            &["modify", &file_id_str, v4_input.to_str().unwrap()],
+        )
+        .await;
+        assert!(
+            !reverted_mod.status.success(),
+            "reverted V4 modify must report failure to CLI"
+        );
+        *force_revert.lock().unwrap() = false;
+
+        let candidate_cids: Vec<String> = store
+            .state
+            .lock()
+            .unwrap()
+            .orphan_blobs
+            .iter()
+            .filter_map(|(cid, (_, status))| (status == "candidate").then_some(cid.clone()))
+            .collect();
+        assert_eq!(
+            candidate_cids.len(),
+            2,
+            "reverted V4 upload should leave exactly 2 orphan candidates (content + envelope), got {candidate_cids:?}"
+        );
+
+        let cleanup_summary = crate::maintenance::cleanup_orphan_blobs_once(&cleanup_state, 0, 50)
+            .await
+            .expect("run live OrphanBlobCleaner");
+        assert_eq!(cleanup_summary.unpinned, 2);
+        assert_eq!(cleanup_summary.skipped_due_to_error, 0);
+
+        // Verify V1 content CID is STILL pinned on 2 live Cluster peers after cleanup!
+        let still_pinned = cleanup_state
+            .blob_store
+            .ensure_replication(StorageCid::Content(v1_content_cid.clone()), 2)
+            .await
+            .expect("committed V1 content must remain pinned after orphan cleanup");
+        assert!(still_pinned.pinned_peers.len() >= 2);
+
+        // 13. Session revocation (`cli logout`) invalidates session immediately.
+        let logout_out = run_cli(
+            &gw_url,
+            alice_id,
+            alice_sign_sk,
+            alice_enc_seed,
+            &alice_session_file,
+            "2",
+            &[
+                "logout",
+                "--session-file",
+                alice_session_file.to_str().unwrap(),
+            ],
+        )
+        .await;
+        assert!(logout_out.status.success());
+
+        // Teardown: cleanly unpin temporary test objects from local Cluster and remove tmp dir.
+        for cid in committed_cids {
+            let _ = cleanup_state.blob_store.unpin(cid).await;
+        }
+        gw_handle.abort();
+        let _ = std::fs::remove_dir_all(&tmp_dir);
     }
 }

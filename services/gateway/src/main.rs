@@ -1,5 +1,6 @@
 mod auth;
 mod config;
+mod maintenance;
 mod ports;
 mod routes;
 mod store;
@@ -9,12 +10,13 @@ use std::{env, error::Error, net::TcpListener, sync::Arc, time::Duration};
 use chain_adapter::{
     BesuClient, DevelopmentRelayerSigner, RelayerConfig, RelayerStartupPolicy, TransactionRelayer,
 };
-use config::GatewayConfig;
+use config::{GatewayConfig, RuntimeEnvironment};
 use ipfs_adapter::{IpfsClusterStore, IpfsConfig};
 use metadata_store::{MigrationMode, PostgresPoolConfig, PostgresStore};
 use ports::BesuContractRelayer;
 use routes::{AppState, router};
 use store::GatewayStore;
+use tokio::sync::watch;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
@@ -35,6 +37,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let address = listener.local_addr()?;
 
     let relayer = build_optional_relayer(&config)?;
+    let storage_health_interval = Duration::from_secs(config.storage_health_interval_seconds);
+    let orphan_retention_seconds = config.orphan_retention_seconds;
     let mut state = AppState::new(
         GatewayStore::new(metadata.pool().clone()),
         chain,
@@ -44,14 +48,32 @@ async fn main() -> Result<(), Box<dyn Error>> {
     if let Some(relayer) = relayer {
         state = state.with_relayer(relayer);
     }
+
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let health_monitor = maintenance::spawn_storage_health_monitor(
+        Arc::clone(&state.blob_store),
+        storage_health_interval,
+        shutdown_rx.clone(),
+    );
+    let orphan_cleaner = maintenance::spawn_orphan_blob_cleaner(
+        state.clone(),
+        orphan_retention_seconds,
+        Duration::from_secs(orphan_retention_seconds.min(300)),
+        shutdown_rx,
+    );
     eprintln!("gateway listening on {address}");
 
     axum::serve(
         listener,
         router(state).into_make_service_with_connect_info::<std::net::SocketAddr>(),
     )
-    .with_graceful_shutdown(shutdown_signal())
+    .with_graceful_shutdown(async move {
+        shutdown_signal().await;
+        let _ = shutdown_tx.send(true);
+    })
     .await?;
+    let _ = health_monitor.await;
+    let _ = orphan_cleaner.await;
     Ok(())
 }
 
@@ -65,6 +87,12 @@ fn build_optional_relayer(
     else {
         return Ok(None);
     };
+    if config.environment == RuntimeEnvironment::Production && allow_unsafe_dev {
+        return Err(std::io::Error::other(
+            "GATEWAY_ALLOW_UNSAFE_DEV_RELAYER cannot be enabled when RRDS_ENV=production",
+        )
+        .into());
+    }
     let policy = if allow_unsafe_dev {
         RelayerStartupPolicy::UnsafeDevelopment
     } else {
