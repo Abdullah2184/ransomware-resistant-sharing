@@ -958,6 +958,70 @@ async function setFilePermissionViaSafe(fileId, memberId, permissionCode, grante
   );
 }
 
+async function createFolderViaSafe(displayName, parentFolderIdArg) {
+  if (!displayName) {
+    throw new Error("Usage: node scripts/besu-bootstrap.mjs create-folder <displayName> [parentFolderId]");
+  }
+  const dev = loadDevAccounts();
+  const state = loadBootstrapState();
+  const addresses = loadDeployedAddresses();
+  const regArt = loadArtifact("FileRegistry.sol", "FileRegistry");
+  const { publicClient, walletClient } = makeClients(dev.accounts.deployer.privateKey);
+
+  const parentFolderId = parentFolderIdArg ?? ZERO_BYTES32;
+  const folderId = `0x${crypto.randomBytes(32).toString("hex")}`;
+  const data = encodeFunctionData({
+    abi: regArt.abi,
+    functionName: "createFolder",
+    args: [folderId, DEMO_ORG_ID, parentFolderId, displayName],
+  });
+  const receipt = await execSafeTransaction({
+    publicClient,
+    walletClient,
+    chainId,
+    safeAddress: state.organizationSafeAddress,
+    ownerPrivateKeys: dev.safeOwners.organization.map((o) => o.privateKey),
+    to: addresses.fileRegistry,
+    data,
+  });
+  console.log(
+    `Created folder via 2-of-3 organizationSafe (tx ${receipt.transactionHash}, block ${receipt.blockNumber}):`
+  );
+  console.log(`  folderId:       ${folderId}`);
+  console.log(`  organizationId: ${DEMO_ORG_ID}`);
+  console.log(`  parentFolderId: ${parentFolderId}`);
+  console.log(`  displayName:    ${displayName}`);
+}
+
+async function renameFolderViaSafe(folderId, displayName) {
+  if (!folderId || !displayName) {
+    throw new Error("Usage: node scripts/besu-bootstrap.mjs rename-folder <folderId> <displayName>");
+  }
+  const dev = loadDevAccounts();
+  const state = loadBootstrapState();
+  const addresses = loadDeployedAddresses();
+  const regArt = loadArtifact("FileRegistry.sol", "FileRegistry");
+  const { publicClient, walletClient } = makeClients(dev.accounts.deployer.privateKey);
+
+  const data = encodeFunctionData({
+    abi: regArt.abi,
+    functionName: "renameFolder",
+    args: [folderId, displayName],
+  });
+  const receipt = await execSafeTransaction({
+    publicClient,
+    walletClient,
+    chainId,
+    safeAddress: state.organizationSafeAddress,
+    ownerPrivateKeys: dev.safeOwners.organization.map((o) => o.privateKey),
+    to: addresses.fileRegistry,
+    data,
+  });
+  console.log(
+    `Renamed folder ${folderId} -> "${displayName}" via 2-of-3 organizationSafe (tx ${receipt.transactionHash}, block ${receipt.blockNumber})`
+  );
+}
+
 const command = process.argv[2];
 switch (command) {
   case "init-dev-accounts":
@@ -981,12 +1045,18 @@ switch (command) {
   case "revoke-read":
     await setFilePermissionViaSafe(process.argv[3], process.argv[4], 0, false, process.argv[5]);
     break;
+  case "create-folder":
+    await createFolderViaSafe(process.argv[3], process.argv[4]);
+    break;
+  case "rename-folder":
+    await renameFolderViaSafe(process.argv[3], process.argv[4]);
+    break;
   case "status":
     await printStatus();
     break;
   default:
     console.error(
-      "Usage: node scripts/besu-bootstrap.mjs <init-dev-accounts|deploy|schedule|execute|register-member|grant-read|revoke-read|status>"
+      "Usage: node scripts/besu-bootstrap.mjs <init-dev-accounts|deploy|schedule|execute|register-member|grant-read|revoke-read|create-folder|rename-folder|status>"
     );
     process.exit(1);
 }

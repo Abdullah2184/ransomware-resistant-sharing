@@ -303,59 +303,66 @@ impl TransactionRelayer {
         Ok(padded)
     }
 
-    /// Submits one signed Type-2 contract call and polls until the receipt is
-    /// included in a QBFT-committed block or the confirmation deadline elapses.
-    ///
-    /// On timeout this clears the cached local nonce so subsequent submissions
-    /// resynchronize against Besu's pending nonce, returns
-    /// [`RelayError::ConfirmationTimedOut`] with the submitted transaction hash,
-    /// and never automatically resubmits.
-    pub async fn submit_and_confirm(
+    /// Signs and broadcasts one Type-2 contract call without waiting for
+    /// confirmation, returning the verified transaction hash immediately so
+    /// callers can durably persist `pending` metadata before polling
+    /// (`TECHNICAL_SPECIFICATION.md` §10.4.7).
+    pub async fn submit_transaction(
         &self,
         to: EvmAddress,
         calldata: Vec<u8>,
         gas_limit: Option<u64>,
-    ) -> Result<RelayOutcome, RelayError> {
+    ) -> Result<[u8; 32], RelayError> {
         let gas_limit = gas_limit.unwrap_or(self.config.default_gas_limit);
         if gas_limit == 0 || gas_limit > self.config.max_gas_limit {
             return Err(RelayError::GasLimitExceeded);
         }
 
-        let tx_hash = {
-            let mut nonce_guard = self.next_nonce.lock().await;
-            let nonce = match *nonce_guard {
-                Some(cached) => cached,
-                None => self.client.pending_nonce(&self.signer.address()).await?,
-            };
-            let unsigned =
-                encode_eip1559_unsigned_tx(self.config.chain_id, nonce, gas_limit, to, &calldata);
-            let signing_hash = keccak256(&unsigned);
-            let signature = self.signer.sign_tx_hash(&signing_hash)?;
-            let signed = encode_eip1559_signed_tx(
-                self.config.chain_id,
-                nonce,
-                gas_limit,
-                to,
-                &calldata,
-                signature,
-            );
-            let expected_hash = keccak256(&signed);
-            match self.client.send_raw_transaction(&signed).await {
-                Ok(submitted_hash) => {
-                    if submitted_hash != expected_hash {
-                        *nonce_guard = None;
-                        return Err(RelayError::HashMismatch);
-                    }
-                    *nonce_guard = nonce.checked_add(1);
-                    submitted_hash
-                }
-                Err(error) => {
-                    *nonce_guard = None;
-                    return Err(RelayError::Chain(error));
-                }
-            }
+        let mut nonce_guard = self.next_nonce.lock().await;
+        let nonce = match *nonce_guard {
+            Some(cached) => cached,
+            None => self.client.pending_nonce(&self.signer.address()).await?,
         };
+        let unsigned =
+            encode_eip1559_unsigned_tx(self.config.chain_id, nonce, gas_limit, to, &calldata);
+        let signing_hash = keccak256(&unsigned);
+        let signature = self.signer.sign_tx_hash(&signing_hash)?;
+        let signed = encode_eip1559_signed_tx(
+            self.config.chain_id,
+            nonce,
+            gas_limit,
+            to,
+            &calldata,
+            signature,
+        );
+        let expected_hash = keccak256(&signed);
+        match self.client.send_raw_transaction(&signed).await {
+            Ok(submitted_hash) => {
+                if submitted_hash != expected_hash {
+                    *nonce_guard = None;
+                    return Err(RelayError::HashMismatch);
+                }
+                *nonce_guard = nonce.checked_add(1);
+                Ok(submitted_hash)
+            }
+            Err(error) => {
+                *nonce_guard = None;
+                Err(RelayError::Chain(error))
+            }
+        }
+    }
 
+    /// Polls until a previously broadcast transaction is included in a
+    /// QBFT-committed block or the confirmation deadline elapses.
+    ///
+    /// On timeout this clears the cached local nonce so subsequent submissions
+    /// resynchronize against Besu's pending nonce, returns
+    /// [`RelayError::ConfirmationTimedOut`] with `tx_hash`, and never
+    /// automatically resubmits.
+    pub async fn wait_for_confirmation(
+        &self,
+        tx_hash: [u8; 32],
+    ) -> Result<RelayOutcome, RelayError> {
         let deadline = Instant::now() + self.config.confirmation_timeout;
         loop {
             if let Some(outcome) = self.reconcile_transaction(tx_hash).await? {
@@ -370,6 +377,18 @@ impl TransactionRelayer {
             let remaining = deadline.saturating_duration_since(Instant::now());
             tokio::time::sleep(self.config.poll_interval.min(remaining)).await;
         }
+    }
+
+    /// Submits one signed Type-2 contract call and polls until the receipt is
+    /// included in a QBFT-committed block or the confirmation deadline elapses.
+    pub async fn submit_and_confirm(
+        &self,
+        to: EvmAddress,
+        calldata: Vec<u8>,
+        gas_limit: Option<u64>,
+    ) -> Result<RelayOutcome, RelayError> {
+        let tx_hash = self.submit_transaction(to, calldata, gas_limit).await?;
+        self.wait_for_confirmation(tx_hash).await
     }
 
     /// Queries the current QBFT-committed receipt for a previously submitted

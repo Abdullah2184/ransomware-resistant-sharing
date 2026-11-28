@@ -267,37 +267,79 @@ impl WriteAuditContext<'_> {
             .await;
     }
 
-    async fn finalize_relay(
+    async fn persist_pending_and_confirm(
         &self,
+        relayer: &dyn crate::ports::GatewayRelayerPort,
         success_status: StatusCode,
         content_cid: Option<&str>,
         envelope_set_cid: &str,
-        relay_result: Result<RelayOutcome, RelayError>,
+        submit_result: Result<[u8; 32], RelayError>,
     ) -> Response {
+        let tx_hash = match submit_result {
+            Ok(tx_hash) => tx_hash,
+            Err(_) => {
+                self.record_orphans(content_cid, envelope_set_cid, None, "relay_failed")
+                    .await;
+                return self
+                    .fail(
+                        "failed",
+                        "relay_failed",
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "service_unavailable",
+                    )
+                    .await;
+            }
+        };
+
         let file_id_str = self.file_id.to_string();
         let operation_id = self.operation_id.unwrap_or_default().to_owned();
-        match relay_result {
+        let tx_hash_hex = encode_hex(&tx_hash);
+
+        // Durably persist `pending` metadata IMMEDIATELY after broadcast and BEFORE
+        // polling for confirmation so a crash/restart mid-confirmation never loses
+        // transaction reconciliation metadata (§10.4.7).
+        if self
+            .state
+            .store
+            .record_relayed_transaction(&RelayedTransactionRecord {
+                tx_hash: tx_hash_hex.clone(),
+                operation_kind: self.action.to_owned(),
+                operation_id,
+                actor_member_id: self.member_id.to_owned(),
+                file_id: file_id_str.clone(),
+                version_number: self.version,
+                content_cid: content_cid.map(str::to_owned),
+                envelope_set_cid: envelope_set_cid.to_owned(),
+                chain_id: self.state.config.chain_id,
+                status: "pending".to_owned(),
+                block_number: None,
+                block_hash: None,
+                gas_used: None,
+            })
+            .await
+            .is_err()
+        {
+            return error(StatusCode::SERVICE_UNAVAILABLE, "service_unavailable");
+        }
+
+        match relayer.wait_for_confirmation(tx_hash).await {
             Ok(RelayOutcome::Committed(receipt)) => {
-                let tx_hash_hex = encode_hex(&receipt.transaction_hash);
-                let _ = self
+                let confirmed_hash = encode_hex(&receipt.transaction_hash);
+                if self
                     .state
                     .store
-                    .record_relayed_transaction(&RelayedTransactionRecord {
-                        tx_hash: tx_hash_hex.clone(),
-                        operation_kind: self.action.to_owned(),
-                        operation_id,
-                        actor_member_id: self.member_id.to_owned(),
-                        file_id: file_id_str.clone(),
-                        version_number: self.version,
-                        content_cid: content_cid.map(str::to_owned),
-                        envelope_set_cid: envelope_set_cid.to_owned(),
-                        chain_id: self.state.config.chain_id,
-                        status: "confirmed".to_owned(),
-                        block_number: Some(receipt.block_number),
-                        block_hash: Some(receipt.block_hash.clone()),
-                        gas_used: Some(receipt.gas_used),
-                    })
-                    .await;
+                    .update_relayed_transaction_status(
+                        &confirmed_hash,
+                        "confirmed",
+                        Some(receipt.block_number),
+                        Some(&receipt.block_hash),
+                        Some(receipt.gas_used),
+                    )
+                    .await
+                    .is_err()
+                {
+                    return error(StatusCode::SERVICE_UNAVAILABLE, "service_unavailable");
+                }
                 self.mark_blobs_referenced(content_cid, envelope_set_cid)
                     .await;
                 if self
@@ -326,7 +368,7 @@ impl WriteAuditContext<'_> {
                     Json(WriteCommitResponse {
                         file_id: file_id_str,
                         version_number: self.version,
-                        transaction_hash: tx_hash_hex,
+                        transaction_hash: confirmed_hash,
                         block_number: receipt.block_number,
                         block_hash: receipt.block_hash,
                         gas_used: receipt.gas_used,
@@ -335,30 +377,26 @@ impl WriteAuditContext<'_> {
                     .into_response()
             }
             Ok(RelayOutcome::Reverted(receipt)) => {
-                let tx_hash_hex = encode_hex(&receipt.transaction_hash);
-                let _ = self
+                let reverted_hash = encode_hex(&receipt.transaction_hash);
+                if self
                     .state
                     .store
-                    .record_relayed_transaction(&RelayedTransactionRecord {
-                        tx_hash: tx_hash_hex.clone(),
-                        operation_kind: self.action.to_owned(),
-                        operation_id,
-                        actor_member_id: self.member_id.to_owned(),
-                        file_id: file_id_str.clone(),
-                        version_number: self.version,
-                        content_cid: content_cid.map(str::to_owned),
-                        envelope_set_cid: envelope_set_cid.to_owned(),
-                        chain_id: self.state.config.chain_id,
-                        status: "reverted".to_owned(),
-                        block_number: Some(receipt.block_number),
-                        block_hash: Some(receipt.block_hash.clone()),
-                        gas_used: Some(receipt.gas_used),
-                    })
-                    .await;
+                    .update_relayed_transaction_status(
+                        &reverted_hash,
+                        "reverted",
+                        Some(receipt.block_number),
+                        Some(&receipt.block_hash),
+                        Some(receipt.gas_used),
+                    )
+                    .await
+                    .is_err()
+                {
+                    return error(StatusCode::SERVICE_UNAVAILABLE, "service_unavailable");
+                }
                 self.record_orphans(
                     content_cid,
                     envelope_set_cid,
-                    Some(&tx_hash_hex),
+                    Some(&reverted_hash),
                     "contract_reverted",
                 )
                 .await;
@@ -387,37 +425,12 @@ impl WriteAuditContext<'_> {
                     StatusCode::CONFLICT,
                     Json(RelayErrorResponse {
                         error: "contract_reverted",
-                        transaction_hash: tx_hash_hex,
+                        transaction_hash: reverted_hash,
                     }),
                 )
                     .into_response()
             }
-            Err(RelayError::ConfirmationTimedOut { tx_hash }) => {
-                let tx_hash_hex = encode_hex(&tx_hash);
-                // Persist pending transaction so reconciliation survives gateway restarts (§7.13, §10.4.7).
-                if self
-                    .state
-                    .store
-                    .record_relayed_transaction(&RelayedTransactionRecord {
-                        tx_hash: tx_hash_hex.clone(),
-                        operation_kind: self.action.to_owned(),
-                        operation_id,
-                        actor_member_id: self.member_id.to_owned(),
-                        file_id: file_id_str.clone(),
-                        version_number: self.version,
-                        content_cid: content_cid.map(str::to_owned),
-                        envelope_set_cid: envelope_set_cid.to_owned(),
-                        chain_id: self.state.config.chain_id,
-                        status: "pending".to_owned(),
-                        block_number: None,
-                        block_hash: None,
-                        gas_used: None,
-                    })
-                    .await
-                    .is_err()
-                {
-                    return error(StatusCode::SERVICE_UNAVAILABLE, "service_unavailable");
-                }
+            Err(RelayError::ConfirmationTimedOut { .. }) => {
                 if self
                     .state
                     .store
@@ -449,11 +462,11 @@ impl WriteAuditContext<'_> {
                     .into_response()
             }
             Err(_) => {
-                self.record_orphans(content_cid, envelope_set_cid, None, "relay_failed")
-                    .await;
+                // Transaction was already broadcast and persisted as `pending`; do NOT
+                // falsely mark blobs as orphaned while confirmation is uncertain.
                 self.fail(
-                    "failed",
-                    "relay_failed",
+                    "pending_uncertain",
+                    "confirmation_unavailable",
                     StatusCode::SERVICE_UNAVAILABLE,
                     "service_unavailable",
                 )
@@ -907,8 +920,8 @@ pub(crate) async fn create_file(
         operation_nonce: fields.nonce_bytes,
         deadline: request.deadline,
     };
-    let relay_result = relayer
-        .relay_create_file(
+    let submit_result = relayer
+        .submit_create_file(
             call,
             request.display_name,
             parent_folder_id,
@@ -916,11 +929,12 @@ pub(crate) async fn create_file(
         )
         .await;
     audit
-        .finalize_relay(
+        .persist_pending_and_confirm(
+            relayer.as_ref(),
             StatusCode::CREATED,
             Some(&content_cid_str),
             &envelope_cid_str,
-            relay_result,
+            submit_result,
         )
         .await
 }
@@ -1183,15 +1197,16 @@ pub(crate) async fn append_version(
         operation_nonce: fields.nonce_bytes,
         deadline: request.deadline,
     };
-    let relay_result = relayer
-        .relay_append_version(call, fields.signature_bytes.to_vec())
+    let submit_result = relayer
+        .submit_append_version(call, fields.signature_bytes.to_vec())
         .await;
     audit
-        .finalize_relay(
+        .persist_pending_and_confirm(
+            relayer.as_ref(),
             StatusCode::CREATED,
             Some(&content_cid_str),
             &envelope_cid_str,
-            relay_result,
+            submit_result,
         )
         .await
 }
@@ -1539,11 +1554,17 @@ pub(crate) async fn update_envelope_set(
         operation_nonce: nonce_bytes,
         deadline: request.deadline,
     };
-    let relay_result = relayer
-        .relay_update_envelope_set(call, signature_bytes.to_vec())
+    let submit_result = relayer
+        .submit_update_envelope_set(call, signature_bytes.to_vec())
         .await;
     audit
-        .finalize_relay(StatusCode::OK, None, &new_cid_str, relay_result)
+        .persist_pending_and_confirm(
+            relayer.as_ref(),
+            StatusCode::OK,
+            None,
+            &new_cid_str,
+            submit_result,
+        )
         .await
 }
 
@@ -1658,7 +1679,7 @@ pub(crate) async fn reconcile_transaction(
                     .store
                     .mark_blob_referenced(&record.envelope_set_cid)
                     .await;
-                let _ = state
+                if state
                     .store
                     .record_write_attempt(
                         ACTION,
@@ -1673,7 +1694,11 @@ pub(crate) async fn reconcile_transaction(
                         None,
                         None,
                     )
-                    .await;
+                    .await
+                    .is_err()
+                {
+                    return error(StatusCode::SERVICE_UNAVAILABLE, "service_unavailable");
+                }
                 record.status = "confirmed".to_owned();
                 record.block_number = Some(receipt.block_number);
                 record.block_hash = Some(receipt.block_hash);
@@ -1720,7 +1745,7 @@ pub(crate) async fn reconcile_transaction(
                         "contract_reverted",
                     )
                     .await;
-                let _ = state
+                if state
                     .store
                     .record_write_attempt(
                         ACTION,
@@ -1735,7 +1760,11 @@ pub(crate) async fn reconcile_transaction(
                         Some("contract_reverted"),
                         None,
                     )
-                    .await;
+                    .await
+                    .is_err()
+                {
+                    return error(StatusCode::SERVICE_UNAVAILABLE, "service_unavailable");
+                }
                 record.status = "reverted".to_owned();
                 record.block_number = Some(receipt.block_number);
                 record.block_hash = Some(receipt.block_hash);

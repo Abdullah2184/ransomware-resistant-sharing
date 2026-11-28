@@ -1,0 +1,12 @@
+# Exclude local secrets, build artifacts, and node_modules from Docker build contexts.
+.git
+.env
+.env.*
+!.env.example
+target
+contracts
+infra/ipfs-cluster/secrets
+infra/besu-qbft/networkFiles
+infra/besu-qbft/generated
+docs
+*.log

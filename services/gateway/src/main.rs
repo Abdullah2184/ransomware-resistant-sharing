@@ -55,6 +55,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
         storage_health_interval,
         shutdown_rx.clone(),
     );
+    let pending_tx_reconciler = maintenance::spawn_pending_transaction_reconciler(
+        state.clone(),
+        Duration::from_secs(15),
+        shutdown_rx.clone(),
+    );
     let orphan_cleaner = maintenance::spawn_orphan_blob_cleaner(
         state.clone(),
         orphan_retention_seconds,
@@ -73,6 +78,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     })
     .await?;
     let _ = health_monitor.await;
+    let _ = pending_tx_reconciler.await;
     let _ = orphan_cleaner.await;
     Ok(())
 }

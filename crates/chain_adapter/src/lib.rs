@@ -17,12 +17,15 @@ pub use relayer::{
     encode_append_version_calldata, encode_create_file_calldata, encode_eip1559_signed_tx,
     encode_eip1559_unsigned_tx, encode_update_envelope_set_calldata,
 };
-use reqwest::{Client, Url};
+use reqwest::{Client, StatusCode, Url, redirect::Policy};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 use sha3::{Digest, Keccak256};
 
+const RPC_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const RPC_TIMEOUT: Duration = Duration::from_secs(15);
+const RPC_MAX_RETRY_ATTEMPTS: usize = 3;
+const RPC_RETRY_INITIAL_BACKOFF: Duration = Duration::from_millis(50);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ChainError {
@@ -173,7 +176,9 @@ impl BesuClient {
             return Err(ChainError::InvalidEndpoint);
         }
         let client = Client::builder()
+            .connect_timeout(RPC_CONNECT_TIMEOUT)
             .timeout(RPC_TIMEOUT)
+            .redirect(Policy::none())
             .build()
             .map_err(|_| ChainError::TransportUnavailable)?;
         Ok(Self {
@@ -764,6 +769,31 @@ impl BesuClient {
     }
 
     async fn rpc_raw(&self, method: &str, params: Value) -> Result<Value, ChainError> {
+        let max_attempts = if is_idempotent_rpc_method(method) {
+            RPC_MAX_RETRY_ATTEMPTS
+        } else {
+            1
+        };
+        let mut backoff = RPC_RETRY_INITIAL_BACKOFF;
+        for attempt in 0..max_attempts {
+            match self.rpc_raw_once(method, &params).await {
+                Ok(value) => return Ok(value),
+                Err((error, true)) if attempt + 1 < max_attempts => {
+                    let _ = error;
+                    tokio::time::sleep(backoff).await;
+                    backoff = backoff.saturating_mul(2);
+                }
+                Err((error, _)) => return Err(error),
+            }
+        }
+        Err(ChainError::TransportUnavailable)
+    }
+
+    async fn rpc_raw_once(
+        &self,
+        method: &str,
+        params: &Value,
+    ) -> Result<Value, (ChainError, bool)> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let response = self
             .client
@@ -776,16 +806,20 @@ impl BesuClient {
             })
             .send()
             .await
-            .map_err(|_| ChainError::TransportUnavailable)?;
-        if !response.status().is_success() {
-            return Err(ChainError::TransportUnavailable);
+            .map_err(|_| (ChainError::TransportUnavailable, true))?;
+        let status = response.status();
+        if !status.is_success() {
+            let retryable = status.is_server_error()
+                || status == StatusCode::TOO_MANY_REQUESTS
+                || status == StatusCode::REQUEST_TIMEOUT;
+            return Err((ChainError::TransportUnavailable, retryable));
         }
         let body: RpcResponse = response
             .json()
             .await
-            .map_err(|_| ChainError::InvalidResponse)?;
+            .map_err(|_| (ChainError::InvalidResponse, false))?;
         if body.jsonrpc != "2.0" || body.id != id {
-            return Err(ChainError::InvalidResponse);
+            return Err((ChainError::InvalidResponse, false));
         }
         if let Some(error) = body.error {
             if error.code == 3 {
@@ -795,19 +829,32 @@ impl BesuClient {
                     .and_then(|value| decode_hex(value).ok())
                     .filter(|bytes| bytes.len() >= 4)
                     .map(|bytes| [bytes[0], bytes[1], bytes[2], bytes[3]]);
-                return Err(ChainError::ExecutionReverted(selector));
+                return Err((ChainError::ExecutionReverted(selector), false));
             }
-            return Err(ChainError::RpcRejected(error.code));
+            return Err((ChainError::RpcRejected(error.code), false));
         }
-        body.result.ok_or(ChainError::InvalidResponse)
+        body.result.ok_or((ChainError::InvalidResponse, false))
     }
+}
+
+fn is_idempotent_rpc_method(method: &str) -> bool {
+    matches!(
+        method,
+        "eth_chainId"
+            | "eth_getBlockByNumber"
+            | "eth_getLogs"
+            | "eth_call"
+            | "eth_getTransactionReceipt"
+            | "eth_getTransactionCount"
+            | "eth_estimateGas"
+    )
 }
 
 #[derive(Serialize)]
 struct RpcRequest<'a> {
     jsonrpc: &'static str,
     method: &'a str,
-    params: Value,
+    params: &'a Value,
     id: u64,
 }
 
@@ -1602,5 +1649,107 @@ mod tests {
             Err(ChainError::InvalidResponse)
         );
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn retries_idempotent_rpc_with_bounds_and_never_retries_send_raw_transaction() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering as AtomicOrdering},
+        };
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        // 1. Idempotent eth_chainId fails twice with 503 then succeeds on attempt 3.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let server_attempts = Arc::clone(&attempts);
+        let server = tokio::spawn(async move {
+            for i in 0..3 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut buf = [0u8; 2048];
+                let n = socket.read(&mut buf).await.unwrap();
+                let req = String::from_utf8_lossy(&buf[..n]);
+                server_attempts.fetch_add(1, AtomicOrdering::SeqCst);
+                if i < 2 {
+                    socket
+                        .write_all(
+                            b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        )
+                        .await
+                        .unwrap();
+                } else {
+                    let body = req.split("\r\n\r\n").nth(1).unwrap_or("{}");
+                    let parsed: Value = serde_json::from_str(body).unwrap();
+                    let resp = json!({ "jsonrpc": "2.0", "id": parsed["id"], "result": "0x539" })
+                        .to_string();
+                    let http = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        resp.len(),
+                        resp
+                    );
+                    socket.write_all(http.as_bytes()).await.unwrap();
+                }
+            }
+        });
+        let client = BesuClient::new(&format!("http://{addr}")).unwrap();
+        assert_eq!(client.chain_id().await.unwrap(), 1337);
+        assert_eq!(attempts.load(AtomicOrdering::SeqCst), 3);
+        server.await.unwrap();
+
+        // 2. Persistent 503 stops after exactly RPC_MAX_RETRY_ATTEMPTS (3).
+        let fail_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let fail_addr = fail_listener.local_addr().unwrap();
+        let fail_attempts = Arc::new(AtomicUsize::new(0));
+        let fail_server_attempts = Arc::clone(&fail_attempts);
+        let fail_server = tokio::spawn(async move {
+            for _ in 0..RPC_MAX_RETRY_ATTEMPTS {
+                let (mut socket, _) = fail_listener.accept().await.unwrap();
+                let mut buf = [0u8; 2048];
+                let _ = socket.read(&mut buf).await.unwrap();
+                fail_server_attempts.fetch_add(1, AtomicOrdering::SeqCst);
+                socket
+                    .write_all(
+                        b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    )
+                    .await
+                    .unwrap();
+            }
+        });
+        let fail_client = BesuClient::new(&format!("http://{fail_addr}")).unwrap();
+        assert_eq!(
+            fail_client.chain_id().await,
+            Err(ChainError::TransportUnavailable)
+        );
+        assert_eq!(
+            fail_attempts.load(AtomicOrdering::SeqCst),
+            RPC_MAX_RETRY_ATTEMPTS
+        );
+        fail_server.await.unwrap();
+
+        // 3. Non-idempotent eth_sendRawTransaction MUST NOT retry on 503 (exactly 1 attempt).
+        let tx_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let tx_addr = tx_listener.local_addr().unwrap();
+        let tx_attempts = Arc::new(AtomicUsize::new(0));
+        let tx_server_attempts = Arc::clone(&tx_attempts);
+        let tx_server = tokio::spawn(async move {
+            let (mut socket, _) = tx_listener.accept().await.unwrap();
+            let mut buf = [0u8; 2048];
+            let _ = socket.read(&mut buf).await.unwrap();
+            tx_server_attempts.fetch_add(1, AtomicOrdering::SeqCst);
+            socket
+                .write_all(
+                    b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+        });
+        let tx_client = BesuClient::new(&format!("http://{tx_addr}")).unwrap();
+        assert_eq!(
+            tx_client.send_raw_transaction(&[0x02, 0x01]).await,
+            Err(ChainError::TransportUnavailable)
+        );
+        assert_eq!(tx_attempts.load(AtomicOrdering::SeqCst), 1);
+        tx_server.await.unwrap();
     }
 }

@@ -28,6 +28,14 @@ const ROOT_BLOCK_LIMIT_BYTES: usize = 4 * 1024 * 1024;
 const MAX_REPLICA_COUNT: usize = 64;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const HEALTH_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_TRANSIENT_ATTEMPTS: usize = 3;
+const RETRY_INITIAL_BACKOFF: Duration = Duration::from_millis(50);
+
+fn is_retryable_http_status(status: StatusCode) -> bool {
+    status.is_server_error()
+        || status == StatusCode::TOO_MANY_REQUESTS
+        || status == StatusCode::REQUEST_TIMEOUT
+}
 
 #[derive(Clone)]
 pub struct ClusterCredentials {
@@ -192,14 +200,21 @@ impl IpfsClusterStore {
                 .first()
                 .ok_or(StorageError::TransportUnavailable);
         }
-        for base in &self.kubo_api_urls {
-            let Ok(url) = base.join("api/v0/id") else {
-                continue;
-            };
-            if let Ok(response) = self.probe_client.post(url).send().await
-                && response.status().is_success()
-            {
-                return Ok(base);
+        let mut backoff = RETRY_INITIAL_BACKOFF;
+        for attempt in 0..MAX_TRANSIENT_ATTEMPTS {
+            for base in &self.kubo_api_urls {
+                let Ok(url) = base.join("api/v0/id") else {
+                    continue;
+                };
+                if let Ok(response) = self.probe_client.post(url).send().await
+                    && response.status().is_success()
+                {
+                    return Ok(base);
+                }
+            }
+            if attempt + 1 < MAX_TRANSIENT_ATTEMPTS {
+                sleep(backoff).await;
+                backoff = backoff.saturating_mul(2);
             }
         }
         Err(StorageError::TransportUnavailable)
@@ -211,10 +226,10 @@ impl IpfsClusterStore {
         form: Form,
         wrap_with_directory: bool,
         expected_content: Option<(&EncryptedFileManifest, &str)>,
-    ) -> Result<String, StorageError> {
+    ) -> Result<String, (StorageError, bool)> {
         let url = base
             .join("api/v0/add")
-            .map_err(|_| StorageError::InvalidPackage)?;
+            .map_err(|_| (StorageError::InvalidPackage, false))?;
         let response = self
             .client
             .post(url)
@@ -235,47 +250,63 @@ impl IpfsClusterStore {
             .multipart(form)
             .send()
             .await
-            .map_err(|_| StorageError::TransportUnavailable)?;
-        if !response.status().is_success() {
-            return Err(StorageError::TransportUnavailable);
+            .map_err(|_| (StorageError::TransportUnavailable, true))?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err((
+                StorageError::TransportUnavailable,
+                is_retryable_http_status(status),
+            ));
         }
 
-        let output = bounded_response_body(response, ADD_RESPONSE_LIMIT_BYTES).await?;
-        parse_add_output(&output, wrap_with_directory, expected_content)
+        let output = bounded_response_body(response, ADD_RESPONSE_LIMIT_BYTES)
+            .await
+            .map_err(|err| (err, false))?;
+        parse_add_output(&output, wrap_with_directory, expected_content).map_err(|err| (err, false))
     }
 
     async fn delete_pin(&self, cid_text: &str) -> Result<(), StorageError> {
-        let mut last_err = StorageError::TransportUnavailable;
-        for base in &self.cluster_api_urls {
-            let url = base
-                .join(&format!("pins/{cid_text}"))
-                .map_err(|_| StorageError::InvalidCid)?;
-            let response = match self
-                .client
-                .delete(url)
-                .basic_auth(&self.credentials.username, Some(&self.credentials.password))
-                .send()
-                .await
-            {
-                Ok(response) => response,
-                Err(_) => {
-                    last_err = StorageError::TransportUnavailable;
-                    continue;
+        let mut backoff = RETRY_INITIAL_BACKOFF;
+        for attempt in 0..MAX_TRANSIENT_ATTEMPTS {
+            let mut saw_retryable = false;
+            for base in &self.cluster_api_urls {
+                let url = base
+                    .join(&format!("pins/{cid_text}"))
+                    .map_err(|_| StorageError::InvalidCid)?;
+                let response = match self
+                    .client
+                    .delete(url)
+                    .basic_auth(&self.credentials.username, Some(&self.credentials.password))
+                    .send()
+                    .await
+                {
+                    Ok(response) => response,
+                    Err(_) => {
+                        saw_retryable = true;
+                        continue;
+                    }
+                };
+                let status = response.status();
+                if status.is_success()
+                    || status == StatusCode::ACCEPTED
+                    || status == StatusCode::NOT_FOUND
+                {
+                    return Ok(());
                 }
-            };
-            let status = response.status();
-            if status.is_success()
-                || status == StatusCode::ACCEPTED
-                || status == StatusCode::NOT_FOUND
-            {
-                return Ok(());
+                if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
+                    return Err(StorageError::TransportUnavailable);
+                }
+                if is_retryable_http_status(status) {
+                    saw_retryable = true;
+                }
             }
-            if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
-                return Err(StorageError::TransportUnavailable);
+            if !saw_retryable || attempt + 1 >= MAX_TRANSIENT_ATTEMPTS {
+                break;
             }
-            last_err = StorageError::TransportUnavailable;
+            sleep(backoff).await;
+            backoff = backoff.saturating_mul(2);
         }
-        Err(last_err)
+        Err(StorageError::TransportUnavailable)
     }
 
     async fn probe_storage_health(&self) -> ports::StorageHealthStatus {
@@ -311,82 +342,106 @@ impl IpfsClusterStore {
     }
 
     async fn post_pin(&self, cid_text: &str, min_replicas: usize) -> Result<(), StorageError> {
-        let mut last_err = StorageError::TransportUnavailable;
-        for base in &self.cluster_api_urls {
-            let url = base
-                .join(&format!("pins/{cid_text}"))
-                .map_err(|_| StorageError::InvalidCid)?;
-            let response = match self
-                .client
-                .post(url)
-                .query(&[
-                    ("replication-min", min_replicas.to_string()),
-                    ("replication-max", min_replicas.to_string()),
-                ])
-                .basic_auth(&self.credentials.username, Some(&self.credentials.password))
-                .send()
-                .await
-            {
-                Ok(response) => response,
-                Err(_) => {
-                    last_err = StorageError::TransportUnavailable;
-                    continue;
+        let mut backoff = RETRY_INITIAL_BACKOFF;
+        for attempt in 0..MAX_TRANSIENT_ATTEMPTS {
+            let mut saw_retryable = false;
+            for base in &self.cluster_api_urls {
+                let url = base
+                    .join(&format!("pins/{cid_text}"))
+                    .map_err(|_| StorageError::InvalidCid)?;
+                let response = match self
+                    .client
+                    .post(url)
+                    .query(&[
+                        ("replication-min", min_replicas.to_string()),
+                        ("replication-max", min_replicas.to_string()),
+                    ])
+                    .basic_auth(&self.credentials.username, Some(&self.credentials.password))
+                    .send()
+                    .await
+                {
+                    Ok(response) => response,
+                    Err(_) => {
+                        saw_retryable = true;
+                        continue;
+                    }
+                };
+                let status = response.status();
+                if status.is_success() || status == StatusCode::ACCEPTED {
+                    return Ok(());
                 }
-            };
-            let status = response.status();
-            if status.is_success() || status == StatusCode::ACCEPTED {
-                return Ok(());
+                if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
+                    return Err(StorageError::TransportUnavailable);
+                }
+                if is_retryable_http_status(status) {
+                    saw_retryable = true;
+                }
             }
-            if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
-                return Err(StorageError::TransportUnavailable);
+            if !saw_retryable || attempt + 1 >= MAX_TRANSIENT_ATTEMPTS {
+                break;
             }
-            last_err = StorageError::TransportUnavailable;
+            sleep(backoff).await;
+            backoff = backoff.saturating_mul(2);
         }
-        Err(last_err)
+        Err(StorageError::TransportUnavailable)
     }
 
     async fn fetch_pin_status(
         &self,
         cid_text: &str,
     ) -> Result<Option<ClusterPinStatus>, StorageError> {
-        let mut not_found = false;
-        for base in &self.cluster_api_urls {
-            let status_url = base
-                .join(&format!("pins/{cid_text}"))
-                .map_err(|_| StorageError::InvalidCid)?;
-            let response = match self
-                .client
-                .get(status_url)
-                .basic_auth(&self.credentials.username, Some(&self.credentials.password))
-                .send()
-                .await
-            {
-                Ok(response) => response,
-                Err(_) => continue,
-            };
-            let status = response.status();
-            if status.is_success() {
-                let body = bounded_response_body(response, PIN_STATUS_LIMIT_BYTES).await?;
-                let parsed: ClusterPinStatus =
-                    serde_json::from_slice(&body).map_err(|_| StorageError::InvalidResponse)?;
-                if parsed.cid != cid_text {
-                    return Err(StorageError::InvalidResponse);
+        let mut backoff = RETRY_INITIAL_BACKOFF;
+        for attempt in 0..MAX_TRANSIENT_ATTEMPTS {
+            let mut not_found = false;
+            let mut saw_retryable = false;
+            for base in &self.cluster_api_urls {
+                let status_url = base
+                    .join(&format!("pins/{cid_text}"))
+                    .map_err(|_| StorageError::InvalidCid)?;
+                let response = match self
+                    .client
+                    .get(status_url)
+                    .basic_auth(&self.credentials.username, Some(&self.credentials.password))
+                    .send()
+                    .await
+                {
+                    Ok(response) => response,
+                    Err(_) => {
+                        saw_retryable = true;
+                        continue;
+                    }
+                };
+                let status = response.status();
+                if status.is_success() {
+                    let body = bounded_response_body(response, PIN_STATUS_LIMIT_BYTES).await?;
+                    let parsed: ClusterPinStatus =
+                        serde_json::from_slice(&body).map_err(|_| StorageError::InvalidResponse)?;
+                    if parsed.cid != cid_text {
+                        return Err(StorageError::InvalidResponse);
+                    }
+                    return Ok(Some(parsed));
                 }
-                return Ok(Some(parsed));
+                if status == StatusCode::NOT_FOUND {
+                    not_found = true;
+                    continue;
+                }
+                if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
+                    return Err(StorageError::TransportUnavailable);
+                }
+                if is_retryable_http_status(status) {
+                    saw_retryable = true;
+                }
             }
-            if status == StatusCode::NOT_FOUND {
-                not_found = true;
-                continue;
+            if not_found {
+                return Ok(None);
             }
-            if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
-                return Err(StorageError::TransportUnavailable);
+            if !saw_retryable || attempt + 1 >= MAX_TRANSIENT_ATTEMPTS {
+                break;
             }
+            sleep(backoff).await;
+            backoff = backoff.saturating_mul(2);
         }
-        if not_found {
-            Ok(None)
-        } else {
-            Err(StorageError::TransportUnavailable)
-        }
+        Err(StorageError::TransportUnavailable)
     }
 
     async fn pin_and_wait(
@@ -467,22 +522,38 @@ impl IpfsClusterStore {
     }
 
     async fn open_reader(&self, command: &str, cid: &str) -> Result<StorageReader, StorageError> {
-        for base in &self.kubo_api_urls {
-            let url = base
-                .join(&format!("api/v0/{command}"))
-                .map_err(|_| StorageError::InvalidPackage)?;
-            let response = self.client.post(url).query(&[("arg", cid)]).send().await;
-            let Ok(response) = response else {
-                continue;
-            };
-            if !response.status().is_success() {
-                continue;
+        let mut backoff = RETRY_INITIAL_BACKOFF;
+        for attempt in 0..MAX_TRANSIENT_ATTEMPTS {
+            let mut saw_retryable = false;
+            for base in &self.kubo_api_urls {
+                let url = base
+                    .join(&format!("api/v0/{command}"))
+                    .map_err(|_| StorageError::InvalidPackage)?;
+                let response = match self.client.post(url).query(&[("arg", cid)]).send().await {
+                    Ok(response) => response,
+                    Err(_) => {
+                        saw_retryable = true;
+                        continue;
+                    }
+                };
+                let status = response.status();
+                if !status.is_success() {
+                    if is_retryable_http_status(status) {
+                        saw_retryable = true;
+                    }
+                    continue;
+                }
+                let stream = response
+                    .bytes_stream()
+                    .map_err(|error| io::Error::other(error.to_string()));
+                let reader = StreamReader::new(stream);
+                return Ok(Box::pin(reader));
             }
-            let stream = response
-                .bytes_stream()
-                .map_err(|error| io::Error::other(error.to_string()));
-            let reader = StreamReader::new(stream);
-            return Ok(Box::pin(reader));
+            if !saw_retryable || attempt + 1 >= MAX_TRANSIENT_ATTEMPTS {
+                break;
+            }
+            sleep(backoff).await;
+            backoff = backoff.saturating_mul(2);
         }
         Err(StorageError::TransportUnavailable)
     }
@@ -519,34 +590,50 @@ impl IpfsClusterStore {
 
     async fn verify_root_block(&self, cid_text: &str) -> Result<(), StorageError> {
         let expected = cid::Cid::try_from(cid_text).map_err(|_| StorageError::InvalidCid)?;
-        let mut invalid_block = false;
-        for base in &self.kubo_api_urls {
-            let url = base
-                .join("api/v0/block/get")
-                .map_err(|_| StorageError::InvalidPackage)?;
-            let response = self
-                .client
-                .post(url)
-                .query(&[("arg", cid_text)])
-                .send()
-                .await;
-            let Ok(response) = response else {
-                continue;
-            };
-            if !response.status().is_success() {
-                continue;
+        let mut backoff = RETRY_INITIAL_BACKOFF;
+        for attempt in 0..MAX_TRANSIENT_ATTEMPTS {
+            let mut invalid_block = false;
+            let mut saw_retryable = false;
+            for base in &self.kubo_api_urls {
+                let url = base
+                    .join("api/v0/block/get")
+                    .map_err(|_| StorageError::InvalidPackage)?;
+                let response = match self
+                    .client
+                    .post(url)
+                    .query(&[("arg", cid_text)])
+                    .send()
+                    .await
+                {
+                    Ok(response) => response,
+                    Err(_) => {
+                        saw_retryable = true;
+                        continue;
+                    }
+                };
+                let status = response.status();
+                if !status.is_success() {
+                    if is_retryable_http_status(status) {
+                        saw_retryable = true;
+                    }
+                    continue;
+                }
+                let block = bounded_response_body(response, ROOT_BLOCK_LIMIT_BYTES).await?;
+                if verify_sha256_cid(&expected, &block) {
+                    return Ok(());
+                }
+                invalid_block = true;
             }
-            let block = bounded_response_body(response, ROOT_BLOCK_LIMIT_BYTES).await?;
-            if verify_sha256_cid(&expected, &block) {
-                return Ok(());
+            if invalid_block {
+                return Err(StorageError::IntegrityCheckFailed);
             }
-            invalid_block = true;
+            if !saw_retryable || attempt + 1 >= MAX_TRANSIENT_ATTEMPTS {
+                break;
+            }
+            sleep(backoff).await;
+            backoff = backoff.saturating_mul(2);
         }
-        if invalid_block {
-            Err(StorageError::IntegrityCheckFailed)
-        } else {
-            Err(StorageError::TransportUnavailable)
-        }
+        Err(StorageError::TransportUnavailable)
     }
 }
 
@@ -597,7 +684,8 @@ impl BlobStore for IpfsClusterStore {
             let peer = self.select_healthy_kubo_url().await?;
             let root_cid = self
                 .add_to_peer(peer, form, true, Some((&manifest, &manifest_cid)))
-                .await?;
+                .await
+                .map_err(|(err, _)| err)?;
             let cid = ContentCid::parse(&root_cid).map_err(|_| StorageError::InvalidCid)?;
             let replication = self
                 .pin_and_wait(StorageCid::Content(cid.clone()), min_replicas)
@@ -635,23 +723,37 @@ impl BlobStore for IpfsClusterStore {
             let expected_cid = raw_chunk_cid(&bytes)?;
 
             let mut uploaded_cid = None;
-            for peer in &self.kubo_api_urls {
-                let part = Part::bytes(bytes.clone())
-                    .file_name("envelope-set.json")
-                    .mime_str("application/json")
-                    .map_err(|_| StorageError::InvalidPackage)?;
-                let form = Form::new().part("file", part);
-                match self.add_to_peer(peer, form, false, None).await {
-                    Ok(cid) => {
-                        if cid != expected_cid {
-                            return Err(StorageError::IntegrityCheckFailed);
+            let mut backoff = RETRY_INITIAL_BACKOFF;
+            'attempts: for attempt in 0..MAX_TRANSIENT_ATTEMPTS {
+                let mut saw_retryable = false;
+                for peer in &self.kubo_api_urls {
+                    let part = Part::bytes(bytes.clone())
+                        .file_name("envelope-set.json")
+                        .mime_str("application/json")
+                        .map_err(|_| StorageError::InvalidPackage)?;
+                    let form = Form::new().part("file", part);
+                    match self.add_to_peer(peer, form, false, None).await {
+                        Ok(cid) => {
+                            if cid != expected_cid {
+                                return Err(StorageError::IntegrityCheckFailed);
+                            }
+                            uploaded_cid = Some(cid);
+                            break 'attempts;
                         }
-                        uploaded_cid = Some(cid);
-                        break;
+                        Err((StorageError::TransportUnavailable, retryable)) => {
+                            if retryable {
+                                saw_retryable = true;
+                            }
+                            continue;
+                        }
+                        Err((other, _)) => return Err(other),
                     }
-                    Err(StorageError::TransportUnavailable) => continue,
-                    Err(other) => return Err(other),
                 }
+                if !saw_retryable || attempt + 1 >= MAX_TRANSIENT_ATTEMPTS {
+                    break;
+                }
+                sleep(backoff).await;
+                backoff = backoff.saturating_mul(2);
             }
             let cid = uploaded_cid.ok_or(StorageError::TransportUnavailable)?;
             let cid = EnvelopeSetCid::parse(&cid).map_err(|_| StorageError::InvalidCid)?;
@@ -1916,5 +2018,128 @@ mod tests {
         s1.await.unwrap();
         s2.await.unwrap();
         s3.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn retries_single_kubo_and_cluster_peer_with_bounds_on_transient_503() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+
+        // 1. Single Kubo peer returns 503 twice, then 200 OK on attempt 3.
+        let kubo = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let kubo_addr = kubo.local_addr().unwrap();
+        let kubo_attempts = Arc::new(AtomicUsize::new(0));
+        let kubo_attempts_srv = Arc::clone(&kubo_attempts);
+        let kubo_srv = tokio::spawn(async move {
+            for i in 0..3 {
+                let (mut socket, _) = kubo.accept().await.unwrap();
+                let _ = read_mock_http_request(&mut socket).await;
+                kubo_attempts_srv.fetch_add(1, Ordering::SeqCst);
+                if i < 2 {
+                    socket
+                        .write_all(
+                            b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        )
+                        .await
+                        .unwrap();
+                } else {
+                    socket
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 9\r\nConnection: close\r\n\r\nrecovered",
+                        )
+                        .await
+                        .unwrap();
+                }
+            }
+        });
+
+        // 2. Single Cluster peer returns 503 twice on POST /pins, then 202 Accepted on attempt 3.
+        let cluster = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let cluster_addr = cluster.local_addr().unwrap();
+        let cluster_attempts = Arc::new(AtomicUsize::new(0));
+        let cluster_attempts_srv = Arc::clone(&cluster_attempts);
+        let cluster_srv = tokio::spawn(async move {
+            for i in 0..3 {
+                let (mut socket, _) = cluster.accept().await.unwrap();
+                let _ = read_mock_http_request(&mut socket).await;
+                cluster_attempts_srv.fetch_add(1, Ordering::SeqCst);
+                if i < 2 {
+                    socket
+                        .write_all(
+                            b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        )
+                        .await
+                        .unwrap();
+                } else {
+                    socket
+                        .write_all(
+                            b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        )
+                        .await
+                        .unwrap();
+                }
+            }
+        });
+
+        let store = IpfsClusterStore::new(IpfsConfig {
+            kubo_api_urls: vec![format!("http://{kubo_addr}")],
+            cluster_api_urls: vec![format!("http://{cluster_addr}")],
+            cluster_credentials: ClusterCredentials::new("user", "password"),
+            request_timeout: Duration::from_secs(2),
+            replication_timeout: Duration::from_secs(1),
+            replication_poll_interval: Duration::from_millis(10),
+            max_upload_bytes: 1024,
+        })
+        .unwrap();
+
+        let mut reader = store.open_reader("cat", "bafy-retry").await.unwrap();
+        let mut payload = Vec::new();
+        reader.read_to_end(&mut payload).await.unwrap();
+        assert_eq!(payload, b"recovered");
+        assert_eq!(kubo_attempts.load(Ordering::SeqCst), 3);
+
+        let cid = raw_chunk_cid(b"retry-pin").unwrap();
+        store.post_pin(&cid, 2).await.unwrap();
+        assert_eq!(cluster_attempts.load(Ordering::SeqCst), 3);
+
+        kubo_srv.await.unwrap();
+        cluster_srv.await.unwrap();
+
+        // 3. Persistent 503 stops cleanly at MAX_TRANSIENT_ATTEMPTS (3).
+        let fail_kubo = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let fail_kubo_addr = fail_kubo.local_addr().unwrap();
+        let fail_attempts = Arc::new(AtomicUsize::new(0));
+        let fail_attempts_srv = Arc::clone(&fail_attempts);
+        let fail_srv = tokio::spawn(async move {
+            for _ in 0..MAX_TRANSIENT_ATTEMPTS {
+                let (mut socket, _) = fail_kubo.accept().await.unwrap();
+                let _ = read_mock_http_request(&mut socket).await;
+                fail_attempts_srv.fetch_add(1, Ordering::SeqCst);
+                socket
+                    .write_all(
+                        b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    )
+                    .await
+                    .unwrap();
+            }
+        });
+        let fail_store = IpfsClusterStore::new(IpfsConfig {
+            kubo_api_urls: vec![format!("http://{fail_kubo_addr}")],
+            cluster_api_urls: vec![format!("http://{fail_kubo_addr}")],
+            cluster_credentials: ClusterCredentials::new("user", "password"),
+            request_timeout: Duration::from_secs(2),
+            replication_timeout: Duration::from_secs(1),
+            replication_poll_interval: Duration::from_millis(10),
+            max_upload_bytes: 1024,
+        })
+        .unwrap();
+        assert!(matches!(
+            fail_store.open_reader("cat", "bafy-fail").await,
+            Err(StorageError::TransportUnavailable)
+        ));
+        assert_eq!(fail_attempts.load(Ordering::SeqCst), MAX_TRANSIENT_ATTEMPTS);
+        fail_srv.await.unwrap();
     }
 }

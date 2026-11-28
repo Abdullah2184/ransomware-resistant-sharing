@@ -167,28 +167,34 @@ impl GatewayChainPort for BesuClient {
 }
 
 /// Contract write-relaying boundary for state-changing gateway routes.
+///
+/// Split into broadcast (`submit_*`) and confirmation (`wait_for_confirmation`)
+/// phases so callers durably persist `pending` transaction metadata immediately
+/// after broadcast and before confirmation polling (`TECHNICAL_SPECIFICATION.md`
+/// §10.4.7).
 pub trait GatewayRelayerPort: Send + Sync {
-    fn relay_create_file(
+    fn submit_create_file(
         &self,
         call: VersionAppendCall,
         display_name: String,
         parent_folder_id: [u8; 32],
         signature: Vec<u8>,
-    ) -> RelayFuture<'_, RelayOutcome>;
+    ) -> RelayFuture<'_, [u8; 32]>;
 
-    fn relay_append_version(
+    fn submit_append_version(
         &self,
         call: VersionAppendCall,
         signature: Vec<u8>,
-    ) -> RelayFuture<'_, RelayOutcome>;
+    ) -> RelayFuture<'_, [u8; 32]>;
 
-    fn relay_update_envelope_set(
+    fn submit_update_envelope_set(
         &self,
         call: EnvelopeSetUpdateCall,
         signature: Vec<u8>,
-    ) -> RelayFuture<'_, RelayOutcome>;
+    ) -> RelayFuture<'_, [u8; 32]>;
 
-    #[allow(dead_code)]
+    fn wait_for_confirmation(&self, tx_hash: [u8; 32]) -> RelayFuture<'_, RelayOutcome>;
+
     fn reconcile_transaction(&self, tx_hash: [u8; 32]) -> RelayFuture<'_, Option<RelayOutcome>>;
 }
 
@@ -219,40 +225,44 @@ impl BesuContractRelayer {
 }
 
 impl GatewayRelayerPort for BesuContractRelayer {
-    fn relay_create_file(
+    fn submit_create_file(
         &self,
         call: VersionAppendCall,
         display_name: String,
         parent_folder_id: [u8; 32],
         signature: Vec<u8>,
-    ) -> RelayFuture<'_, RelayOutcome> {
+    ) -> RelayFuture<'_, [u8; 32]> {
         let calldata =
             encode_create_file_calldata(&call, &display_name, parent_folder_id, &signature);
         let to = self.file_registry;
         let gas = Some(self.gas_limit);
-        Box::pin(async move { self.relayer.submit_and_confirm(to, calldata, gas).await })
+        Box::pin(async move { self.relayer.submit_transaction(to, calldata, gas).await })
     }
 
-    fn relay_append_version(
+    fn submit_append_version(
         &self,
         call: VersionAppendCall,
         signature: Vec<u8>,
-    ) -> RelayFuture<'_, RelayOutcome> {
+    ) -> RelayFuture<'_, [u8; 32]> {
         let calldata = encode_append_version_calldata(&call, &signature);
         let to = self.file_registry;
         let gas = Some(self.gas_limit);
-        Box::pin(async move { self.relayer.submit_and_confirm(to, calldata, gas).await })
+        Box::pin(async move { self.relayer.submit_transaction(to, calldata, gas).await })
     }
 
-    fn relay_update_envelope_set(
+    fn submit_update_envelope_set(
         &self,
         call: EnvelopeSetUpdateCall,
         signature: Vec<u8>,
-    ) -> RelayFuture<'_, RelayOutcome> {
+    ) -> RelayFuture<'_, [u8; 32]> {
         let calldata = encode_update_envelope_set_calldata(&call, &signature);
         let to = self.access_governance;
         let gas = Some(self.gas_limit);
-        Box::pin(async move { self.relayer.submit_and_confirm(to, calldata, gas).await })
+        Box::pin(async move { self.relayer.submit_transaction(to, calldata, gas).await })
+    }
+
+    fn wait_for_confirmation(&self, tx_hash: [u8; 32]) -> RelayFuture<'_, RelayOutcome> {
+        Box::pin(async move { self.relayer.wait_for_confirmation(tx_hash).await })
     }
 
     fn reconcile_transaction(&self, tx_hash: [u8; 32]) -> RelayFuture<'_, Option<RelayOutcome>> {
@@ -381,6 +391,11 @@ pub trait GatewayStorePort: Send + Sync {
         block_hash: Option<&'a str>,
         gas_used: Option<u64>,
     ) -> StoreFuture<'a, ()>;
+
+    fn list_pending_relayed_transactions<'a>(
+        &'a self,
+        limit: u32,
+    ) -> StoreFuture<'a, Vec<RelayedTransactionRecord>>;
 
     #[allow(clippy::too_many_arguments)]
     fn record_orphan_blob_candidate<'a>(
@@ -645,6 +660,13 @@ impl GatewayStorePort for GatewayStore {
             block_hash,
             gas_used,
         ))
+    }
+
+    fn list_pending_relayed_transactions<'a>(
+        &'a self,
+        limit: u32,
+    ) -> StoreFuture<'a, Vec<RelayedTransactionRecord>> {
+        Box::pin(self.list_pending_relayed_transactions(limit))
     }
 
     fn record_orphan_blob_candidate<'a>(

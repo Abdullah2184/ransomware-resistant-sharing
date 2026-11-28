@@ -6,11 +6,216 @@
 
 use std::{sync::Arc, time::Duration};
 
+use chain_adapter::RelayOutcome;
 use domain::{ContentCid, EnvelopeSetCid, FileId};
 use ports::{BlobStore, StorageCid, StorageError, StorageHealthStatus};
 use tokio::sync::watch;
 
 use crate::routes::AppState;
+
+/// Summary of one pending relayed-transaction reconciliation pass
+/// (`TECHNICAL_SPECIFICATION.md` §10.4.7).
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct PendingTxReconcileSummary {
+    pub inspected: usize,
+    pub confirmed: usize,
+    pub reverted: usize,
+    pub still_pending: usize,
+    pub skipped_due_to_error: usize,
+}
+
+/// Reconciles persisted `pending` relayed transactions against Besu receipts.
+///
+/// Runs immediately at gateway startup and periodically in the background so
+/// transactions interrupted by a crash, restart, or confirmation timeout
+/// automatically transition to `confirmed` or `reverted` and update blob
+/// reference/orphan state cleanly.
+pub async fn reconcile_pending_transactions_once(
+    state: &AppState,
+    batch_limit: u32,
+) -> Result<PendingTxReconcileSummary, String> {
+    let Some(relayer) = state.relayer.as_ref() else {
+        return Ok(PendingTxReconcileSummary::default());
+    };
+    let pending = state
+        .store
+        .list_pending_relayed_transactions(batch_limit)
+        .await
+        .map_err(|err| format!("failed to list pending relayed transactions: {err}"))?;
+    if pending.is_empty() {
+        return Ok(PendingTxReconcileSummary::default());
+    }
+
+    let mut summary = PendingTxReconcileSummary {
+        inspected: pending.len(),
+        ..PendingTxReconcileSummary::default()
+    };
+
+    for record in pending {
+        let Some(tx_hash_bytes) = domain::hex::parse_lowercase_fixed_hex::<32>(&record.tx_hash)
+        else {
+            summary.skipped_due_to_error += 1;
+            continue;
+        };
+        match relayer.reconcile_transaction(tx_hash_bytes).await {
+            Ok(Some(RelayOutcome::Committed(receipt))) => {
+                if state
+                    .store
+                    .update_relayed_transaction_status(
+                        &record.tx_hash,
+                        "confirmed",
+                        Some(receipt.block_number),
+                        Some(&receipt.block_hash),
+                        Some(receipt.gas_used),
+                    )
+                    .await
+                    .is_err()
+                {
+                    summary.skipped_due_to_error += 1;
+                    continue;
+                }
+                if let Some(cid) = record.content_cid.as_deref() {
+                    let _ = state.store.mark_blob_referenced(cid).await;
+                }
+                let _ = state
+                    .store
+                    .mark_blob_referenced(&record.envelope_set_cid)
+                    .await;
+                let _ = state
+                    .store
+                    .record_write_attempt(
+                        "transaction.reconcile",
+                        Some(&record.actor_member_id),
+                        "system:reconciler",
+                        &record.file_id,
+                        record.version_number,
+                        Some(&record.operation_id),
+                        record.chain_id,
+                        Some(receipt.block_number),
+                        "committed",
+                        None,
+                        None,
+                    )
+                    .await;
+                summary.confirmed += 1;
+            }
+            Ok(Some(RelayOutcome::Reverted(receipt))) => {
+                if state
+                    .store
+                    .update_relayed_transaction_status(
+                        &record.tx_hash,
+                        "reverted",
+                        Some(receipt.block_number),
+                        Some(&receipt.block_hash),
+                        Some(receipt.gas_used),
+                    )
+                    .await
+                    .is_err()
+                {
+                    summary.skipped_due_to_error += 1;
+                    continue;
+                }
+                if let Some(cid) = record.content_cid.as_deref() {
+                    let _ = state
+                        .store
+                        .record_orphan_blob_candidate(
+                            cid,
+                            "content",
+                            &record.actor_member_id,
+                            Some(&record.file_id),
+                            Some(record.version_number),
+                            Some(&record.tx_hash),
+                            "contract_reverted",
+                        )
+                        .await;
+                }
+                let _ = state
+                    .store
+                    .record_orphan_blob_candidate(
+                        &record.envelope_set_cid,
+                        "envelope",
+                        &record.actor_member_id,
+                        Some(&record.file_id),
+                        Some(record.version_number),
+                        Some(&record.tx_hash),
+                        "contract_reverted",
+                    )
+                    .await;
+                let _ = state
+                    .store
+                    .record_write_attempt(
+                        "transaction.reconcile",
+                        Some(&record.actor_member_id),
+                        "system:reconciler",
+                        &record.file_id,
+                        record.version_number,
+                        Some(&record.operation_id),
+                        record.chain_id,
+                        Some(receipt.block_number),
+                        "reverted",
+                        Some("contract_reverted"),
+                        None,
+                    )
+                    .await;
+                summary.reverted += 1;
+            }
+            Ok(None) => {
+                summary.still_pending += 1;
+            }
+            Err(_) => {
+                summary.skipped_due_to_error += 1;
+            }
+        }
+    }
+
+    Ok(summary)
+}
+
+/// Spawns a cancellable startup + periodic reconciler for persisted `pending`
+/// relayed transactions (`TECHNICAL_SPECIFICATION.md` §10.4.7).
+#[allow(dead_code)]
+pub fn spawn_pending_transaction_reconciler(
+    state: AppState,
+    interval: Duration,
+    mut shutdown: watch::Receiver<bool>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                _ = shutdown.changed() => {
+                    if *shutdown.borrow() {
+                        break;
+                    }
+                }
+                _ = ticker.tick() => {
+                    match reconcile_pending_transactions_once(&state, 50).await {
+                        Ok(summary) if summary.confirmed > 0 || summary.reverted > 0 || summary.skipped_due_to_error > 0 => {
+                            let report = serde_json::json!({
+                                "event": "relayer.pending_reconciliation",
+                                "inspected": summary.inspected,
+                                "confirmed": summary.confirmed,
+                                "reverted": summary.reverted,
+                                "stillPending": summary.still_pending,
+                                "skippedDueToError": summary.skipped_due_to_error,
+                            });
+                            eprintln!("{report}");
+                        }
+                        Ok(_) => {}
+                        Err(err) => {
+                            let alert = serde_json::json!({
+                                "event": "relayer.pending_reconciliation_failed",
+                                "error": err,
+                            });
+                            eprintln!("{alert}");
+                        }
+                    }
+                }
+            }
+        }
+    })
+}
 
 /// Summary of one safe orphan blob cleanup pass.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]

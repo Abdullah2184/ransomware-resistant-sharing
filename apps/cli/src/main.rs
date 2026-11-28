@@ -72,7 +72,28 @@ async fn run(args: Vec<String>) -> Result<(), String> {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RuntimeEnvironment {
+    Development,
+    Production,
+}
+
+impl RuntimeEnvironment {
+    fn from_env() -> Result<Self, String> {
+        match env::var("RRDS_ENV") {
+            Ok(raw) if !raw.trim().is_empty() => match raw.trim().to_ascii_lowercase().as_str() {
+                "development" | "dev" | "local" => Ok(Self::Development),
+                "production" | "prod" => Ok(Self::Production),
+                _ => Err("RRDS_ENV must be one of: development, production".to_owned()),
+            },
+            Ok(_) | Err(env::VarError::NotPresent) => Ok(Self::Development),
+            Err(env::VarError::NotUnicode(_)) => Err("RRDS_ENV is not valid Unicode".to_owned()),
+        }
+    }
+}
+
 struct CliEnvConfig {
+    environment: RuntimeEnvironment,
     gateway_url: String,
     allow_insecure_http: bool,
     chain_id: u64,
@@ -85,11 +106,17 @@ struct CliEnvConfig {
 
 impl CliEnvConfig {
     fn from_env() -> Result<Self, String> {
+        let environment = RuntimeEnvironment::from_env()?;
         let gateway_url =
             env::var("GATEWAY_URL").unwrap_or_else(|_| DEFAULT_GATEWAY_URL.to_owned());
         let allow_insecure_http = env::var("RRDS_ALLOW_INSECURE_HTTP")
             .map(|v| v == "true")
             .unwrap_or(false);
+        if environment == RuntimeEnvironment::Production && allow_insecure_http {
+            return Err(
+                "RRDS_ALLOW_INSECURE_HTTP cannot be enabled when RRDS_ENV=production".to_owned(),
+            );
+        }
         let chain_id = env::var("BESU_CHAIN_ID")
             .ok()
             .map(|v| {
@@ -142,6 +169,7 @@ impl CliEnvConfig {
             .filter(|v| !v.is_empty())
             .map(PathBuf::from);
         Ok(Self {
+            environment,
             gateway_url,
             allow_insecure_http,
             chain_id,
@@ -154,6 +182,11 @@ impl CliEnvConfig {
     }
 
     fn gateway_client(&self) -> Result<GatewayHttpClient, String> {
+        if self.environment == RuntimeEnvironment::Production
+            && !self.gateway_url.starts_with("https://")
+        {
+            return Err("GATEWAY_URL must use https:// when RRDS_ENV=production".to_owned());
+        }
         GatewayHttpClient::new_with_insecure_http_opt_in(
             &self.gateway_url,
             self.allow_insecure_http,
@@ -172,9 +205,15 @@ impl CliEnvConfig {
 }
 
 async fn load_custody_from_env() -> Result<DevelopmentKeyCustody, String> {
+    let environment = RuntimeEnvironment::from_env()?;
     let allow_unsafe = env::var("RRDS_ALLOW_UNSAFE_DEV_CUSTODY")
         .map(|v| v == "true")
         .unwrap_or(false);
+    if environment == RuntimeEnvironment::Production && allow_unsafe {
+        return Err(
+            "RRDS_ALLOW_UNSAFE_DEV_CUSTODY cannot be enabled when RRDS_ENV=production".to_owned(),
+        );
+    }
     let policy = if allow_unsafe {
         CustodyStartupPolicy::UnsafeDevelopment
     } else {
@@ -1946,6 +1985,59 @@ mod tests {
         if env::var("RRDS_SESSION_FILE").is_err() {
             let err = run(vec!["login".into()]).await.unwrap_err();
             assert!(err.contains("--session-file"));
+        }
+    }
+
+    #[tokio::test]
+    async fn production_env_refuses_unsafe_dev_custody_and_insecure_http() {
+        static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+        let _guard = ENV_LOCK.lock().await;
+
+        let prev_env = env::var("RRDS_ENV").ok();
+        let prev_unsafe = env::var("RRDS_ALLOW_UNSAFE_DEV_CUSTODY").ok();
+        let prev_http = env::var("RRDS_ALLOW_INSECURE_HTTP").ok();
+        let prev_url = env::var("GATEWAY_URL").ok();
+
+        // SAFETY: serialized via ENV_LOCK within this unit test binary.
+        unsafe {
+            env::set_var("RRDS_ENV", "production");
+            env::set_var("RRDS_ALLOW_UNSAFE_DEV_CUSTODY", "true");
+            env::set_var("RRDS_ALLOW_INSECURE_HTTP", "true");
+            env::set_var("GATEWAY_URL", "http://127.0.0.1:8080");
+        }
+
+        let custody_err = load_custody_from_env().await.unwrap_err();
+        assert!(custody_err.contains("RRDS_ENV=production"));
+
+        let config_err = CliEnvConfig::from_env()
+            .err()
+            .expect("reject insecure http");
+        assert!(config_err.contains("RRDS_ALLOW_INSECURE_HTTP"));
+
+        unsafe {
+            env::set_var("RRDS_ALLOW_INSECURE_HTTP", "false");
+        }
+        let cfg = CliEnvConfig::from_env().unwrap();
+        let client_err = cfg.gateway_client().unwrap_err();
+        assert!(client_err.contains("https://"));
+
+        unsafe {
+            match prev_env {
+                Some(v) => env::set_var("RRDS_ENV", v),
+                None => env::remove_var("RRDS_ENV"),
+            }
+            match prev_unsafe {
+                Some(v) => env::set_var("RRDS_ALLOW_UNSAFE_DEV_CUSTODY", v),
+                None => env::remove_var("RRDS_ALLOW_UNSAFE_DEV_CUSTODY"),
+            }
+            match prev_http {
+                Some(v) => env::set_var("RRDS_ALLOW_INSECURE_HTTP", v),
+                None => env::remove_var("RRDS_ALLOW_INSECURE_HTTP"),
+            }
+            match prev_url {
+                Some(v) => env::set_var("GATEWAY_URL", v),
+                None => env::remove_var("GATEWAY_URL"),
+            }
         }
     }
 }

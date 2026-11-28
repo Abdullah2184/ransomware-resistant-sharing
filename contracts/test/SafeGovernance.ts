@@ -581,6 +581,95 @@ describe("Audited Safe v1.4.1 threshold multisig governance integration", async 
     await execSafeTx(orgSafe, [orgOwners[0], orgOwners[2]], governance.address, revokeReadData);
     assert.equal(await governance.read.hasReadAccess([bobId, fileId]), false);
     assert.equal(await governance.read.hasWriteAccess([aliceId, fileId]), true);
+
+    // Organization Safe (2-of-3) creates a nested folder hierarchy and renames a folder;
+    // unauthorized EOA callers are rejected, and Alice places a file inside the nested folder.
+    const rootFolderId = keccak256(stringToBytes("folder-finance"));
+    const childFolderId = keccak256(stringToBytes("folder-finance-q4"));
+    await assert.rejects(
+      relayer.writeContract({
+        address: registry.address,
+        abi: registry.abi,
+        functionName: "createFolder",
+        args: [rootFolderId, orgId, ZERO_BYTES32, "Finance"],
+      })
+    );
+    const createRootFolderData = encodeFunctionData({
+      abi: registry.abi,
+      functionName: "createFolder",
+      args: [rootFolderId, orgId, ZERO_BYTES32, "Finance"],
+    });
+    await execSafeTx(orgSafe, [orgOwners[0], orgOwners[1]], registry.address, createRootFolderData);
+
+    const createChildFolderData = encodeFunctionData({
+      abi: registry.abi,
+      functionName: "createFolder",
+      args: [childFolderId, orgId, rootFolderId, "Q4"],
+    });
+    await execSafeTx(orgSafe, [orgOwners[1], orgOwners[2]], registry.address, createChildFolderData);
+
+    const renameChildData = encodeFunctionData({
+      abi: registry.abi,
+      functionName: "renameFolder",
+      args: [childFolderId, "Q4-Audited"],
+    });
+    await execSafeTx(orgSafe, [orgOwners[0], orgOwners[2]], registry.address, renameChildData);
+    const childFolder = await registry.read.getFolder([childFolderId]);
+    assert.equal(childFolder.displayName, "Q4-Audited");
+    assert.equal(childFolder.parentFolderId, rootFolderId);
+
+    const nestedFileId = keccak256(stringToBytes("safe-nested-file-1"));
+    const nestedEpochId = keccak256(stringToBytes("safe-nested-epoch-1"));
+    const nestedManifest = keccak256(stringToBytes("safe-nested-manifest-1"));
+    const nestedNonce = keccak256(stringToBytes("safe-nested-nonce-1"));
+    const nestedDeadline = (await publicClient.getBlock()).timestamp + 3600n;
+    const nestedReq = {
+      fileId: nestedFileId,
+      versionNumber: 1n,
+      parentManifestHash: ZERO_BYTES32,
+      contentCidHash: keccak256(stringToBytes(contentCidV1)),
+      envelopeSetCidHash: keccak256(stringToBytes(envCidV1)),
+      epochId: nestedEpochId,
+      manifestHash: nestedManifest,
+      memberId: aliceId,
+      signerAddress: alice.address,
+      operationNonce: nestedNonce,
+      deadline: nestedDeadline,
+    };
+    const nestedSig = await alice.signTypedData({
+      domain: {
+        name: "RRDS FileRegistry",
+        version: "1",
+        chainId,
+        verifyingContract: registry.address,
+      },
+      types: {
+        VersionAppend: [
+          { name: "fileId", type: "bytes32" },
+          { name: "versionNumber", type: "uint64" },
+          { name: "parentManifestHash", type: "bytes32" },
+          { name: "contentCidHash", type: "bytes32" },
+          { name: "envelopeSetCidHash", type: "bytes32" },
+          { name: "epochId", type: "bytes32" },
+          { name: "manifestHash", type: "bytes32" },
+          { name: "memberId", type: "bytes32" },
+          { name: "signerAddress", type: "address" },
+          { name: "operationNonce", type: "bytes32" },
+          { name: "deadline", type: "uint256" },
+        ],
+      },
+      primaryType: "VersionAppend",
+      message: nestedReq,
+    });
+    await relayer.writeContract({
+      address: registry.address,
+      abi: registry.abi,
+      functionName: "createFile",
+      args: [nestedReq, contentCidV1, envCidV1, "q4-audit.txt", childFolderId, nestedSig],
+    });
+    const nestedFile = await registry.read.getFile([nestedFileId]);
+    assert.equal(nestedFile.parentFolderId, childFolderId);
+    assert.equal(nestedFile.currentVersionNumber, 1n);
     void WRITE_PERMISSION;
   });
 });

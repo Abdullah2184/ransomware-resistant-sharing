@@ -607,6 +607,23 @@ mod http_tests {
             Box::pin(async { Ok(()) })
         }
 
+        fn list_pending_relayed_transactions<'a>(
+            &'a self,
+            limit: u32,
+        ) -> StoreFuture<'a, Vec<crate::store::RelayedTransactionRecord>> {
+            let list = self
+                .state
+                .lock()
+                .unwrap()
+                .relayed_txs
+                .values()
+                .filter(|tx| tx.status == "pending")
+                .take(limit as usize)
+                .cloned()
+                .collect();
+            Box::pin(async move { Ok(list) })
+        }
+
         fn record_orphan_blob_candidate<'a>(
             &'a self,
             cid: &'a str,
@@ -668,7 +685,13 @@ mod http_tests {
                 .orphan_blobs
                 .values()
                 .filter(|(c, status)| {
-                    status == "candidate" && !state.referenced_projection_cids.contains(&c.cid)
+                    status == "candidate"
+                        && !state.referenced_projection_cids.contains(&c.cid)
+                        && !state.relayed_txs.values().any(|tx| {
+                            tx.status == "pending"
+                                && (tx.content_cid.as_deref() == Some(c.cid.as_str())
+                                    || tx.envelope_set_cid == c.cid)
+                        })
                 })
                 .take(limit as usize)
                 .map(|(c, _)| c.clone())
@@ -997,6 +1020,16 @@ mod http_tests {
             }
         }
 
+        fn submit_hash(&self, label: &str) -> Result<[u8; 32], RelayError> {
+            self.events.lock().unwrap().push(format!("relay:{label}"));
+            self.calls.lock().unwrap().push(label.to_owned());
+            match self.behavior.lock().unwrap().clone() {
+                MockRelayBehavior::Commit(_) => Ok([0xaa; 32]),
+                MockRelayBehavior::Revert(_) => Ok([0xdd; 32]),
+                MockRelayBehavior::Timeout(tx_hash) => Ok(tx_hash),
+            }
+        }
+
         fn execute(&self, label: &str) -> Result<RelayOutcome, RelayError> {
             self.events.lock().unwrap().push(format!("relay:{label}"));
             self.calls.lock().unwrap().push(label.to_owned());
@@ -1027,32 +1060,60 @@ mod http_tests {
     }
 
     impl GatewayRelayerPort for MockRelayer {
-        fn relay_create_file(
+        fn submit_create_file(
             &self,
             _call: VersionAppendCall,
             _display_name: String,
             _parent_folder_id: [u8; 32],
             _signature: Vec<u8>,
-        ) -> RelayFuture<'_, RelayOutcome> {
-            let result = self.execute("createFile");
+        ) -> RelayFuture<'_, [u8; 32]> {
+            let result = self.submit_hash("createFile");
             Box::pin(async move { result })
         }
 
-        fn relay_append_version(
+        fn submit_append_version(
             &self,
             _call: VersionAppendCall,
             _signature: Vec<u8>,
-        ) -> RelayFuture<'_, RelayOutcome> {
-            let result = self.execute("appendVersion");
+        ) -> RelayFuture<'_, [u8; 32]> {
+            let result = self.submit_hash("appendVersion");
             Box::pin(async move { result })
         }
 
-        fn relay_update_envelope_set(
+        fn submit_update_envelope_set(
             &self,
             _call: EnvelopeSetUpdateCall,
             _signature: Vec<u8>,
-        ) -> RelayFuture<'_, RelayOutcome> {
-            let result = self.execute("updateEnvelopeSet");
+        ) -> RelayFuture<'_, [u8; 32]> {
+            let result = self.submit_hash("updateEnvelopeSet");
+            Box::pin(async move { result })
+        }
+
+        fn wait_for_confirmation(&self, tx_hash: [u8; 32]) -> RelayFuture<'_, RelayOutcome> {
+            let behavior = self.behavior.lock().unwrap().clone();
+            let result = match behavior {
+                MockRelayBehavior::Commit(block) => {
+                    Ok(RelayOutcome::Committed(EvmTransactionReceipt {
+                        transaction_hash: tx_hash,
+                        block_number: block,
+                        block_hash: format!("0x{}", "bb".repeat(32)),
+                        status: true,
+                        gas_used: 120_000,
+                    }))
+                }
+                MockRelayBehavior::Revert(block) => {
+                    Ok(RelayOutcome::Reverted(EvmTransactionReceipt {
+                        transaction_hash: tx_hash,
+                        block_number: block,
+                        block_hash: format!("0x{}", "ee".repeat(32)),
+                        status: false,
+                        gas_used: 85_000,
+                    }))
+                }
+                MockRelayBehavior::Timeout(timeout_hash) => Err(RelayError::ConfirmationTimedOut {
+                    tx_hash: timeout_hash,
+                }),
+            };
             Box::pin(async move { result })
         }
 
@@ -4089,29 +4150,36 @@ mod http_tests {
         struct StatefulRelayer {
             chain: MockChain,
             force_revert: Arc<Mutex<bool>>,
+            outcomes: Arc<Mutex<HashMap<[u8; 32], RelayOutcome>>>,
         }
         impl GatewayRelayerPort for StatefulRelayer {
-            fn relay_create_file(
+            fn submit_create_file(
                 &self,
                 call: VersionAppendCall,
                 _display_name: String,
                 _parent_folder_id: [u8; 32],
                 _signature: Vec<u8>,
-            ) -> RelayFuture<'_, RelayOutcome> {
+            ) -> RelayFuture<'_, [u8; 32]> {
                 let chain = self.chain.clone();
                 let revert = *self.force_revert.lock().unwrap();
+                let outcomes = self.outcomes.clone();
                 Box::pin(async move {
                     let mut st = chain.state.lock().unwrap();
                     st.block_number += 1;
                     let block = st.block_number;
                     if revert {
-                        return Ok(RelayOutcome::Reverted(EvmTransactionReceipt {
-                            transaction_hash: [0xee; 32],
-                            block_number: block,
-                            block_hash: st.block_hash.clone(),
-                            status: false,
-                            gas_used: 90_000,
-                        }));
+                        let tx_hash = [0xee; 32];
+                        outcomes.lock().unwrap().insert(
+                            tx_hash,
+                            RelayOutcome::Reverted(EvmTransactionReceipt {
+                                transaction_hash: tx_hash,
+                                block_number: block,
+                                block_hash: st.block_hash.clone(),
+                                status: false,
+                                gas_used: 90_000,
+                            }),
+                        );
+                        return Ok(tx_hash);
                     }
                     st.heads.insert(
                         call.file_id,
@@ -4138,35 +4206,46 @@ mod http_tests {
                     );
                     st.read_acl.insert((call.member_id, call.file_id));
                     st.write_acl.insert((call.member_id, call.file_id));
-                    Ok(RelayOutcome::Committed(EvmTransactionReceipt {
-                        transaction_hash: [0xa1; 32],
-                        block_number: block,
-                        block_hash: st.block_hash.clone(),
-                        status: true,
-                        gas_used: 180_000,
-                    }))
+                    let tx_hash = [0xa1; 32];
+                    outcomes.lock().unwrap().insert(
+                        tx_hash,
+                        RelayOutcome::Committed(EvmTransactionReceipt {
+                            transaction_hash: tx_hash,
+                            block_number: block,
+                            block_hash: st.block_hash.clone(),
+                            status: true,
+                            gas_used: 180_000,
+                        }),
+                    );
+                    Ok(tx_hash)
                 })
             }
 
-            fn relay_append_version(
+            fn submit_append_version(
                 &self,
                 call: VersionAppendCall,
                 _signature: Vec<u8>,
-            ) -> RelayFuture<'_, RelayOutcome> {
+            ) -> RelayFuture<'_, [u8; 32]> {
                 let chain = self.chain.clone();
                 let revert = *self.force_revert.lock().unwrap();
+                let outcomes = self.outcomes.clone();
                 Box::pin(async move {
                     let mut st = chain.state.lock().unwrap();
                     st.block_number += 1;
                     let block = st.block_number;
                     if revert {
-                        return Ok(RelayOutcome::Reverted(EvmTransactionReceipt {
-                            transaction_hash: [0xef; 32],
-                            block_number: block,
-                            block_hash: st.block_hash.clone(),
-                            status: false,
-                            gas_used: 95_000,
-                        }));
+                        let tx_hash = [0xef; 32];
+                        outcomes.lock().unwrap().insert(
+                            tx_hash,
+                            RelayOutcome::Reverted(EvmTransactionReceipt {
+                                transaction_hash: tx_hash,
+                                block_number: block,
+                                block_hash: st.block_hash.clone(),
+                                status: false,
+                                gas_used: 95_000,
+                            }),
+                        );
+                        return Ok(tx_hash);
                     }
                     st.heads.insert(
                         call.file_id,
@@ -4191,35 +4270,46 @@ mod http_tests {
                             revision: 1,
                         },
                     );
-                    Ok(RelayOutcome::Committed(EvmTransactionReceipt {
-                        transaction_hash: [0xa2; 32],
-                        block_number: block,
-                        block_hash: st.block_hash.clone(),
-                        status: true,
-                        gas_used: 150_000,
-                    }))
+                    let tx_hash = [0xa2; 32];
+                    outcomes.lock().unwrap().insert(
+                        tx_hash,
+                        RelayOutcome::Committed(EvmTransactionReceipt {
+                            transaction_hash: tx_hash,
+                            block_number: block,
+                            block_hash: st.block_hash.clone(),
+                            status: true,
+                            gas_used: 150_000,
+                        }),
+                    );
+                    Ok(tx_hash)
                 })
             }
 
-            fn relay_update_envelope_set(
+            fn submit_update_envelope_set(
                 &self,
                 call: EnvelopeSetUpdateCall,
                 _signature: Vec<u8>,
-            ) -> RelayFuture<'_, RelayOutcome> {
+            ) -> RelayFuture<'_, [u8; 32]> {
                 let chain = self.chain.clone();
                 let revert = *self.force_revert.lock().unwrap();
+                let outcomes = self.outcomes.clone();
                 Box::pin(async move {
                     let mut st = chain.state.lock().unwrap();
                     st.block_number += 1;
                     let block = st.block_number;
                     if revert {
-                        return Ok(RelayOutcome::Reverted(EvmTransactionReceipt {
-                            transaction_hash: [0xed; 32],
-                            block_number: block,
-                            block_hash: st.block_hash.clone(),
-                            status: false,
-                            gas_used: 70_000,
-                        }));
+                        let tx_hash = [0xed; 32];
+                        outcomes.lock().unwrap().insert(
+                            tx_hash,
+                            RelayOutcome::Reverted(EvmTransactionReceipt {
+                                transaction_hash: tx_hash,
+                                block_number: block,
+                                block_hash: st.block_hash.clone(),
+                                status: false,
+                                gas_used: 70_000,
+                            }),
+                        );
+                        return Ok(tx_hash);
                     }
                     let next_rev = st
                         .envelopes
@@ -4234,21 +4324,32 @@ mod http_tests {
                             revision: next_rev,
                         },
                     );
-                    Ok(RelayOutcome::Committed(EvmTransactionReceipt {
-                        transaction_hash: [0xa3; 32],
-                        block_number: block,
-                        block_hash: st.block_hash.clone(),
-                        status: true,
-                        gas_used: 110_000,
-                    }))
+                    let tx_hash = [0xa3; 32];
+                    outcomes.lock().unwrap().insert(
+                        tx_hash,
+                        RelayOutcome::Committed(EvmTransactionReceipt {
+                            transaction_hash: tx_hash,
+                            block_number: block,
+                            block_hash: st.block_hash.clone(),
+                            status: true,
+                            gas_used: 110_000,
+                        }),
+                    );
+                    Ok(tx_hash)
                 })
+            }
+
+            fn wait_for_confirmation(&self, tx_hash: [u8; 32]) -> RelayFuture<'_, RelayOutcome> {
+                let outcome = self.outcomes.lock().unwrap().get(&tx_hash).cloned();
+                Box::pin(async move { outcome.ok_or(RelayError::ConfirmationTimedOut { tx_hash }) })
             }
 
             fn reconcile_transaction(
                 &self,
-                _tx_hash: [u8; 32],
+                tx_hash: [u8; 32],
             ) -> RelayFuture<'_, Option<RelayOutcome>> {
-                Box::pin(async { Ok(None) })
+                let outcome = self.outcomes.lock().unwrap().get(&tx_hash).cloned();
+                Box::pin(async move { Ok(outcome) })
             }
         }
 
@@ -4263,6 +4364,7 @@ mod http_tests {
         let relayer = StatefulRelayer {
             chain: chain.clone(),
             force_revert: force_revert.clone(),
+            outcomes: Arc::new(Mutex::new(HashMap::new())),
         };
 
         let access_gov = EvmAddress::from_bytes([0x22; 20]);
@@ -4858,5 +4960,389 @@ mod http_tests {
         }
         gw_handle.abort();
         let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[tokio::test]
+    async fn persists_pending_tx_before_confirmation_protects_pending_blobs_and_reconciles_on_restart()
+     {
+        use crate::maintenance::{cleanup_orphan_blobs_once, reconcile_pending_transactions_once};
+        use crate::store::RelayedTransactionRecord;
+
+        let server = spawn_server_with_relayer(true).await;
+        let relayer = server.relayer.clone().unwrap();
+
+        let content_cid = raw_sha256_cid(b"pending-content-blob").unwrap().to_string();
+        let env_cid = raw_sha256_cid(b"pending-env-blob").unwrap().to_string();
+        let file_id = format!("0x{}", "44".repeat(32));
+        let member_id = format!("0x{}", "11".repeat(32));
+        let tx_hash_bytes = [0x99u8; 32];
+        let tx_hash_hex = encode_hex(&tx_hash_bytes);
+
+        // Simulate a transaction that was broadcast and persisted as `pending` right
+        // before a gateway crash/restart, with its staged blobs tracked as candidates.
+        server
+            .store
+            .record_orphan_blob_candidate(
+                &content_cid,
+                "content",
+                &member_id,
+                Some(&file_id),
+                Some(1),
+                None,
+                "staged_uncommitted",
+            )
+            .await
+            .unwrap();
+        server
+            .store
+            .record_orphan_blob_candidate(
+                &env_cid,
+                "envelope",
+                &member_id,
+                Some(&file_id),
+                Some(1),
+                None,
+                "staged_uncommitted",
+            )
+            .await
+            .unwrap();
+        server
+            .store
+            .record_relayed_transaction(&RelayedTransactionRecord {
+                tx_hash: tx_hash_hex.clone(),
+                operation_kind: "file.create".to_owned(),
+                operation_id: format!("0x{}", "55".repeat(32)),
+                actor_member_id: member_id.clone(),
+                file_id: file_id.clone(),
+                version_number: 1,
+                content_cid: Some(content_cid.clone()),
+                envelope_set_cid: env_cid.clone(),
+                chain_id: 1337,
+                status: "pending".to_owned(),
+                block_number: None,
+                block_hash: None,
+                gas_used: None,
+            })
+            .await
+            .unwrap();
+
+        let state = AppState::new(
+            server.store.clone(),
+            server.chain.clone(),
+            server.blobs.clone(),
+            GatewayConfig {
+                environment: crate::config::RuntimeEnvironment::Development,
+                database_url: "postgres://unused".to_owned(),
+                besu_rpc_url: "http://127.0.0.1:8545".to_owned(),
+                chain_id: 1337,
+                access_governance: EvmAddress::from_bytes([0x22; 20]),
+                file_registry: EvmAddress::from_bytes([0x11; 20]),
+                audience: "rrds-local".to_owned(),
+                bind: "127.0.0.1:8080".parse().unwrap(),
+                challenge_ttl_seconds: 120,
+                session_ttl_seconds: 900,
+                rate_limit_capacity: 100,
+                rate_limit_refill_per_second: 100.0,
+                member_rate_limit_capacity: 100,
+                member_rate_limit_refill_per_second: 100.0,
+                org_rate_limit_capacity: 500,
+                org_rate_limit_refill_per_second: 500.0,
+                invalid_sig_limit_capacity: 100,
+                invalid_sig_limit_refill_per_second: 100.0,
+                max_concurrent_streams: 32,
+                min_pin_replicas: 2,
+                default_tx_gas_limit: 2_000_000,
+                transaction_confirmation_timeout_seconds: 30,
+                orphan_retention_seconds: 0,
+                storage_health_interval_seconds: 30,
+                max_blob_upload_bytes: 64 * 1024 * 1024,
+            },
+        )
+        .with_relayer(relayer.clone());
+
+        // 1. While pending, OrphanBlobCleaner MUST NOT unpin blobs referenced by the pending tx!
+        let cleanup_while_pending = cleanup_orphan_blobs_once(&state, 0, 50).await.unwrap();
+        assert_eq!(cleanup_while_pending.inspected, 0);
+        assert_eq!(cleanup_while_pending.unpinned, 0);
+        assert!(server.blobs.unpinned_cids.lock().unwrap().is_empty());
+
+        // 2. While Besu still reports pending (None), reconciler leaves the tx pending.
+        *relayer.behavior.lock().unwrap() = MockRelayBehavior::Timeout(tx_hash_bytes);
+        let pass1 = reconcile_pending_transactions_once(&state, 50)
+            .await
+            .unwrap();
+        assert_eq!(pass1.inspected, 1);
+        assert_eq!(pass1.still_pending, 1);
+        assert_eq!(pass1.confirmed, 0);
+
+        // 3. Once Besu confirms the tx after restart, reconciler transitions it to `confirmed`
+        //    and marks both content & envelope blobs as `referenced`.
+        *relayer.behavior.lock().unwrap() = MockRelayBehavior::Commit(77);
+        let pass2 = reconcile_pending_transactions_once(&state, 50)
+            .await
+            .unwrap();
+        assert_eq!(pass2.inspected, 1);
+        assert_eq!(pass2.confirmed, 1);
+        let updated = server
+            .store
+            .get_relayed_transaction(&tx_hash_hex)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(updated.status, "confirmed");
+        assert_eq!(updated.block_number, Some(77));
+        assert_eq!(
+            server
+                .store
+                .state
+                .lock()
+                .unwrap()
+                .orphan_blobs
+                .get(&content_cid)
+                .unwrap()
+                .1,
+            "referenced"
+        );
+        assert_eq!(
+            server
+                .store
+                .state
+                .lock()
+                .unwrap()
+                .orphan_blobs
+                .get(&env_cid)
+                .unwrap()
+                .1,
+            "referenced"
+        );
+
+        // 4. Reconciling a pending tx that reverted marks it `reverted` and leaves blobs eligible
+        //    for orphan cleanup.
+        let reverted_tx_hex = encode_hex(&[0x88u8; 32]);
+        let rev_env_cid = raw_sha256_cid(b"reverted-env-blob").unwrap().to_string();
+        server
+            .store
+            .record_relayed_transaction(&RelayedTransactionRecord {
+                tx_hash: reverted_tx_hex.clone(),
+                operation_kind: "file.envelope_update".to_owned(),
+                operation_id: format!("0x{}", "66".repeat(32)),
+                actor_member_id: member_id.clone(),
+                file_id: file_id.clone(),
+                version_number: 1,
+                content_cid: None,
+                envelope_set_cid: rev_env_cid.clone(),
+                chain_id: 1337,
+                status: "pending".to_owned(),
+                block_number: None,
+                block_hash: None,
+                gas_used: None,
+            })
+            .await
+            .unwrap();
+        *relayer.behavior.lock().unwrap() = MockRelayBehavior::Revert(78);
+        let pass3 = reconcile_pending_transactions_once(&state, 50)
+            .await
+            .unwrap();
+        assert_eq!(pass3.inspected, 1);
+        assert_eq!(pass3.reverted, 1);
+        let rev_row = server
+            .store
+            .get_relayed_transaction(&reverted_tx_hex)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(rev_row.status, "reverted");
+        let cleanup_after_revert = cleanup_orphan_blobs_once(&state, 0, 50).await.unwrap();
+        assert_eq!(cleanup_after_revert.unpinned, 1);
+        assert_eq!(
+            server.blobs.unpinned_cids.lock().unwrap().as_slice(),
+            &[rev_env_cid]
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_transaction_route_fails_closed_when_audit_persistence_fails() {
+        use crate::store::RelayedTransactionRecord;
+
+        let server = spawn_server_with_relayer(true).await;
+        let relayer = server.relayer.clone().unwrap();
+        let member_id = MemberId::from_bytes([0x21; 32]);
+        let token = [0x31u8; 32];
+        server.store.state.lock().unwrap().sessions.insert(
+            crate::store::hash_session_token(&token),
+            member_id.to_string(),
+        );
+        let tx_hash_hex = encode_hex(&[0x77u8; 32]);
+        server
+            .store
+            .record_relayed_transaction(&RelayedTransactionRecord {
+                tx_hash: tx_hash_hex.clone(),
+                operation_kind: "file.create".to_owned(),
+                operation_id: format!("0x{}", "12".repeat(32)),
+                actor_member_id: member_id.to_string(),
+                file_id: format!("0x{}", "34".repeat(32)),
+                version_number: 1,
+                content_cid: None,
+                envelope_set_cid: raw_sha256_cid(b"env").unwrap().to_string(),
+                chain_id: 1337,
+                status: "pending".to_owned(),
+                block_number: None,
+                block_hash: None,
+                gas_used: None,
+            })
+            .await
+            .unwrap();
+        *relayer.behavior.lock().unwrap() = MockRelayBehavior::Commit(50);
+        server.store.state.lock().unwrap().fail_audit = true;
+
+        let response = reqwest::Client::new()
+            .get(format!("{}/v1/transactions/{tx_hash_hex}", server.base_url))
+            .bearer_auth(format!("0x{}", "31".repeat(32)))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+        // Confirm the handler actually invoked relayer reconciliation and failed on the audit write.
+        assert!(
+            relayer
+                .calls
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|c| c == "reconcileTransaction")
+        );
+    }
+
+    #[tokio::test]
+    async fn browses_nested_folder_hierarchy_with_informational_flag_and_enforces_read_acl() {
+        use crate::store::{ProjectedFile, ProjectedFolder};
+
+        let server = spawn_server_with_relayer(true).await;
+        let alice = MemberId::from_bytes([0x11; 32]);
+        let mallory = MemberId::from_bytes([0x22; 32]);
+        let org = [0xaa; 32];
+        let alice_token = [0x41u8; 32];
+        let mallory_token = [0x42u8; 32];
+
+        {
+            let mut chain = server.chain.state.lock().unwrap();
+            chain.members.insert(
+                *alice.as_bytes(),
+                MemberIdentityState {
+                    organization_id: org,
+                    signing_address: EvmAddress::from_bytes([0x11; 20]),
+                    signing_key_version: 1,
+                    encryption_key_version: 1,
+                    encryption_public_key: [0x11; 32],
+                    status: 1,
+                },
+            );
+            chain.members.insert(
+                *mallory.as_bytes(),
+                MemberIdentityState {
+                    organization_id: org,
+                    signing_address: EvmAddress::from_bytes([0x22; 20]),
+                    signing_key_version: 1,
+                    encryption_key_version: 1,
+                    encryption_public_key: [0x22; 32],
+                    status: 1,
+                },
+            );
+        }
+
+        let finance_folder = format!("0x{}", "f1".repeat(32));
+        let q4_folder = format!("0x{}", "f2".repeat(32));
+        let nested_file_bytes = [0xf3u8; 32];
+        let nested_file = encode_hex(&nested_file_bytes);
+
+        {
+            let mut store = server.store.state.lock().unwrap();
+            store.sessions.insert(
+                crate::store::hash_session_token(&alice_token),
+                alice.to_string(),
+            );
+            store.sessions.insert(
+                crate::store::hash_session_token(&mallory_token),
+                mallory.to_string(),
+            );
+            let org_hex = encode_hex(&org);
+            store.listing_folders.push(ProjectedFolder {
+                folder_id: finance_folder.clone(),
+                organization_id: org_hex.clone(),
+                parent_folder_id: format!("0x{}", "00".repeat(32)),
+                display_name: "Finance".to_owned(),
+                updated_block_number: 42,
+            });
+            store.listing_folders.push(ProjectedFolder {
+                folder_id: q4_folder.clone(),
+                organization_id: org_hex.clone(),
+                parent_folder_id: finance_folder.clone(),
+                display_name: "Q4".to_owned(),
+                updated_block_number: 42,
+            });
+            store.listing_files.push(ProjectedFile {
+                file_id: nested_file.clone(),
+                organization_id: org_hex,
+                creator_member_id: alice.to_string(),
+                display_name: "q4-audit.txt".to_owned(),
+                parent_folder_id: q4_folder.clone(),
+                file_status: 1,
+                current_version: 1,
+                current_head_manifest_hash: format!("0x{}", "ab".repeat(32)),
+                updated_block_number: 42,
+            });
+        }
+        {
+            let mut chain = server.chain.state.lock().unwrap();
+            chain.heads.insert(
+                nested_file_bytes,
+                FileHeadState {
+                    version_number: 1,
+                    manifest_hash: format!("0x{}", "ab".repeat(32)),
+                    status: 1,
+                },
+            );
+            chain
+                .read_acl
+                .insert((*alice.as_bytes(), nested_file_bytes));
+        }
+
+        let client = reqwest::Client::new();
+        // 1. Browsing nested folder returns folders/files with `authoritative: false`.
+        let list_resp = client
+            .get(format!("{}/v1/files?folderId={q4_folder}", server.base_url))
+            .bearer_auth(format!("0x{}", "41".repeat(32)))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(list_resp.status(), reqwest::StatusCode::OK);
+        let body: serde_json::Value = list_resp.json().await.unwrap();
+        assert_eq!(body["authoritative"], false);
+        assert_eq!(body["folderId"], q4_folder);
+        assert_eq!(body["files"][0]["fileId"], nested_file);
+
+        // 2. Listing does NOT grant access: Mallory (same org, no Read ACL) is denied on file history.
+        let mallory_hist = client
+            .get(format!(
+                "{}/v1/files/{nested_file}/versions",
+                server.base_url
+            ))
+            .bearer_auth(format!("0x{}", "42".repeat(32)))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(mallory_hist.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+        // 3. Alice (with Read ACL) retrieves file history cleanly.
+        let alice_hist = client
+            .get(format!(
+                "{}/v1/files/{nested_file}/versions",
+                server.base_url
+            ))
+            .bearer_auth(format!("0x{}", "41".repeat(32)))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(alice_hist.status(), reqwest::StatusCode::OK);
     }
 }

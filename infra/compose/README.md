@@ -19,6 +19,15 @@ and administrative domains (`TECHNICAL_SPECIFICATION.md` §§1.1, 15.4 #13,
 | [`besu-validator.yaml`](besu-validator.yaml) | Consortium Validator Host (4+ independent orgs) | Single Besu `26.11.0` QBFT validator (no JSON-RPC exposed) |
 | [`besu-rpc.yaml`](besu-rpc.yaml) | Organization RPC Host | Single non-validator Besu `26.11.0` RPC node serving `gateway` and `indexer` |
 
-Before production use, replace loopback binds with private-network/VPN or
-mutual-TLS ingress, mount host-managed secrets, and never co-locate multiple
-validator or storage replicas in a single failure domain.
+Before production use, build the per-role service images from the repository
+root [`Dockerfile`](../../Dockerfile):
+
+```shell
+docker build --target gateway -t rrds-gateway:local .
+docker build --target indexer -t rrds-indexer:local .
+docker build --target migrate -t rrds-migrate:local .
+```
+
+Then replace loopback binds with private-network/VPN or mutual-TLS ingress,
+mount host-managed secrets, and never co-locate multiple validator or storage
+replicas in a single failure domain.

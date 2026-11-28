@@ -390,13 +390,30 @@ What to highlight:
 - `login` completes the one-time EIP-712 `LoginChallenge` handshake and saves
   the bearer token with `0600` atomic permissions.
 
-### 5.2 Encrypted Upload (V1) & Storage Verification
+### 5.2 Logical Folder Creation (`2-of-3` Safe), Encrypted Upload (V1), & Storage Verification
+
+Optionally demonstrate Safe-governed logical folder creation before uploading
+so files can be browsed inside a nested folder hierarchy (`cli ls` and
+`cli ls --folder <folderId>`):
+
+```shell
+# Create a root folder ("Finance") and nested child folder ("Q4") via 2-of-3 organizationSafe
+FOLDER_OUT="$(node contracts/scripts/besu-bootstrap.mjs create-folder "Finance")"
+echo "$FOLDER_OUT"
+FINANCE_FOLDER_ID="$(printf '%s\n' "$FOLDER_OUT" | sed -n 's/.*folderId:[[:space:]]*\(0x[0-9a-f]\{64\}\).*/\1/p')"
+
+CHILD_OUT="$(node contracts/scripts/besu-bootstrap.mjs create-folder "Q4" "$FINANCE_FOLDER_ID")"
+echo "$CHILD_OUT"
+Q4_FOLDER_ID="$(printf '%s\n' "$CHILD_OUT" | sed -n 's/.*folderId:[[:space:]]*\(0x[0-9a-f]\{64\}\).*/\1/p')"
+```
+
+Now encrypt and upload V1 (omit `--folder "$Q4_FOLDER_ID"` to upload to root):
 
 ```shell
 DEMO_DIR="$(mktemp -d /tmp/rrds-walkthrough.XXXXXX)"
 printf 'Confidential Q4 financial ledger — clean V1 (%s)\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$DEMO_DIR/ledger-v1.txt"
 
-UPLOAD_OUT="$(./target/debug/cli upload "$DEMO_DIR/ledger-v1.txt" --name "q4-ledger.txt")"
+UPLOAD_OUT="$(./target/debug/cli upload "$DEMO_DIR/ledger-v1.txt" --name "q4-ledger.txt" --folder "$Q4_FOLDER_ID")"
 echo "$UPLOAD_OUT"
 
 FILE_ID="$(printf '%s\n' "$UPLOAD_OUT" | sed -n 's/.*fileId=\(0x[0-9a-f]\{64\}\).*/\1/p')"
@@ -429,6 +446,8 @@ Wait ~1–2 seconds for the indexer poll interval, then query indexed views:
 
 ```shell
 ./target/debug/cli ls
+./target/debug/cli ls --folder "$FINANCE_FOLDER_ID"
+./target/debug/cli ls --folder "$Q4_FOLDER_ID"
 ./target/debug/cli history "$FILE_ID"
 ```
 

@@ -700,6 +700,48 @@ impl GatewayStore {
         Ok(())
     }
 
+    pub async fn list_pending_relayed_transactions(
+        &self,
+        limit: u32,
+    ) -> Result<Vec<RelayedTransactionRecord>, sqlx::Error> {
+        let rows = sqlx::query(
+            "SELECT tx_hash, operation_kind, operation_id, actor_member_id, file_id, \
+                    version_number, content_cid, envelope_set_cid, chain_id, status, \
+                    block_number, block_hash, gas_used \
+             FROM gateway_relayed_transactions \
+             WHERE status = 'pending' \
+             ORDER BY created_at ASC \
+             LIMIT $1",
+        )
+        .bind(i64::from(limit))
+        .fetch_all(&self.pool)
+        .await?;
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            out.push(RelayedTransactionRecord {
+                tx_hash: row.try_get("tx_hash")?,
+                operation_kind: row.try_get("operation_kind")?,
+                operation_id: row.try_get("operation_id")?,
+                actor_member_id: row.try_get("actor_member_id")?,
+                file_id: row.try_get("file_id")?,
+                version_number: u64::try_from(row.try_get::<i64, _>("version_number")?)
+                    .unwrap_or(0),
+                content_cid: row.try_get("content_cid")?,
+                envelope_set_cid: row.try_get("envelope_set_cid")?,
+                chain_id: u64::try_from(row.try_get::<i64, _>("chain_id")?).unwrap_or(0),
+                status: row.try_get("status")?,
+                block_number: row
+                    .try_get::<Option<i64>, _>("block_number")?
+                    .and_then(|v| u64::try_from(v).ok()),
+                block_hash: row.try_get("block_hash")?,
+                gas_used: row
+                    .try_get::<Option<i64>, _>("gas_used")?
+                    .and_then(|v| u64::try_from(v).ok()),
+            });
+        }
+        Ok(out)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub async fn record_orphan_blob_candidate(
         &self,
@@ -781,6 +823,11 @@ impl GatewayStore {
                AND NOT EXISTS ( \
                    SELECT 1 FROM envelope_sets_projection e \
                    WHERE e.envelope_set_cid = o.cid \
+               ) \
+               AND NOT EXISTS ( \
+                   SELECT 1 FROM gateway_relayed_transactions t \
+                   WHERE t.status = 'pending' \
+                     AND (t.content_cid = o.cid OR t.envelope_set_cid = o.cid) \
                ) \
              ORDER BY o.created_at ASC \
              LIMIT $2",
