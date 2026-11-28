@@ -19,7 +19,7 @@ pnpm exec hardhat test nodejs
 
 The default and production Solidity build profiles enable the optimizer with
 200 runs so local tests and Besu deployments use deployable bytecode. The
-current optimized `AccessGovernance` runtime is 17,229 bytes, below the
+current optimized `AccessGovernance` runtime is 17,475 bytes, below the
 24,576-byte EIP-170 limit.
 
 ## Deploy to local Besu
@@ -59,9 +59,10 @@ until that operation completes. Never put private keys in the parameter file.
 
 `BESU_CHAIN_ID` defaults to the local development chain ID `1337` in the
 Hardhat configuration. The actual Besu genesis configuration is authoritative;
-configure the same chain ID there. Deployment, role activation, EIP-712 parity,
-and §7.9 gas bounds are covered by local Hardhat tests (`35` passing: `29`
-Solidity, `6` Node.js including `GasBounds.ts`).
+configure the same chain ID there. Deployment, role activation, Option B
+relayed envelope updates, EIP-712 parity, and §7.9 gas bounds are covered by
+local Hardhat tests (`36` passing: `30` Solidity, `6` Node.js including
+`GasBounds.ts`).
 
 ## Local Dev Smoke-Test Bootstrap (`scripts/besu-bootstrap.mjs`)
 
@@ -90,14 +91,15 @@ node scripts/besu-bootstrap.mjs register-member
 > accounts and HSM/keystore custody, and real Safe proxy compatibility on Besu
 > must be validated before any production claim.
 
-### Current Local Besu Smoke-Test Deployment Snapshot (27 November 2026)
+### Current Local Besu Smoke-Test Deployment Snapshot (28 November 2026 — Option B)
 
 - **Network:** Local Besu QBFT (`http://127.0.0.1:8545`, `chainId = 1337`, zero gas price)
 - **Authority mode:** **Dev-only EOA placeholders** (stored in git-ignored `contracts/secrets/besu-dev-accounts.json`) — replace with real Safe multisigs later
-- **`RrdsTimelockController`:** `0x18cd48bbff72acf29bd50f8e98397b1a07eba80f` (block `48149`, `minDelay = 86400s`)
-- **`AccessGovernance`:** `0xe1304f22747114aafdd0c0c3f8e64b83c5326663` (block `48151`)
-- **`FileRegistry`:** `0xf27d55447405f702299ed948325cfd9025fbe5cb` (block `48153`)
+- **`RrdsTimelockController`:** `0xc4647d02e8ba1c922d5c4fc22e04b3d1bcd75568` (block `60843`, `minDelay = 86400s`)
+- **`AccessGovernance` (Option B):** `0x1efe4b8d6076a0ca115241346f8d7da516ce4055` (block `60845`, `17,475` runtime bytes)
+- **`FileRegistry`:** `0x7ba5ef0f4c923942554c8b5788578280f7451f2d` (block `60846`)
 - **Timelocked activation batch (`grantRole(FILE_REGISTRY_ROLE, FileRegistry)` + `registerOrganization(rrds-dev-org-1, orgSafe)`):**
-  - `operationId`: `0xb05fc2b0d9d0e021d65045c2c1537a5909692e54dcfda06bf0b07c828cf100fc`
-  - Scheduled at block `48177` (`delay = 86400s`); executable at **`2026-11-27T20:26:20.000Z`** via `node scripts/besu-bootstrap.mjs execute`
+  - `operationId`: `0xdb2a6855389bb2fa922f3110e7af84deabdf798c6c86b2c63261e665c16f8c56`
+  - Scheduled at block `60850` (`delay = 86400s`); executable at **`2026-11-29T01:27:12.000Z`** via `node scripts/besu-bootstrap.mjs execute`
   - Verified on-chain: `deployer` has no admin role on either contract, `RrdsTimelockController` is sole `DEFAULT_ADMIN_ROLE` on `AccessGovernance`, `emergencySafe` holds `EMERGENCY_SUSPENDER_ROLE`, and `FILE_REGISTRY_ROLE` remains inactive until execution.
+- **Previous snapshot (27 November 2026, pre-Option-B):** `RrdsTimelockController=0x18cd48bbff72acf29bd50f8e98397b1a07eba80f`, `AccessGovernance=0xe1304f22747114aafdd0c0c3f8e64b83c5326663`, `FileRegistry=0xf27d55447405f702299ed948325cfd9025fbe5cb` (timelock executed at block `59814`, demo member enrolled at block `59819`, full live `scripts/demo-local.sh` E2E verified through block `60745`; metadata archived under `contracts/ignition/deployments/chain-1337/pre-option-b/`).

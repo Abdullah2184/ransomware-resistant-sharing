@@ -10,9 +10,11 @@ use domain::EvmAddress;
 
 const DEFAULT_BESU_RPC_URL: &str = "http://127.0.0.1:8545";
 const DEFAULT_CHAIN_ID: u64 = 1337;
-const DEFAULT_TIMELOCK: &str = "0x18cd48bbff72acf29bd50f8e98397b1a07eba80f";
-const DEFAULT_ACCESS_GOVERNANCE: &str = "0xe1304f22747114aafdd0c0c3f8e64b83c5326663";
-const DEFAULT_FILE_REGISTRY: &str = "0xf27d55447405f702299ed948325cfd9025fbe5cb";
+const DEFAULT_TIMELOCK: &str = "0xc4647d02e8ba1c922d5c4fc22e04b3d1bcd75568";
+const DEFAULT_ACCESS_GOVERNANCE: &str = "0x1efe4b8d6076a0ca115241346f8d7da516ce4055";
+const DEFAULT_FILE_REGISTRY: &str = "0x7ba5ef0f4c923942554c8b5788578280f7451f2d";
+const DEFAULT_BOOTSTRAP_FROM_BLOCK: u64 = 60_840;
+const DEFAULT_BOOTSTRAP_TO_BLOCK: u64 = 60_855;
 
 fn parse_env_address(name: &str, default: &str) -> EvmAddress {
     let raw = env::var(name).unwrap_or_else(|_| default.to_owned());
@@ -75,13 +77,23 @@ async fn besu_qbft_live_rpc_reads_revert_classification_and_log_bounds() {
     );
     assert!(
         !client
-            .has_read_access(&access_governance, &unknown_member, &unknown_file, head.number)
+            .has_read_access(
+                &access_governance,
+                &unknown_member,
+                &unknown_file,
+                head.number
+            )
             .await
             .expect("hasReadAccess eth_call")
     );
     assert!(
         !client
-            .has_write_access(&access_governance, &unknown_member, &unknown_file, head.number)
+            .has_write_access(
+                &access_governance,
+                &unknown_member,
+                &unknown_file,
+                head.number
+            )
             .await
             .expect("hasWriteAccess eth_call")
     );
@@ -127,8 +139,16 @@ async fn besu_qbft_live_rpc_reads_revert_classification_and_log_bounds() {
     }
 
     // 4. Real eth_getLogs verification: fetch deployed contract logs and confirm range-limit rejection.
+    let from_block = env::var("BESU_BOOTSTRAP_FROM_BLOCK")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_BOOTSTRAP_FROM_BLOCK);
+    let to_block = env::var("BESU_BOOTSTRAP_TO_BLOCK")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_BOOTSTRAP_TO_BLOCK);
     let deploy_logs = client
-        .logs(48_145, 48_185, &[access_governance, timelock])
+        .logs(from_block, to_block, &[access_governance, timelock])
         .await
         .expect("fetch real Besu deployment & timelock logs");
     assert!(
@@ -154,4 +174,3 @@ async fn besu_qbft_live_rpc_reads_revert_classification_and_log_bounds() {
         0
     );
 }
-

@@ -3250,14 +3250,14 @@ mod http_tests {
         let access_governance = EvmAddress::from_bytes(
             domain::hex::parse_fixed_hex::<20>(
                 &std::env::var("CONTRACT_ACCESS_GOVERNANCE_ADDRESS")
-                    .unwrap_or_else(|_| "0xe1304f22747114aafdd0c0c3f8e64b83c5326663".to_owned()),
+                    .unwrap_or_else(|_| "0x1efe4b8d6076a0ca115241346f8d7da516ce4055".to_owned()),
             )
             .expect("valid AccessGovernance address"),
         );
         let file_registry = EvmAddress::from_bytes(
             domain::hex::parse_fixed_hex::<20>(
                 &std::env::var("CONTRACT_FILE_REGISTRY_ADDRESS")
-                    .unwrap_or_else(|_| "0xf27d55447405f702299ed948325cfd9025fbe5cb".to_owned()),
+                    .unwrap_or_else(|_| "0x7ba5ef0f4c923942554c8b5788578280f7451f2d".to_owned()),
             )
             .expect("valid FileRegistry address"),
         );

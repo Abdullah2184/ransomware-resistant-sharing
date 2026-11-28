@@ -43,21 +43,28 @@ The root `.env.example` already points `BESU_RPC_URL` and `BESU_CHAIN_ID` at
 this network. Production deployment keys belong in Hardhat's keystore / HSM; no
 private key should be added to `.env`, Compose, or tracked files.
 
-### Local Smoke-Test Deployment Status (27 November 2026)
+### Local Smoke-Test Deployment Status (28 November 2026 — Option B)
 
 - Latest network verification passed at `chainId=1337`, `rpcPeerCount=4`,
-  `validatorCount=4`, `qbftCommittedBlock=47443` (and advancing through
-  `48196`).
-- `RrdsTimelockController`, `AccessGovernance`, and `FileRegistry` were
-  deployed locally using [`contracts/scripts/besu-bootstrap.mjs`](../../contracts/scripts/besu-bootstrap.mjs)
+  `validatorCount=4`, with chain height advancing cleanly past block `60853`.
+- The initial pre-Option-B deployment (`0x18cd...`, `0xe130...`, `0xf27d...`)
+  completed its 24-hour timelock activation at block `59814`, enrolled the demo
+  member at block `59819`, and passed the full live `scripts/demo-local.sh`
+  end-to-end flow (upload, index, download verification, version append, and
+  hash-chained audit trail) through block `60745`.
+- Updated **Option B** contracts (`RrdsTimelockController`, `AccessGovernance`,
+  and `FileRegistry`) were deployed onto the same local chain at blocks
+  `60843`–`60846` using
+  [`contracts/scripts/besu-bootstrap.mjs`](../../contracts/scripts/besu-bootstrap.mjs)
   with **dev-only EOA placeholders** for `consortiumSafe`, `emergencySafe`, and
   `organizationSafe` (git-ignored under `contracts/secrets/besu-dev-accounts.json`).
   Real Safe smart accounts must replace these placeholders before staging or
   production claims (see [`docs/adr/governance-authority-and-timelock.md`](../../docs/adr/governance-authority-and-timelock.md)).
 - The 24-hour (`86,400`s) timelocked activation batch (`FILE_REGISTRY_ROLE` +
-  demo org registration) was scheduled at block `48177` and becomes executable
-  at `2026-11-27T20:26:20.000Z` via `node contracts/scripts/besu-bootstrap.mjs execute`.
-  See [`contracts/README.md`](../../contracts/README.md) for the recorded public
+  demo org registration) for the Option B deployment was scheduled at block
+  `60850` and becomes executable at `2026-11-29T01:27:12.000Z` via
+  `node contracts/scripts/besu-bootstrap.mjs execute`. See
+  [`contracts/README.md`](../../contracts/README.md) for the recorded public
   contract addresses and verified role checks.
 
 ## Network assumptions and limitations

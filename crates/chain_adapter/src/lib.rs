@@ -1535,7 +1535,9 @@ mod tests {
         // Unexpected revert selectors must fail closed rather than looking like a missing version.
         assert_eq!(
             client.file_version(&registry, &[0x77; 32], 3, 20).await,
-            Err(ChainError::ExecutionReverted(Some([0xde, 0xad, 0xbe, 0xef])))
+            Err(ChainError::ExecutionReverted(Some([
+                0xde, 0xad, 0xbe, 0xef
+            ])))
         );
         assert_eq!(
             client.file_version(&registry, &[0x77; 32], 3, 20).await,
@@ -1591,7 +1593,9 @@ mod tests {
         );
         assert_eq!(
             client.current_envelope_set(&gov, &[0x77; 32], 1, 25).await,
-            Err(ChainError::ExecutionReverted(Some([0xba, 0xdc, 0x0f, 0xfe])))
+            Err(ChainError::ExecutionReverted(Some([
+                0xba, 0xdc, 0x0f, 0xfe
+            ])))
         );
         assert_eq!(
             client.current_envelope_set(&gov, &[0x77; 32], 1, 25).await,

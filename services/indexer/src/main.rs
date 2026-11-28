@@ -1760,14 +1760,18 @@ mod tests {
         let expected_chain_id = parse_env_u64("BESU_CHAIN_ID", "1337").expect("valid chain ID");
         let access_governance = parse_nonzero_address(
             &env::var("CONTRACT_ACCESS_GOVERNANCE_ADDRESS")
-                .unwrap_or_else(|_| "0xe1304f22747114aafdd0c0c3f8e64b83c5326663".to_owned()),
+                .unwrap_or_else(|_| "0x1efe4b8d6076a0ca115241346f8d7da516ce4055".to_owned()),
         )
         .expect("valid AccessGovernance address");
         let timelock = parse_nonzero_address(
             &env::var("CONTRACT_TIMELOCK_ADDRESS")
-                .unwrap_or_else(|_| "0x18cd48bbff72acf29bd50f8e98397b1a07eba80f".to_owned()),
+                .unwrap_or_else(|_| "0xc4647d02e8ba1c922d5c4fc22e04b3d1bcd75568".to_owned()),
         )
         .expect("valid RrdsTimelockController address");
+        let from_block = parse_env_u64("BESU_BOOTSTRAP_FROM_BLOCK", "60840")
+            .expect("valid bootstrap from block");
+        let to_block =
+            parse_env_u64("BESU_BOOTSTRAP_TO_BLOCK", "60855").expect("valid bootstrap to block");
 
         let client = BesuClient::new(&rpc_url).expect("BesuClient");
         assert_eq!(
@@ -1776,7 +1780,7 @@ mod tests {
         );
 
         let mut logs = client
-            .logs(48_145, 48_185, &[access_governance, timelock])
+            .logs(from_block, to_block, &[access_governance, timelock])
             .await
             .expect("fetch live Besu governance and timelock logs");
         assert!(
