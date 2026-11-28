@@ -85,8 +85,12 @@ jobs:
             GRANT USAGE, CREATE ON SCHEMA public TO rrfs_migrator;
           SQL
           DATABASE_URL=postgres://rrfs_migrator:rrfs_migrator_ci@127.0.0.1:5432/rrfs_ci_test \
-            cargo test -p metadata-store --locked --test postgres_connection migrates_metadata_schema -- --ignored
+            cargo run --locked -p metadata-store --bin rrds-migrate -- run
           psql -v ON_ERROR_STOP=1 -h 127.0.0.1 -U rrfs_ci -d rrfs_ci_test -f infra/postgres/init-roles.sql
+          DATABASE_URL=postgres://rrfs_gateway:rrfs_gateway_ci@127.0.0.1:5432/rrfs_ci_test \
+            cargo run --locked -p metadata-store --bin rrds-migrate -- verify
+          DATABASE_URL=postgres://rrfs_indexer:rrfs_indexer_ci@127.0.0.1:5432/rrfs_ci_test \
+            cargo run --locked -p metadata-store --bin rrds-migrate -- verify
 
       - name: Run live PostgreSQL integration & least-privilege RBAC tests
         env:
@@ -94,7 +98,11 @@ jobs:
           DATABASE_GATEWAY_URL: postgres://rrfs_gateway:rrfs_gateway_ci@127.0.0.1:5432/rrfs_ci_test
           DATABASE_INDEXER_URL: postgres://rrfs_indexer:rrfs_indexer_ci@127.0.0.1:5432/rrfs_ci_test
           DATABASE_AUDIT_READER_URL: postgres://rrfs_audit_reader:rrfs_audit_ci@127.0.0.1:5432/rrfs_ci_test
-        run: cargo test -p metadata-store -p indexer -p gateway --locked -- --ignored
+        run: >-
+          cargo test -p metadata-store -p indexer -p gateway --locked
+          -- --ignored --test-threads=1
+          --skip live_besu
+          --skip live_dual_node_ipfs_cluster
 
   contracts:
     name: Solidity & Hardhat tests
@@ -134,10 +142,26 @@ jobs:
       - name: Validate Compose templates
         env:
           POSTGRES_PASSWORD: ci-placeholder-not-a-secret
+          GATEWAY_AUDIENCE: rrds-ci
+          DATABASE_GATEWAY_URL: postgres://rrfs_gateway:ci@127.0.0.1:5432/rrfs_ci
+          DATABASE_INDEXER_URL: postgres://rrfs_indexer:ci@127.0.0.1:5432/rrfs_ci
+          BESU_RPC_URL: https://besu.internal:8545
+          BESU_CHAIN_ID: "1337"
+          CONTRACT_TIMELOCK_ADDRESS: "0x1111111111111111111111111111111111111111"
+          CONTRACT_ACCESS_GOVERNANCE_ADDRESS: "0x2222222222222222222222222222222222222222"
+          CONTRACT_FILE_REGISTRY_ADDRESS: "0x3333333333333333333333333333333333333333"
+          INDEXER_START_BLOCK: "0"
+          IPFS_API_URLS: https://kubo.internal:5001
+          IPFS_CLUSTER_API_URL: https://cluster.internal:9094
+          IPFS_CLUSTER_USERNAME: rrfs-admin
+          IPFS_CLUSTER_PASSWORD_FILE: /tmp/ci-placeholder-password
         run: |
+          touch /tmp/ci-placeholder-password
           docker compose -f infra/compose.yaml config --quiet
           docker compose -f infra/besu-qbft/compose.yaml config --quiet
           docker compose -f infra/compose/database.yaml config --quiet
+          docker compose -f infra/compose/gateway.yaml config --quiet
+          docker compose -f infra/compose/indexer.yaml config --quiet
           docker compose -f infra/compose/ipfs-peer.yaml config --quiet
           docker compose -f infra/compose/besu-validator.yaml config --quiet
           docker compose -f infra/compose/besu-rpc.yaml config --quiet
